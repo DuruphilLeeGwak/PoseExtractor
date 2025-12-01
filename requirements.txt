@@ -1,21 +1,10 @@
-# Pose Transfer System Requirements
-# ==================================
-
 # Core
 numpy>=1.20.0
 opencv-python>=4.5.0
-
-# DWPose (rtmlib)
-rtmlib>=0.0.10
-
-# ONNX Runtime (GPU 지원)
-onnxruntime-gpu>=1.15.0
-# CPU만 사용 시: onnxruntime>=1.15.0
-
-# Configuration
 pyyaml>=6.0
 
-# Optional: 개발/테스트
-# pytest>=7.0.0
-# black>=22.0.0
-# flake8>=4.0.0
+# rtmlib (DWPose)
+rtmlib>=0.0.10
+
+# onnxruntime-gpu는 Dockerfile에서 별도 설치
+# onnxruntime-gpu  # 주석 처리

@@ -111,17 +111,21 @@ def main():
         input_path = Path(args.input)
         
         print(f"Processing: {input_path}")
-        json_data, skeleton_image = pipeline.extract_and_render(str(input_path))
+        json_data, skeleton_image, overlay_image = pipeline.extract_and_render(str(input_path))
         
-        # 저장
+        # 저장 경로 설정
         json_path = output_dir / f"{input_path.stem}_keypoints.json"
         skeleton_path = output_dir / f"{input_path.stem}_skeleton.png"
+        overlay_path = output_dir / f"{input_path.stem}_rendered.png"# <--- 추가됨
         
+        # 파일 저장
         save_json(json_data, json_path)
         save_image(skeleton_image, skeleton_path)
+        save_image(overlay_image, overlay_path)  # <--- 추가됨
         
         print(f"Saved: {json_path}")
         print(f"Saved: {skeleton_path}")
+        print(f"Saved: {overlay_path}")  # <--- 추가됨
     
     elif args.command == 'transfer':
         # 포즈 전이
