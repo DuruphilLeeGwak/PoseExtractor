@@ -9,7 +9,7 @@ person_filter:
   area_weight: 0.6
   center_weight: 0.4
   min_keypoints: 5
-  confidence_threshold: 5.0
+  confidence_threshold: 0.3
 
 hand_refinement:
   enabled: true
@@ -18,7 +18,7 @@ hand_refinement:
 
 transfer:
   normalization_base: "shoulder_width"
-  confidence_threshold: 5.0
+  confidence_threshold: 0.3
 
 fallback:
   symmetric_mirror: true
@@ -31,7 +31,7 @@ rendering:
   hand_line_thickness: 20
   point_radius: 6
   background_color: [0, 0, 0]
-  kpt_threshold: 3.0
+  kpt_threshold: 0.3
 
 output:
   save_json: true
