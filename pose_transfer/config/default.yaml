@@ -1,9 +1,13 @@
+# Pose Transfer System Configuration v2
+# =====================================
+
+# 모델 설정
 model:
   backend: "onnxruntime"
   device: "cuda"
   mode: "performance"
   to_openpose: false
-
+# 다중 인물 필터링
 person_filter:
   enabled: true
   area_weight: 0.6
@@ -11,29 +15,83 @@ person_filter:
   min_keypoints: 5
   confidence_threshold: 0.3
 
+# 손 정밀화
 hand_refinement:
   enabled: true
-  min_hand_size: 30
+  min_hand_size: 48
   max_scale_factor: 4.0
 
+# 포즈 전이
 transfer:
   normalization_base: "shoulder_width"
   confidence_threshold: 0.3
+  # 하반신 유효 판단 기준 (엉덩이+무릎 필요)
+  lower_body_confidence_threshold: 2.0
 
+# 폴백 전략
 fallback:
   symmetric_mirror: true
   hierarchical_estimation: true
   fallback_confidence_decay: 0.5
 
+# 렌더링
 rendering:
-  line_thickness: 20
-  face_line_thickness: 10
-  hand_line_thickness: 20
-  point_radius: 6
+  line_thickness: 4
+  point_radius: 4
   background_color: [0, 0, 0]
   kpt_threshold: 0.3
 
+# 출력
 output:
   save_json: true
   save_skeleton_image: true
   save_debug_image: false
+
+# ========================================
+# 얼굴 렌더링 설정 (NEW)
+# ========================================
+face_rendering:
+  # 얼굴 전체 활성화
+  enabled: false
+  
+  # 개별 부위 설정
+  parts:
+    # 턱라인 (face landmarks 0-16)
+    jawline:
+      enabled: false
+      color: [255, 255, 255]  # 흰색
+    
+    # 왼쪽 눈썹 (face landmarks 17-21)
+    left_eyebrow:
+      enabled: true
+      color: [255, 255, 255]
+    
+    # 오른쪽 눈썹 (face landmarks 22-26)
+    right_eyebrow:
+      enabled: true
+      color: [255, 255, 255]
+    
+    # 코 (face landmarks 27-35)
+    nose:
+      enabled: true
+      color: [255, 255, 255]
+    
+    # 왼쪽 눈 (face landmarks 36-41)
+    left_eye:
+      enabled: true
+      color: [255, 0, 0]  # 빨강
+    
+    # 오른쪽 눈 (face landmarks 42-47)
+    right_eye:
+      enabled: true
+      color: [255, 0, 0]
+    
+    # 입 외곽 (face landmarks 48-59)
+    mouth_outer:
+      enabled: true
+      color: [255, 255, 255]
+    
+    # 입 내부 (face landmarks 60-67)
+    mouth_inner:
+      enabled: true
+      color: [255, 255, 255]
