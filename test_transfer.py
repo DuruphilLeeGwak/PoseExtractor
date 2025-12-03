@@ -2,6 +2,7 @@
 포즈 전이 테스트 스크립트 (디버그 포함)
 """
 import sys
+import yaml # pip install pyyaml
 import numpy as np
 from pathlib import Path
 
@@ -13,7 +14,6 @@ def analyze_keypoints(name: str, keypoints: np.ndarray, scores: np.ndarray, thre
     """키포인트 유효성 분석"""
     print(f"\n[{name}] 키포인트 분석:")
     
-    # 부위별 인덱스
     regions = {
         'Body (0-16)': (0, 17),
         'Feet (17-22)': (17, 23),
@@ -42,7 +42,6 @@ def check_compatibility(source_scores: np.ndarray, ref_scores: np.ndarray, thres
     print("[호환성 분석]")
     print("="*50)
     
-    # 주요 본 정의
     key_bones = [
         ('left_shoulder_left_elbow', 5, 7),
         ('left_elbow_left_wrist', 7, 9),
@@ -114,21 +113,27 @@ def main():
     
     # 설정 로드
     config_path = args.config or Path(__file__).parent / "pose_transfer/config/default.yaml"
+    
+    yaml_config = {}
     if Path(config_path).exists():
         print(f"Config: {config_path}")
+        # [NEW] YAML 파일 내용을 직접 로드 (Engine에 전달용)
+        with open(config_path, 'r', encoding='utf-8') as f:
+            yaml_config = yaml.safe_load(f)
         config = PipelineConfig.from_yaml(str(config_path))
     else:
         print("Config: 기본값 사용")
         config = PipelineConfig()
     
-    # 파이프라인 초기화
-    pipeline = PoseTransferPipeline(config)
+    # 파이프라인 초기화 (yaml_config 전달)
+    pipeline = PoseTransferPipeline(config, yaml_config=yaml_config)
     
     # 1. 각각 키포인트 추출
     print("\n" + "="*50)
     print("[Step 1] 키포인트 추출")
     print("="*50)
     
+    # Extract only calls extract_pose internally
     source_kpts, source_scores, _, source_size = pipeline.extract_pose(source_path)
     ref_kpts, ref_scores, _, ref_size = pipeline.extract_pose(ref_path)
     
@@ -186,17 +191,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-def clip_invalid_keypoints(kpts, scores, img_size, margin=0.1):
-    """이미지 범위 밖 키포인트 무효화"""
-    h, w = img_size
-    max_x = w * (1 + margin)
-    max_y = h * (1 + margin)
-    
-    for i in range(len(kpts)):
-        x, y = kpts[i]
-        if x < -w * margin or x > max_x or y < -h * margin or y > max_y:
-            scores[i] = 0
-            print(f"  [CLIP] 키포인트 {i}: ({x:.0f}, {y:.0f}) → 무효화")
-    
-    return kpts, scores

@@ -1,97 +1,122 @@
-# Pose Transfer System Configuration v2
-# =====================================
+# =============================================================================
+# Pose Transfer Configuration v5 (Final Integration)
+# =============================================================================
 
-# 모델 설정
+# [0] 입력 모드 설정
+# --------------------------------------------------------
+# CLI 인자(--source, --reference)가 없을 때 이 설정을 사용합니다.
+# internal: 프로젝트 내부 inputs 폴더의 파일을 사용 (테스트용)
+# external: 절대 경로로 지정된 외부 파일을 사용 (실전/연동용)
+input_mode:
+  type: "internal"  # 'internal' or 'external'
+
+  # [Type: internal] 설정
+  internal:
+    root_dir: "inputs"
+    source_name: "source.jpg"
+    reference_name: "reference.jpg"
+
+  # [Type: external] 설정 (type을 external로 바꾸면 이 경로를 읽음)
+  external:
+    source_path: "/var/data/users/user_123.jpg"
+    reference_path: "/var/data/poses/pose_dance.jpg"
+
+
+# [1] 모델 설정
 model:
-  backend: "onnxruntime"
-  device: "cuda"
-  mode: "performance"
-  to_openpose: false
-# 다중 인물 필터링
+  backend: "onnxruntime"  # 'onnxruntime' or 'openvino'
+  device: "cuda"          # 'cuda' or 'cpu'
+  mode: "performance"     # 'performance', 'lightweight', or 'balanced'
+  to_openpose: false      # COCO-WholeBody 포맷 사용
+
+# [2] 다중 인물 필터링
 person_filter:
   enabled: true
-  area_weight: 0.6
-  center_weight: 0.4
-  min_keypoints: 5
+  area_weight: 0.6        # 면적 가중치
+  center_weight: 0.4      # 중심 거리 가중치
+  min_keypoints: 5        # 최소 키포인트 수
   confidence_threshold: 0.3
 
-# 손 정밀화
+# [3] 손 정밀화 (해상도 업스케일링)
 hand_refinement:
   enabled: true
-  min_hand_size: 48
-  max_scale_factor: 4.0
+  min_hand_size: 48       # 이보다 작으면 업스케일 시도
+  max_scale_factor: 4.0   # 최대 확대 배율
 
-# 포즈 전이
+# [4] 포즈 전이 핵심 로직
 transfer:
   normalization_base: "shoulder_width"
   confidence_threshold: 0.3
-  # 하반신 유효 판단 기준 (엉덩이+무릎 필요)
-  lower_body_confidence_threshold: 2.0
+  
+  # 하반신(Ghost Legs) 방지 설정
+  lower_body_confidence_threshold: 0.5  # 이 점수보다 낮으면 하반신 그리지 않음
+  lower_body_margin_ratio: 0.05         # 이미지 바닥 5% 영역에 무릎이 있으면 무효화
 
-# 폴백 전략
+# [5] 폴백 전략 (누락된 부위 추정)
 fallback:
-  symmetric_mirror: true
-  hierarchical_estimation: true
-  fallback_confidence_decay: 0.5
+  symmetric_mirror: true          # 대칭 부위(왼팔<->오른팔) 복사 허용
+  hierarchical_estimation: true   # 부모 노드 기반 추정 허용
+  fallback_confidence_decay: 0.5  # 추정된 키포인트의 신뢰도 감소율
 
-# 렌더링
+# [6] 렌더링 스타일
 rendering:
-  line_thickness: 4
-  point_radius: 4
-  background_color: [0, 0, 0]
-  kpt_threshold: 0.3
+  line_thickness: 10          # 뼈대 선 두께
+  face_line_thickness: 5      # 얼굴 선 두께
+  hand_line_thickness: 5      # 손 선 두께
+  point_radius: 6             # 관절 점 크기
+  background_color: [0, 0, 0] # 스켈레톤 이미지 배경색 (BGR)
+  kpt_threshold: 0.3          # [중요] 이 점수 이상만 그림 (0.8 점수를 그리기 위해 낮춤)
 
-# 출력
+# [7] 출력 설정
 output:
   save_json: true
   save_skeleton_image: true
   save_debug_image: false
 
-# ========================================
-# 얼굴 렌더링 설정 (NEW)
-# ========================================
+# [8] 시스템 설정 (파일 관리)
+system:
+  # 작업 완료 후 입력 파일 처리 방식
+  # true: archive 폴더로 이동 (보관)
+  # false: 삭제 (휘발성, 스토리지 절약) - *외부 파일 사용 시 주의*
+  enable_archiving: true
+
+# [9] 얼굴 부위별 렌더링 제어
 face_rendering:
-  # 얼굴 전체 활성화
-  enabled: false
+  enabled: true  # false면 얼굴 전체 안 그림
   
-  # 개별 부위 설정
   parts:
-    # 턱라인 (face landmarks 0-16)
+    # 턱 라인 (얼굴 윤곽) - 보통 끄는 게 자연스러울 때가 많음
     jawline:
       enabled: false
-      color: [255, 255, 255]  # 흰색
+      color: [255, 255, 255]
     
-    # 왼쪽 눈썹 (face landmarks 17-21)
+    # 눈썹
     left_eyebrow:
       enabled: true
       color: [255, 255, 255]
-    
-    # 오른쪽 눈썹 (face landmarks 22-26)
     right_eyebrow:
       enabled: true
       color: [255, 255, 255]
     
-    # 코 (face landmarks 27-35)
+    # 코
     nose:
       enabled: true
       color: [255, 255, 255]
     
-    # 왼쪽 눈 (face landmarks 36-41)
+    # 눈
     left_eye:
       enabled: true
-      color: [255, 0, 0]  # 빨강
-    
-    # 오른쪽 눈 (face landmarks 42-47)
+      color: [255, 255, 255]
     right_eye:
       enabled: true
-      color: [255, 0, 0]
+      color: [255, 255, 255]
     
-    # 입 외곽 (face landmarks 48-59)
+    # 입 (바깥 라인)
     mouth_outer:
       enabled: true
       color: [255, 255, 255]
     
-    # 입 내부 (face landmarks 60-67)
+    # 입 (안쪽 라인)
     mouth_inner:
       enabled: true
       color: [255, 255, 255]
