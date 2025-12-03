@@ -3,3 +3,5 @@ outputs/
 __pycache__/
 *.pyc
 .ipynb_checkpoints
+test_Inputs/
+outputs_test/

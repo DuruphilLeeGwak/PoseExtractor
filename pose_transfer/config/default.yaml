@@ -1,5 +1,5 @@
 # =============================================================================
-# Pose Transfer Configuration v5 (Final Integration)
+# Pose Transfer Configuration v6 (Final Integration)
 # =============================================================================
 
 # [0] 입력 모드 설정
@@ -48,9 +48,16 @@ transfer:
   normalization_base: "shoulder_width"
   confidence_threshold: 0.3
   
-  # 하반신(Ghost Legs) 방지 설정
-  lower_body_confidence_threshold: 0.5  # 이 점수보다 낮으면 하반신 그리지 않음
-  lower_body_margin_ratio: 0.05         # 이미지 바닥 5% 영역에 무릎이 있으면 무효화
+  # 하반신(Ghost Legs) 방지 설정 1: 점수 미달 시 제거
+  lower_body_confidence_threshold: 0.5
+  
+  # 하반신 방지 설정 2: 이미지 바닥(Edge) 근처 좌표 무효화
+  # 0.05 = 이미지 하단 5% 영역에 무릎이 있으면 가짜로 판단
+  lower_body_margin_ratio: 0.05
+  
+  # [NEW] 스마트 클리핑: 화면 밖 허용 범위
+  # 0.15 = 이미지 크기의 15% 정도는 벗어나도 그림 (그 이상은 자름)
+  visibility_margin: 0.15
 
 # [5] 폴백 전략 (누락된 부위 추정)
 fallback:
@@ -58,14 +65,15 @@ fallback:
   hierarchical_estimation: true   # 부모 노드 기반 추정 허용
   fallback_confidence_decay: 0.5  # 추정된 키포인트의 신뢰도 감소율
 
-# [6] 렌더링 스타일
+# [6] 렌더링 스타일 (상대적 크기 적용됨)
+# 값은 이미지 긴 변이 1000px일 때의 기준 픽셀입니다.
 rendering:
-  line_thickness: 10          # 뼈대 선 두께
-  face_line_thickness: 5      # 얼굴 선 두께
-  hand_line_thickness: 5      # 손 선 두께
+  line_thickness: 10          # Body 선 두께
+  face_line_thickness: 5      # Face 선 두께
+  hand_line_thickness: 5      # Hand 선 두께
   point_radius: 6             # 관절 점 크기
-  background_color: [0, 0, 0] # 스켈레톤 이미지 배경색 (BGR)
-  kpt_threshold: 0.3          # [중요] 이 점수 이상만 그림 (0.8 점수를 그리기 위해 낮춤)
+  background_color: [0, 0, 0] # 배경색 (BGR)
+  kpt_threshold: 0.3          # 이 점수 이상만 렌더링
 
 # [7] 출력 설정
 output:
@@ -77,15 +85,15 @@ output:
 system:
   # 작업 완료 후 입력 파일 처리 방식
   # true: archive 폴더로 이동 (보관)
-  # false: 삭제 (휘발성, 스토리지 절약) - *외부 파일 사용 시 주의*
-  enable_archiving: true
+  # false: 삭제 (휘발성, 스토리지 절약)
+  enable_archiving: false
 
 # [9] 얼굴 부위별 렌더링 제어
 face_rendering:
   enabled: true  # false면 얼굴 전체 안 그림
   
   parts:
-    # 턱 라인 (얼굴 윤곽) - 보통 끄는 게 자연스러울 때가 많음
+    # 턱 라인 (얼굴 윤곽) - 끄는 것이 자연스러움
     jawline:
       enabled: false
       color: [255, 255, 255]
