@@ -1,193 +1,175 @@
 """
-포즈 전이 테스트 스크립트 (디버그 포함)
+Pose Transfer Batch Test Script (Auto Clean)
+- 목적: test_Inputs 폴더 내의 모든 이미지를 일괄 테스트
+- 기능:
+  1. 시작 시 기존 output 폴더 삭제 후 재생성 (Clean Start)
+  2. 폴더 내 모든 이미지에 대해 키포인트 분석 (Reference 없을 때)
+  3. 폴더 내 모든 이미지에 특정 Reference 포즈 전이 (Reference 있을 때)
 """
 import sys
-import yaml # pip install pyyaml
+import yaml
+import shutil  # [NEW] 폴더 삭제용
+import argparse
 import numpy as np
 from pathlib import Path
+from typing import List, Optional
 
+# 패키지 임포트
 from pose_transfer.pipeline import PipelineConfig, PoseTransferPipeline
-from pose_transfer.utils.io import load_image, save_image, save_json
+from pose_transfer.utils.io import save_json, save_image, load_image, convert_to_openpose_format
 
+# 이미지 확장자 목록
+IMG_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
 
-def analyze_keypoints(name: str, keypoints: np.ndarray, scores: np.ndarray, threshold: float = 0.3):
-    """키포인트 유효성 분석"""
-    print(f"\n[{name}] 키포인트 분석:")
-    
-    regions = {
-        'Body (0-16)': (0, 17),
-        'Feet (17-22)': (17, 23),
-        'Face (23-90)': (23, 91),
-        'Left Hand (91-111)': (91, 112),
-        'Right Hand (112-132)': (112, 133),
-    }
-    
-    total_valid = 0
-    for region_name, (start, end) in regions.items():
-        region_scores = scores[start:end]
-        valid_count = np.sum(region_scores > threshold)
-        total_count = end - start
-        pct = valid_count / total_count * 100
-        status = "✅" if valid_count > total_count * 0.5 else "⚠️" if valid_count > 0 else "❌"
-        print(f"  {status} {region_name}: {valid_count}/{total_count} ({pct:.0f}%)")
-        total_valid += valid_count
-    
-    print(f"  총 유효 키포인트: {total_valid}/133")
-    return total_valid
-
-
-def check_compatibility(source_scores: np.ndarray, ref_scores: np.ndarray, threshold: float = 0.3):
-    """소스-레퍼런스 호환성 체크"""
-    print("\n" + "="*50)
-    print("[호환성 분석]")
-    print("="*50)
-    
-    key_bones = [
-        ('left_shoulder_left_elbow', 5, 7),
-        ('left_elbow_left_wrist', 7, 9),
-        ('right_shoulder_right_elbow', 6, 8),
-        ('right_elbow_right_wrist', 8, 10),
-        ('left_hip_left_knee', 11, 13),
-        ('left_knee_left_ankle', 13, 15),
-        ('right_hip_right_knee', 12, 14),
-        ('right_knee_right_ankle', 14, 16),
+def get_image_files(directory: Path) -> List[Path]:
+    """폴더 내 이미지 파일 목록 반환"""
+    return [
+        p for p in directory.iterdir() 
+        if p.is_file() and p.suffix.lower() in IMG_EXTENSIONS
     ]
-    
-    warnings = []
-    for bone_name, start_idx, end_idx in key_bones:
-        src_valid = source_scores[start_idx] > threshold and source_scores[end_idx] > threshold
-        ref_valid = ref_scores[start_idx] > threshold and ref_scores[end_idx] > threshold
-        
-        if src_valid and ref_valid:
-            status = "✅ 정상"
-        elif src_valid and not ref_valid:
-            status = "⚠️ Reference 없음 → 방향 폴백"
-            warnings.append(f"{bone_name}: Reference에 없음")
-        elif not src_valid and ref_valid:
-            status = "⚠️ Source 없음 → 길이 폴백"
-            warnings.append(f"{bone_name}: Source에 없음")
-        else:
-            status = "❌ 둘 다 없음"
-            warnings.append(f"{bone_name}: 둘 다 없음")
-        
-        print(f"  {bone_name}: {status}")
-    
-    if warnings:
-        print(f"\n⚠️ 경고 {len(warnings)}개:")
-        for w in warnings:
-            print(f"   - {w}")
-    else:
-        print("\n✅ 모든 주요 본 호환!")
-    
-    return warnings
 
+def analyze_keypoints(name: str, scores: np.ndarray, threshold: float = 0.3):
+    """키포인트 유효성 요약 출력"""
+    total = len(scores)
+    valid = np.sum(scores > threshold)
+    pct = (valid / total) * 100
+    print(f"   📊 [{name}] Valid Keypoints: {valid}/{total} ({pct:.1f}%)")
+
+def process_image(
+    pipeline: PoseTransferPipeline,
+    src_path: Path,
+    out_dir: Path,
+    ref_data: Optional[dict] = None, # (kpts, scores, size)
+    config_threshold: float = 0.3
+):
+    """단일 이미지 처리 함수"""
+    file_stem = src_path.stem  # 확장자 뺀 파일명 (라벨링용)
+    print(f"\nProcessing: {src_path.name} ...")
+
+    try:
+        # [Step 1] Source 추출
+        src_img = load_image(src_path)
+        src_kpts, src_scores, _, src_size = pipeline.extract_pose(src_img)
+        
+        analyze_keypoints("Source", src_scores, config_threshold)
+
+        # Source 결과 저장 (공통)
+        # 1. JSON
+        src_json = convert_to_openpose_format(src_kpts[None], src_scores[None], src_size)
+        save_json(src_json, str(out_dir / f"{file_stem}_keypoints.json"))
+        
+        # 2. Skeleton
+        src_skel = pipeline.renderer.render_skeleton_only((src_size[0], src_size[1], 3), src_kpts, src_scores)
+        save_image(src_skel, str(out_dir / f"{file_stem}_skeleton.png"))
+        
+        # 3. Overlay
+        src_overlay = pipeline.renderer.render(src_img, src_kpts, src_scores)
+        save_image(src_overlay, str(out_dir / f"{file_stem}_overlay.png"))
+
+        # [Step 2] 전이 (Reference가 있을 경우에만)
+        if ref_data:
+            ref_kpts, ref_scores, ref_size = ref_data
+            
+            # 전이 실행 (이미지 사이즈 전달하여 하반신 검증 활성화)
+            result = pipeline.transfer_engine.transfer(
+                src_kpts, src_scores,
+                ref_kpts, ref_scores,
+                source_image_size=src_size,
+                reference_image_size=ref_size
+            )
+            
+            # 렌더링
+            res_skel = pipeline.renderer.render_skeleton_only((src_size[0], src_size[1], 3), result.keypoints, result.scores)
+            res_overlay = pipeline.renderer.render(src_img, result.keypoints, result.scores)
+            
+            # 전이 결과 저장 (라벨링: 원본명_transferred)
+            save_image(res_skel, str(out_dir / f"{file_stem}_transferred_skeleton.png"))
+            save_image(res_overlay, str(out_dir / f"{file_stem}_transferred_overlay.png"))
+            save_json(result.to_json(), str(out_dir / f"{file_stem}_transferred_keypoints.json"))
+            
+            print(f"   ✅ Transfer Complete -> {file_stem}_transferred_*.png")
+        else:
+            print(f"   ✅ Extraction Complete -> {file_stem}_*.png")
+
+    except Exception as e:
+        print(f"   ❌ Error processing {src_path.name}: {e}")
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='포즈 전이 테스트')
-    parser.add_argument('--source', type=str, default='inputs/source.jpg', help='원본 이미지 (비율)')
-    parser.add_argument('--reference', type=str, default='inputs/reference.jpg', help='레퍼런스 이미지 (포즈)')
-    parser.add_argument('--output', type=str, default='outputs', help='출력 폴더')
-    parser.add_argument('--config', type=str, default=None, help='설정 파일')
+    parser = argparse.ArgumentParser(description='Pose Transfer Batch Test')
+    # 기본값을 test_Inputs 폴더로 설정
+    parser.add_argument('--source', type=str, default='test_Inputs', help='Input Directory or File')
+    parser.add_argument('--reference', type=str, default=None, help='Reference Image Path (Optional)')
+    parser.add_argument('--output', type=str, default='outputs_test', help='Output Directory')
+    parser.add_argument('--config', type=str, default='pose_transfer/config/default.yaml', help='Config Path')
+    
     args = parser.parse_args()
     
-    # 경로 확인
-    source_path = Path(args.source)
-    ref_path = Path(args.reference)
-    output_dir = Path(args.output)
-    output_dir.mkdir(exist_ok=True)
+    # 1. 경로 설정
+    source_input = Path(args.source)
+    out_dir = Path(args.output)
+
+    # [NEW] 기존 출력 폴더 정리 (Reset)
+    if out_dir.exists():
+        print(f"🧹 Cleaning up existing output directory: {out_dir}")
+        shutil.rmtree(out_dir)  # 폴더 통째로 삭제
     
-    if not source_path.exists():
-        print(f"❌ Source 이미지 없음: {source_path}")
-        sys.exit(1)
-    if not ref_path.exists():
-        print(f"❌ Reference 이미지 없음: {ref_path}")
-        sys.exit(1)
-    
-    print("="*50)
-    print("포즈 전이 테스트")
-    print("="*50)
-    print(f"Source: {source_path}")
-    print(f"Reference: {ref_path}")
-    print(f"Output: {output_dir}")
-    
-    # 설정 로드
-    config_path = args.config or Path(__file__).parent / "pose_transfer/config/default.yaml"
-    
+    out_dir.mkdir(parents=True, exist_ok=True) # 다시 생성
+
+    # 소스 파일 목록 확보
+    if source_input.is_dir():
+        src_files = get_image_files(source_input)
+        if not src_files:
+            print(f"❌ '{source_input}' 폴더에 이미지 파일이 없습니다.")
+            return
+        print(f"📂 Batch Mode: '{source_input}' 폴더 내 {len(src_files)}개 이미지 처리")
+    elif source_input.exists():
+        src_files = [source_input]
+        print(f"📄 Single Mode: {source_input} 처리")
+    else:
+        print(f"❌ Source 경로를 찾을 수 없습니다: {source_input}")
+        return
+
+    # 2. 파이프라인 초기화
+    config_path = Path(args.config)
     yaml_config = {}
-    if Path(config_path).exists():
-        print(f"Config: {config_path}")
-        # [NEW] YAML 파일 내용을 직접 로드 (Engine에 전달용)
+    if config_path.exists():
         with open(config_path, 'r', encoding='utf-8') as f:
             yaml_config = yaml.safe_load(f)
         config = PipelineConfig.from_yaml(str(config_path))
     else:
-        print("Config: 기본값 사용")
         config = PipelineConfig()
-    
-    # 파이프라인 초기화 (yaml_config 전달)
-    pipeline = PoseTransferPipeline(config, yaml_config=yaml_config)
-    
-    # 1. 각각 키포인트 추출
-    print("\n" + "="*50)
-    print("[Step 1] 키포인트 추출")
-    print("="*50)
-    
-    # Extract only calls extract_pose internally
-    source_kpts, source_scores, _, source_size = pipeline.extract_pose(source_path)
-    ref_kpts, ref_scores, _, ref_size = pipeline.extract_pose(ref_path)
-    
-    print(f"\nSource 이미지 크기: {source_size[1]}x{source_size[0]}")
-    print(f"Reference 이미지 크기: {ref_size[1]}x{ref_size[0]}")
-    
-    # 2. 키포인트 분석
-    analyze_keypoints("Source", source_kpts, source_scores, config.kpt_threshold)
-    analyze_keypoints("Reference", ref_kpts, ref_scores, config.kpt_threshold)
-    
-    # 3. 호환성 체크
-    warnings = check_compatibility(source_scores, ref_scores, config.kpt_threshold)
-    
-    # 4. 포즈 전이 실행
-    print("\n" + "="*50)
-    print("[Step 2] 포즈 전이 실행")
-    print("="*50)
-    
-    result = pipeline.transfer(source_path, ref_path)
-    
-    # 전이 로그 출력
-    print("\n[전이 로그]")
-    methods = {}
-    for kpt_name, method in result.processing_info.get('transfer_log', {}).items():
-        methods[method] = methods.get(method, 0) + 1
-    for method, count in methods.items():
-        print(f"  {method}: {count}개")
-    
-    # 5. 결과 저장
-    print("\n" + "="*50)
-    print("[Step 3] 결과 저장")
-    print("="*50)
-    
-    # JSON
-    json_path = output_dir / "transferred_keypoints.json"
-    save_json(result.to_json(), str(json_path))
-    print(f"✅ {json_path}")
-    
-    # 스켈레톤 이미지
-    skeleton_path = output_dir / "transferred_skeleton.png"
-    save_image(result.skeleton_image, str(skeleton_path))
-    print(f"✅ {skeleton_path}")
-    
-    # 원본 위에 전이된 포즈 오버레이
-    source_img = load_image(source_path)
-    overlay = pipeline.renderer.render(source_img, result.transferred_keypoints, result.transferred_scores)
-    overlay_path = output_dir / "transferred_overlay.png"
-    save_image(overlay, str(overlay_path))
-    print(f"✅ {overlay_path}")
-    
-    print("\n" + "="*50)
-    print("✅ 포즈 전이 완료!")
-    print("="*50)
 
+    pipeline = PoseTransferPipeline(config, yaml_config=yaml_config)
+
+    # 3. Reference 로드 (옵션)
+    ref_data = None
+    if args.reference:
+        ref_path = Path(args.reference)
+        if ref_path.exists():
+            print(f"💃 Reference Loading: {ref_path}")
+            ref_kpts, ref_scores, _, ref_size = pipeline.extract_pose(ref_path)
+            ref_data = (ref_kpts, ref_scores, ref_size)
+            
+            # Reference 분석 결과도 한 번 저장
+            r_skel = pipeline.renderer.render_skeleton_only((ref_size[0], ref_size[1], 3), ref_kpts, ref_scores)
+            save_image(r_skel, str(out_dir / "reference_skeleton.png"))
+        else:
+            print(f"❌ Reference 파일을 찾을 수 없어 '추출 모드'로 진행합니다: {ref_path}")
+
+    print("="*60)
+    
+    # 4. 일괄 처리 루프
+    for src_path in src_files:
+        process_image(
+            pipeline, 
+            src_path, 
+            out_dir, 
+            ref_data, 
+            config.kpt_threshold
+        )
+
+    print("="*60)
+    print(f"✨ 모든 작업 완료! 결과물 위치: {out_dir}")
 
 if __name__ == "__main__":
     main()
