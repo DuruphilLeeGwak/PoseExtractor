@@ -1,22 +1,17 @@
 # =============================================================================
-# Pose Transfer Configuration v6 (Final Integration)
+# Pose Transfer Configuration v7 (Ghost Legs Fix)
 # =============================================================================
 
 # [0] 입력 모드 설정
 # --------------------------------------------------------
-# CLI 인자(--source, --reference)가 없을 때 이 설정을 사용합니다.
-# internal: 프로젝트 내부 inputs 폴더의 파일을 사용 (테스트용)
-# external: 절대 경로로 지정된 외부 파일을 사용 (실전/연동용)
 input_mode:
-  type: "internal"  # 'internal' or 'external'
+  type: "internal"
 
-  # [Type: internal] 설정
   internal:
     root_dir: "inputs"
     source_name: "source.jpg"
     reference_name: "reference.jpg"
 
-  # [Type: external] 설정 (type을 external로 바꾸면 이 경로를 읽음)
   external:
     source_path: "/var/data/users/user_123.jpg"
     reference_path: "/var/data/poses/pose_dance.jpg"
@@ -24,56 +19,120 @@ input_mode:
 
 # [1] 모델 설정
 model:
-  backend: "onnxruntime"  # 'onnxruntime' or 'openvino'
-  device: "cuda"          # 'cuda' or 'cpu'
-  mode: "performance"     # 'performance', 'lightweight', or 'balanced'
-  to_openpose: false      # COCO-WholeBody 포맷 사용
+  backend: "onnxruntime"
+  device: "cuda"
+  mode: "performance"
+  to_openpose: false
 
 # [2] 다중 인물 필터링
 person_filter:
   enabled: true
-  area_weight: 0.6        # 면적 가중치
-  center_weight: 0.4      # 중심 거리 가중치
-  min_keypoints: 5        # 최소 키포인트 수
+  area_weight: 0.6
+  center_weight: 0.4
+  min_keypoints: 5
   confidence_threshold: 0.3
 
-# [3] 손 정밀화 (해상도 업스케일링)
+# [3] 손 정밀화
 hand_refinement:
   enabled: true
-  min_hand_size: 48       # 이보다 작으면 업스케일 시도
-  max_scale_factor: 4.0   # 최대 확대 배율
+  min_hand_size: 48
+  max_scale_factor: 4.0
 
-# [4] 포즈 전이 핵심 로직
+# =============================================================================
+# [4] 포즈 전이 & Ghost Legs 클리핑 설정
+# =============================================================================
 transfer:
   normalization_base: "shoulder_width"
   confidence_threshold: 0.3
   
-  # 하반신(Ghost Legs) 방지 설정 1: 점수 미달 시 제거
-  lower_body_confidence_threshold: 0.5
+  # ============================================================
+  # Ghost Legs 클리핑 설정
+  # ============================================================
+  # 
+  # DWPose는 프레임에 보이지 않는 신체 부위도 "추정"하여 키포인트를 생성합니다.
+  # 이로 인해 상반신만 있는 이미지에서도 허공에 다리가 그려지는 문제가 발생합니다.
+  # 아래 설정으로 이러한 "유령 다리(Ghost Legs)"를 제거할 수 있습니다.
+  #
+  # ============================================================
   
-  # 하반신 방지 설정 2: 이미지 바닥(Edge) 근처 좌표 무효화
-  # 0.05 = 이미지 하단 5% 영역에 무릎이 있으면 가짜로 판단
-  lower_body_margin_ratio: 0.05
+  # [ON/OFF] Ghost Legs 클리핑 활성화
+  # --------------------------------------------------------
+  # true: 클리핑 적용 (권장)
+  # false: 클리핑 비활성화 (DWPose 원본 그대로 사용)
+  ghost_legs_clipping_enabled: true
   
-  # [NEW] 스마트 클리핑: 화면 밖 허용 범위
-  # 0.15 = 이미지 크기의 15% 정도는 벗어나도 그림 (그 이상은 자름)
-  visibility_margin: 0.15
+  # [조절 1] 신뢰도 임계값 (lower_body_confidence_threshold)
+  # --------------------------------------------------------
+  # DWPose가 출력하는 각 키포인트의 신뢰도(confidence score) 기준입니다.
+  # 이 값 미만의 신뢰도를 가진 하반신 키포인트는 "추정된 가짜"로 판단하여 제거합니다.
+  #
+  # 참고 - DWPose 신뢰도 범위:
+  #   - 명확히 보이는 부위: 5.0 ~ 8.0+
+  #   - 부분적으로 보이는 부위: 3.0 ~ 5.0
+  #   - 추정된 부위 (안 보임): 0.5 ~ 2.0
+  #   - 완전히 불확실: 0.5 미만
+  #
+  # 값 조절 가이드:
+  #   - 3.0: 보수적 (확실히 안 보이는 것만 제거, 절삭 최소화)
+  #   - 2.0: 균형 (기본값, 대부분의 경우 적절)
+  #   - 1.5: 관대함 (약간 불확실해도 유지)
+  #   - 1.0: 매우 관대함 (거의 절삭 안 함)
+  #
+  # 너무 많이 절삭된다면: 값을 낮추세요 (예: 2.0 → 1.5)
+  # Ghost Legs가 남아있다면: 값을 높이세요 (예: 2.0 → 2.5)
+  lower_body_confidence_threshold: 1.5
+  
+  # [조절 2] 경계 영역 비율 (lower_body_margin_ratio)
+  # --------------------------------------------------------
+  # 이미지 하단의 몇 %를 "프레임 밖 경계"로 간주할지 설정합니다.
+  # 이 경계 안에 있는 하반신 키포인트는 "프레임 밖으로 나간 것"으로 판단하여 제거합니다.
+  #
+  # 계산 방식:
+  #   boundary_y = 이미지높이 × (1 - margin_ratio)
+  #   예: 이미지높이=1000, margin_ratio=0.10 → boundary_y=900
+  #   → Y좌표가 900 이상인 하반신 키포인트는 제거
+  #
+  # 값 조절 가이드:
+  #   - 0.05 (5%): 매우 관대함 (맨 아래 가장자리만 제거)
+  #   - 0.10 (10%): 균형 (기본값)
+  #   - 0.15 (15%): 보수적 (더 많이 제거)
+  #   - 0.20 (20%): 매우 보수적 (하단 1/5 영역 제거)
+  #
+  # 발이 잘린다면: 값을 낮추세요 (예: 0.10 → 0.05)
+  # 하단 Ghost Legs가 남아있다면: 값을 높이세요 (예: 0.10 → 0.12)
+  lower_body_margin_ratio: 0.025
+  
+  # [조절 3] 화면 밖 허용 범위 (visibility_margin)
+  # --------------------------------------------------------
+  # 전이(transfer) 후 최종 결과에서, 화면 밖으로 얼마나 벗어난 키포인트까지 허용할지 설정합니다.
+  # (이 설정은 전이 시에만 적용되며, 단순 추출에는 영향 없음)
+  #
+  # 계산 방식:
+  #   limit = 이미지크기 × (1 + visibility_margin)
+  #   예: 이미지높이=1000, margin=0.15 → limit=1150
+  #   → Y좌표가 1150 이상이면 제거
+  #
+  # 값 조절 가이드:
+  #   - 0.10: 보수적 (화면 밖 10%까지만 허용)
+  #   - 0.15: 균형 (기본값)
+  #   - 0.20: 관대함 (화면 밖 20%까지 허용)
+  visibility_margin: 0.2
 
-# [5] 폴백 전략 (누락된 부위 추정)
+
+# [5] 폴백 전략
 fallback:
-  symmetric_mirror: true          # 대칭 부위(왼팔<->오른팔) 복사 허용
-  hierarchical_estimation: true   # 부모 노드 기반 추정 허용
-  fallback_confidence_decay: 0.5  # 추정된 키포인트의 신뢰도 감소율
+  symmetric_mirror: true
+  hierarchical_estimation: true
+  fallback_confidence_decay: 0.5
 
-# [6] 렌더링 스타일 (상대적 크기 적용됨)
-# 값은 이미지 긴 변이 1000px일 때의 기준 픽셀입니다.
+# [6] 렌더링 스타일
 rendering:
-  line_thickness: 10          # Body 선 두께
-  face_line_thickness: 5      # Face 선 두께
-  hand_line_thickness: 5      # Hand 선 두께
-  point_radius: 6             # 관절 점 크기
-  background_color: [0, 0, 0] # 배경색 (BGR)
-  kpt_threshold: 0.3          # 이 점수 이상만 렌더링
+  line_thickness: 4
+  face_line_thickness: 4
+  hand_line_thickness: 4
+  point_radius: 2
+  background_color: [0, 0, 0]
+  kpt_threshold: 0.1
 
 # [7] 출력 설정
 output:
@@ -81,50 +140,36 @@ output:
   save_skeleton_image: true
   save_debug_image: false
 
-# [8] 시스템 설정 (파일 관리)
+# [8] 시스템 설정
 system:
-  # 작업 완료 후 입력 파일 처리 방식
-  # true: archive 폴더로 이동 (보관)
-  # false: 삭제 (휘발성, 스토리지 절약)
   enable_archiving: false
 
 # [9] 얼굴 부위별 렌더링 제어
 face_rendering:
-  enabled: true  # false면 얼굴 전체 안 그림
+  enabled: true
   
   parts:
-    # 턱 라인 (얼굴 윤곽) - 끄는 것이 자연스러움
     jawline:
       enabled: false
       color: [255, 255, 255]
-    
-    # 눈썹
     left_eyebrow:
       enabled: true
       color: [255, 255, 255]
     right_eyebrow:
       enabled: true
       color: [255, 255, 255]
-    
-    # 코
     nose:
       enabled: true
       color: [255, 255, 255]
-    
-    # 눈
     left_eye:
       enabled: true
       color: [255, 255, 255]
     right_eye:
       enabled: true
       color: [255, 255, 255]
-    
-    # 입 (바깥 라인)
     mouth_outer:
       enabled: true
       color: [255, 255, 255]
-    
-    # 입 (안쪽 라인)
     mouth_inner:
       enabled: true
       color: [255, 255, 255]
