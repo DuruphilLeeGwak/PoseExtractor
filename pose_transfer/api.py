@@ -1,6 +1,7 @@
 """
-Pose Transfer API Module
-(핵심 로직이 모여있는 곳)
+Pose Transfer API Module (Updated)
+- Naming Convention Changed: src, ref, trans / kp, sk, rend
+- Output Format: JPG
 """
 import sys
 import os
@@ -15,15 +16,9 @@ from .pipeline import PipelineConfig, PoseTransferPipeline
 from .utils.io import save_json, save_image, load_image
 
 # ====================================================
-# [Helper] 경로 결정 로직 (수정됨: 폴더 스캔 기능)
+# [Helper] 경로 결정 로직
 # ====================================================
 def resolve_input_paths(cli_args, yaml_config) -> Tuple[Path, Path]:
-    """
-    경로 결정 로직
-    1. CLI 인자 우선
-    2. Internal Mode: inputs/src 및 inputs/ref 폴더 내의 첫 번째 이미지를 자동 선택
-    """
-    # 1. CLI가 있으면 최우선
     if cli_args.source and cli_args.reference:
         print("ℹ️  [Input] Using CLI arguments.")
         return Path(cli_args.source), Path(cli_args.reference)
@@ -50,10 +45,7 @@ def resolve_input_paths(cli_args, yaml_config) -> Tuple[Path, Path]:
         ref_dir_path = inputs_root / ref_dir_name
         
         print(f"ℹ️  [Input] Internal Mode: Scanning folders...")
-        print(f"    - Src: {src_dir_path}")
-        print(f"    - Ref: {ref_dir_path}")
 
-        # 폴더 내 이미지 찾기 함수
         def find_first_image(directory: Path, label: str) -> Path:
             if not directory.exists():
                 raise FileNotFoundError(f"❌ '{label}' directory not found: {directory}")
@@ -64,19 +56,13 @@ def resolve_input_paths(cli_args, yaml_config) -> Tuple[Path, Path]:
             if not files:
                 raise FileNotFoundError(f"❌ No images found in '{label}' directory: {directory}")
             
-            # 첫 번째 파일 선택
-            selected = files[0]
-            if len(files) > 1:
-                print(f"    ⚠️ Warning: {len(files)} images in {label}. Using first one: {selected.name}")
-            
-            return selected
+            return files[0]
 
-        # 자동 탐색
         src_p = find_first_image(src_dir_path, "src")
         ref_p = find_first_image(ref_dir_path, "ref")
         
-        print(f"    👉 Auto-selected Source: {src_p.name}")
-        print(f"    👉 Auto-selected Reference: {ref_p.name}")
+        print(f"    👉 Source: {src_p.name}")
+        print(f"    👉 Reference: {ref_p.name}")
 
         return src_p, ref_p
 
@@ -116,6 +102,7 @@ def execute_pose_transfer(
     time_str = datetime.now().strftime("%H%M%S")
     job_id = f"{date_str}_{time_str}_{src_p.stem}_to_{ref_p.stem}"
     
+    # [수정] 디렉토리 설정 로직 호출
     out_dirs = _setup_directories(output_root, job_id)
 
     print(f"\n🚀 [Start Job] {job_id}")
@@ -124,23 +111,27 @@ def execute_pose_transfer(
         pipeline = PoseTransferPipeline(pipeline_config, yaml_config=yaml_config)
         
         print("📊 Analyzing Inputs...")
-        _save_analysis(pipeline, src_p, out_dirs["source"], "source")
-        _save_analysis(pipeline, ref_p, out_dirs["reference"], "reference")
+        # [수정] prefix를 'source' -> 'src', 'reference' -> 'ref'로 변경
+        _save_analysis(pipeline, src_p, out_dirs["src"], "src")
+        _save_analysis(pipeline, ref_p, out_dirs["ref"], "ref")
         
         print("✨ Running Transfer...")
         result = pipeline.transfer(src_p, ref_p)
         
         res_paths = {}
         
-        path_json = out_dirs["result"] / "transferred_keypoints.json"
+        # [수정] 파일명 변경: transferred -> trans, keypoints -> kp
+        path_json = out_dirs["trans"] / "trans_kp.json"
         save_json(result.to_json(), str(path_json))
         res_paths['json'] = str(path_json)
         
-        path_skel = out_dirs["result"] / "transferred_skeleton.png"
+        # [수정] 파일명 변경: skeleton -> sk, 포맷 -> jpg
+        path_skel = out_dirs["trans"] / "trans_sk.jpg"
         save_image(result.skeleton_image, str(path_skel))
         res_paths['skeleton'] = str(path_skel)
         
-        path_overlay = out_dirs["result"] / "transferred_overlay.png"
+        # [수정] 파일명 변경: overlay -> rend, 포맷 -> jpg
+        path_overlay = out_dirs["trans"] / "trans_rend.jpg"
         src_img = load_image(src_p)
         overlay = pipeline.renderer.render(src_img, result.transferred_keypoints, result.transferred_scores)
         save_image(overlay, str(path_overlay))
@@ -160,14 +151,17 @@ def execute_pose_transfer(
         traceback.print_exc()
         raise RuntimeError(f"Pose transfer failed: {e}")
 
-# 내부 헬퍼 함수들
+# ====================================================
+# [Internal] 내부 헬퍼 함수들
+# ====================================================
 def _setup_directories(output_root: str, job_id: str):
     base_dir = Path(output_root) / job_id
+    # [수정] 폴더명 변경: 01_source -> src, 02_reference -> ref, 03_result -> trans
     dirs = {
         "root": base_dir,
-        "source": base_dir / "01_source",
-        "reference": base_dir / "02_reference",
-        "result": base_dir / "03_result"
+        "src": base_dir / "src",
+        "ref": base_dir / "ref",
+        "trans": base_dir / "trans"
     }
     for d in dirs.values():
         d.mkdir(parents=True, exist_ok=True)
@@ -175,19 +169,21 @@ def _setup_directories(output_root: str, job_id: str):
 
 def _save_analysis(pipeline, image_path: Path, output_dir: Path, prefix: str):
     json_data, skel_img, overlay_img = pipeline.extract_and_render(image_path)
-    save_json(json_data, str(output_dir / f"{prefix}_keypoints.json"))
-    save_image(skel_img, str(output_dir / f"{prefix}_skeleton.png"))
-    save_image(overlay_img, str(output_dir / f"{prefix}_overlay.png"))
+    
+    # [수정] 파일명 및 확장자 변경
+    save_json(json_data, str(output_dir / f"{prefix}_kp.json"))
+    save_image(skel_img, str(output_dir / f"{prefix}_sk.jpg"))   # png -> jpg
+    save_image(overlay_img, str(output_dir / f"{prefix}_rend.jpg")) # png -> jpg
 
 def _cleanup_inputs(src_path: Path, ref_path: Path, enable_archiving: bool, archive_root: str = "archive"):
     if enable_archiving:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         archive_dir = Path(archive_root)
-        (archive_dir / "source").mkdir(parents=True, exist_ok=True)
-        (archive_dir / "reference").mkdir(parents=True, exist_ok=True)
+        (archive_dir / "src").mkdir(parents=True, exist_ok=True) # source -> src
+        (archive_dir / "ref").mkdir(parents=True, exist_ok=True) # reference -> ref
         
-        dest_src = archive_dir / "source" / f"{timestamp}_{src_path.name}"
-        dest_ref = archive_dir / "reference" / f"{timestamp}_{ref_path.name}"
+        dest_src = archive_dir / "src" / f"{timestamp}_{src_path.name}"
+        dest_ref = archive_dir / "ref" / f"{timestamp}_{ref_path.name}"
         
         shutil.move(str(src_path), str(dest_src))
         shutil.move(str(ref_path), str(dest_ref))
