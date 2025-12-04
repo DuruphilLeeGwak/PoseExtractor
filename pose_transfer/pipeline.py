@@ -1,6 +1,7 @@
 """
-포즈 전이 파이프라인 v2
-- Ghost Legs 클리핑을 extract_pose() 단계에서 수행
+포즈 전이 파이프라인 v3
+- Ghost Legs 클리핑
+- [NEW] 키포인트 기반 자동 패딩/크롭 (trans_sk용)
 """
 import cv2
 import numpy as np
@@ -71,10 +72,14 @@ class PipelineConfig:
     point_radius: int = 4
     kpt_threshold: float = 0.3
     
-    # [NEW] Ghost Legs 클리핑 설정
+    # Ghost Legs 클리핑 설정
     ghost_legs_clipping_enabled: bool = True
-    lower_body_confidence_threshold: float = 2.0  # 이 미만이면 저신뢰
-    lower_body_margin_ratio: float = 0.10  # 이미지 하단 10% = 경계
+    lower_body_confidence_threshold: float = 2.0
+    lower_body_margin_ratio: float = 0.10
+    
+    # [NEW] 키포인트 기반 크롭 설정
+    auto_crop_enabled: bool = True
+    crop_padding_px: int = 50  # 바운딩 박스 외부에 추가할 패딩 (픽셀)
     
     @classmethod
     def from_yaml(cls, yaml_path: str) -> 'PipelineConfig':
@@ -82,12 +87,15 @@ class PipelineConfig:
         config = load_config(yaml_path)
         rendering = config.get('rendering', {})
         transfer = config.get('transfer', {})
+        output = config.get('output', {})
         
         print("\n[DEBUG] Loading YAML config...")
         print(f"  model.backend: {config.get('model', {}).get('backend')}")
         print(f"  rendering.kpt_threshold: {rendering.get('kpt_threshold')}")
         print(f"  transfer.lower_body_confidence_threshold: {transfer.get('lower_body_confidence_threshold')}")
         print(f"  transfer.lower_body_margin_ratio: {transfer.get('lower_body_margin_ratio')}")
+        print(f"  output.auto_crop_enabled: {output.get('auto_crop_enabled')}")
+        print(f"  output.crop_padding_px: {output.get('crop_padding_px')}")
         
         return cls(
             backend=config.get('model', {}).get('backend', 'onnxruntime'),
@@ -107,10 +115,13 @@ class PipelineConfig:
             hand_line_thickness=rendering.get('hand_line_thickness', 2),
             point_radius=rendering.get('point_radius', 4),
             kpt_threshold=rendering.get('kpt_threshold', 0.3),
-            # [NEW] Ghost Legs 설정
+            # Ghost Legs 설정
             ghost_legs_clipping_enabled=transfer.get('ghost_legs_clipping_enabled', True),
             lower_body_confidence_threshold=transfer.get('lower_body_confidence_threshold', 2.0),
             lower_body_margin_ratio=transfer.get('lower_body_margin_ratio', 0.10),
+            # [NEW] 크롭 설정
+            auto_crop_enabled=output.get('auto_crop_enabled', True),
+            crop_padding_px=output.get('crop_padding_px', 50),
         )
 
 
@@ -155,6 +166,8 @@ class PoseTransferPipeline:
         print(f"  ghost_legs_clipping_enabled: {self.config.ghost_legs_clipping_enabled}")
         print(f"  lower_body_confidence_threshold: {self.config.lower_body_confidence_threshold}")
         print(f"  lower_body_margin_ratio: {self.config.lower_body_margin_ratio}")
+        print(f"  auto_crop_enabled: {self.config.auto_crop_enabled}")
+        print(f"  crop_padding_px: {self.config.crop_padding_px}")
         
         # 추출기
         self.extractor = DWPoseExtractorFactory.get_instance(
@@ -202,7 +215,139 @@ class PoseTransferPipeline:
         )
     
     # ============================================================
-    # [NEW] Ghost Legs 클리핑 함수들
+    # [NEW] 키포인트 바운딩 박스 계산
+    # ============================================================
+    def _get_keypoint_bbox(
+        self,
+        keypoints: np.ndarray,
+        scores: np.ndarray,
+        score_threshold: float = 0.1
+    ) -> Tuple[float, float, float, float]:
+        """
+        유효한 키포인트들의 바운딩 박스 계산
+        
+        Returns:
+            (min_x, min_y, max_x, max_y)
+        """
+        valid_mask = scores > score_threshold
+        valid_kpts = keypoints[valid_mask]
+        
+        if len(valid_kpts) == 0:
+            return (0, 0, 100, 100)
+        
+        min_x = np.min(valid_kpts[:, 0])
+        min_y = np.min(valid_kpts[:, 1])
+        max_x = np.max(valid_kpts[:, 0])
+        max_y = np.max(valid_kpts[:, 1])
+        
+        return (min_x, min_y, max_x, max_y)
+    
+    # ============================================================
+    # [NEW] 키포인트 기반 캔버스 크기 계산 및 좌표 변환
+    # ============================================================
+    def _calculate_canvas_and_offset(
+        self,
+        keypoints: np.ndarray,
+        scores: np.ndarray,
+        base_size: Tuple[int, int],
+        padding: int
+    ) -> Tuple[Tuple[int, int], Tuple[int, int], np.ndarray]:
+        """
+        키포인트가 모두 들어오도록 캔버스 크기와 오프셋 계산
+        
+        Args:
+            keypoints: 키포인트 좌표
+            scores: 키포인트 신뢰도
+            base_size: 기준 이미지 크기 (height, width)
+            padding: 바운딩 박스 외부 패딩 (픽셀)
+        
+        Returns:
+            (canvas_size, offset, adjusted_keypoints)
+            - canvas_size: (height, width)
+            - offset: (offset_x, offset_y) - 원본 좌표에서 캔버스 좌표로의 오프셋
+            - adjusted_keypoints: 오프셋이 적용된 키포인트
+        """
+        base_h, base_w = base_size
+        
+        # 바운딩 박스 계산
+        min_x, min_y, max_x, max_y = self._get_keypoint_bbox(
+            keypoints, scores, self.config.kpt_threshold
+        )
+        
+        # 패딩 적용한 바운딩 박스
+        bbox_left = min_x - padding
+        bbox_top = min_y - padding
+        bbox_right = max_x + padding
+        bbox_bottom = max_y + padding
+        
+        # 필요한 확장 계산
+        expand_left = max(0, -bbox_left)
+        expand_top = max(0, -bbox_top)
+        expand_right = max(0, bbox_right - base_w)
+        expand_bottom = max(0, bbox_bottom - base_h)
+        
+        # 캔버스 크기 (확장 포함)
+        canvas_w = int(base_w + expand_left + expand_right)
+        canvas_h = int(base_h + expand_top + expand_bottom)
+        
+        # 오프셋 (원본 좌표 -> 캔버스 좌표)
+        offset_x = expand_left
+        offset_y = expand_top
+        
+        # 키포인트 좌표 조정
+        adjusted_kpts = keypoints.copy()
+        adjusted_kpts[:, 0] += offset_x
+        adjusted_kpts[:, 1] += offset_y
+        
+        print(f"   📐 [Canvas] base={base_w}x{base_h} -> canvas={canvas_w}x{canvas_h}")
+        print(f"       expand: L={expand_left:.0f}, T={expand_top:.0f}, R={expand_right:.0f}, B={expand_bottom:.0f}")
+        print(f"       offset: ({offset_x:.0f}, {offset_y:.0f})")
+        
+        return (canvas_h, canvas_w), (int(offset_x), int(offset_y)), adjusted_kpts
+    
+    # ============================================================
+    # [NEW] 키포인트 기반 최종 크롭
+    # ============================================================
+    def _crop_to_keypoints(
+        self,
+        image: np.ndarray,
+        keypoints: np.ndarray,
+        scores: np.ndarray,
+        padding: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        키포인트 바운딩 박스 + 패딩으로 이미지 크롭
+        
+        Returns:
+            (cropped_image, cropped_keypoints)
+        """
+        h, w = image.shape[:2]
+        
+        # 바운딩 박스 계산
+        min_x, min_y, max_x, max_y = self._get_keypoint_bbox(
+            keypoints, scores, self.config.kpt_threshold
+        )
+        
+        # 패딩 적용 + 경계 클리핑
+        crop_x1 = max(0, int(min_x - padding))
+        crop_y1 = max(0, int(min_y - padding))
+        crop_x2 = min(w, int(max_x + padding))
+        crop_y2 = min(h, int(max_y + padding))
+        
+        # 크롭
+        cropped = image[crop_y1:crop_y2, crop_x1:crop_x2]
+        
+        # 키포인트 좌표 조정
+        cropped_kpts = keypoints.copy()
+        cropped_kpts[:, 0] -= crop_x1
+        cropped_kpts[:, 1] -= crop_y1
+        
+        print(f"   ✂️ [Crop] ({crop_x1}, {crop_y1}) ~ ({crop_x2}, {crop_y2}) -> {crop_x2-crop_x1}x{crop_y2-crop_y1}")
+        
+        return cropped, cropped_kpts
+    
+    # ============================================================
+    # Ghost Legs 클리핑 함수들
     # ============================================================
     def _clip_ghost_legs(
         self, 
@@ -211,24 +356,17 @@ class PoseTransferPipeline:
         image_height: int,
         image_width: int
     ) -> Tuple[np.ndarray, np.ndarray, int]:
-        """
-        프레임 경계 밖 또는 저신뢰도 하반신 키포인트 제거
-        
-        Returns:
-            keypoints, scores, clipped_count
-        """
+        """프레임 경계 밖 또는 저신뢰도 하반신 키포인트 제거"""
         if not self.config.ghost_legs_clipping_enabled:
             return keypoints, scores, 0
         
         boundary_y = image_height * (1 - self.config.lower_body_margin_ratio)
         conf_threshold = self.config.lower_body_confidence_threshold
         
-        # 무효화할 인덱스 수집
         invalid_indices = self._get_invalid_lower_body_indices(
             keypoints, scores, boundary_y, conf_threshold
         )
         
-        # 무효화 적용
         clipped_count = 0
         for idx in invalid_indices:
             if scores[idx] > 0:
@@ -236,7 +374,7 @@ class PoseTransferPipeline:
                 clipped_count += 1
         
         if clipped_count > 0:
-            print(f"   🔧 [Ghost Legs] Clipped {clipped_count} keypoints (boundary_y={boundary_y:.0f}, conf_thresh={conf_threshold})")
+            print(f"   🔧 [Ghost Legs] Clipped {clipped_count} keypoints")
         
         return keypoints, scores, clipped_count
     
@@ -250,7 +388,6 @@ class PoseTransferPipeline:
         """무효화할 하반신 키포인트 인덱스 집합 반환"""
         invalid = set()
         
-        # 체크할 하반신 부위 (순서 중요: 부모 먼저)
         lower_body_parts = [
             ('left_hip', BODY_KEYPOINTS.get('left_hip', 11)),
             ('right_hip', BODY_KEYPOINTS.get('right_hip', 12)),
@@ -260,7 +397,6 @@ class PoseTransferPipeline:
             ('right_ankle', BODY_KEYPOINTS.get('right_ankle', 16)),
         ]
         
-        # 발 키포인트 (FEET_KEYPOINTS가 있을 경우)
         feet_parts = []
         if FEET_KEYPOINTS:
             feet_parts = [
@@ -279,13 +415,11 @@ class PoseTransferPipeline:
             y = keypoints[idx][1]
             conf = scores[idx]
             
-            # 무효화 조건: 경계 밖 OR 저신뢰도
             over_boundary = y >= boundary_y
-            low_confidence = conf < conf_threshold and conf > 0  # 이미 0인 건 스킵
+            low_confidence = conf < conf_threshold and conf > 0
             
             if over_boundary or low_confidence:
                 invalid.add(idx)
-                # 자식들도 무효화
                 self._invalidate_children(part_name, invalid)
         
         return invalid
@@ -296,7 +430,6 @@ class PoseTransferPipeline:
             return
         
         for child_name in LOWER_BODY_HIERARCHY[parent_name]:
-            # BODY_KEYPOINTS에서 먼저 찾고, 없으면 FEET_KEYPOINTS에서 찾기
             if child_name in BODY_KEYPOINTS:
                 child_idx = BODY_KEYPOINTS[child_name]
             elif FEET_KEYPOINTS and child_name in FEET_KEYPOINTS:
@@ -315,27 +448,20 @@ class PoseTransferPipeline:
         image: Union[np.ndarray, str, Path],
         filter_person: bool = True
     ) -> Tuple[np.ndarray, np.ndarray, int, Tuple[int, int]]:
-        """
-        포즈 추출 + Ghost Legs 클리핑
-        
-        Returns:
-            keypoints, scores, selected_idx, image_size
-        """
+        """포즈 추출 + Ghost Legs 클리핑"""
         if isinstance(image, (str, Path)):
             img = load_image(image)
         else:
             img = image
         
-        image_size = img.shape[:2]  # (height, width)
+        image_size = img.shape[:2]
         img_h, img_w = image_size
         
-        # 1. DWPose 추출
         all_keypoints, all_scores = self.extractor.extract(img)
         
         if len(all_keypoints) == 0:
             return np.zeros((133, 2)), np.zeros(133), -1, image_size
         
-        # 2. 인물 필터링
         if filter_person and self.config.filter_enabled and len(all_keypoints) > 1:
             keypoints, scores, selected_idx, best = self.person_filter.select_main_person(
                 all_keypoints, all_scores, image_size
@@ -345,13 +471,11 @@ class PoseTransferPipeline:
             scores = all_scores[0]
             selected_idx = 0
         
-        # 3. 손 정밀화
         if self.config.hand_refinement_enabled:
             keypoints, scores, _ = self.hand_refiner.refine_both_hands(
                 img, keypoints, scores, self.extractor
             )
         
-        # 4. [NEW] Ghost Legs 클리핑
         keypoints, scores, clipped = self._clip_ghost_legs(
             keypoints, scores, img_h, img_w
         )
@@ -359,7 +483,7 @@ class PoseTransferPipeline:
         return keypoints, scores, selected_idx, image_size
     
     # ============================================================
-    # 전이 (Transfer)
+    # 전이 (Transfer) - 자동 패딩/크롭 포함
     # ============================================================
     def transfer(
         self,
@@ -384,7 +508,7 @@ class PoseTransferPipeline:
         
         ref_h, ref_w = ref_img.shape[:2]
         
-        # 포즈 추출 (Ghost Legs 클리핑 포함)
+        # 포즈 추출
         source_kpts, source_scores, source_idx, source_size = self.extract_pose(source_img)
         ref_kpts, ref_scores, ref_idx, ref_size = self.extract_pose(ref_img)
         
@@ -396,22 +520,26 @@ class PoseTransferPipeline:
             reference_image_size=(ref_h, ref_w)
         )
         
-        # 폴백 적용 (필요시)
-        if self.config.fallback_enabled:
-            pass
-            
         transferred_kpts = transfer_result.keypoints
         transferred_scores = transfer_result.scores
         
-        output_size = output_image_size or source_size
-        
-        skeleton_image = self.renderer.render_skeleton_only(
-            (output_size[0], output_size[1], 3),
-            transferred_kpts, transferred_scores
-        )
+        # [NEW] 자동 패딩/크롭 적용
+        if self.config.auto_crop_enabled:
+            skeleton_image, final_kpts, final_size = self._render_with_auto_crop(
+                transferred_kpts, transferred_scores,
+                source_size, self.config.crop_padding_px
+            )
+        else:
+            output_size = output_image_size or source_size
+            skeleton_image = self.renderer.render_skeleton_only(
+                (output_size[0], output_size[1], 3),
+                transferred_kpts, transferred_scores
+            )
+            final_kpts = transferred_kpts
+            final_size = output_size
         
         return PipelineResult(
-            transferred_keypoints=transferred_kpts,
+            transferred_keypoints=final_kpts,
             transferred_scores=transferred_scores,
             source_keypoints=source_kpts,
             source_scores=source_scores,
@@ -419,10 +547,47 @@ class PoseTransferPipeline:
             reference_keypoints=ref_kpts,
             reference_scores=ref_scores,
             skeleton_image=skeleton_image,
-            image_size=output_size,
+            image_size=final_size,
             selected_person_idx={'source': source_idx, 'reference': ref_idx},
             processing_info={'transfer_log': transfer_result.transfer_log}
         )
+    
+    # ============================================================
+    # [NEW] 자동 패딩/크롭으로 렌더링
+    # ============================================================
+    def _render_with_auto_crop(
+        self,
+        keypoints: np.ndarray,
+        scores: np.ndarray,
+        base_size: Tuple[int, int],
+        padding: int
+    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+        """
+        키포인트가 모두 포함되도록 자동으로 캔버스 확장 후 크롭
+        
+        Returns:
+            (skeleton_image, adjusted_keypoints, final_size)
+        """
+        # 1. 캔버스 크기 및 오프셋 계산
+        canvas_size, offset, adjusted_kpts = self._calculate_canvas_and_offset(
+            keypoints, scores, base_size, padding
+        )
+        
+        # 2. 확장된 캔버스에 렌더링
+        canvas_h, canvas_w = canvas_size
+        skeleton_image = self.renderer.render_skeleton_only(
+            (canvas_h, canvas_w, 3),
+            adjusted_kpts, scores
+        )
+        
+        # 3. 키포인트 바운딩 박스 + 패딩으로 크롭
+        cropped_image, cropped_kpts = self._crop_to_keypoints(
+            skeleton_image, adjusted_kpts, scores, padding
+        )
+        
+        final_size = cropped_image.shape[:2]
+        
+        return cropped_image, cropped_kpts, final_size
     
     # ============================================================
     # 추출 + 렌더링 (단일 이미지용)
@@ -431,7 +596,7 @@ class PoseTransferPipeline:
         self,
         image: Union[np.ndarray, str, Path]
     ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray]:
-        """단일 이미지 추출 및 렌더링 (Ghost Legs 클리핑 포함)"""
+        """단일 이미지 추출 및 렌더링"""
         if isinstance(image, (str, Path)):
             img = load_image(image)
         else:
@@ -439,15 +604,12 @@ class PoseTransferPipeline:
         
         image_size = img.shape[:2]
         
-        # 추출 (Ghost Legs 클리핑 포함)
         keypoints, scores, selected_idx, _ = self.extract_pose(img)
         
-        # JSON 변환
         json_data = convert_to_openpose_format(
             keypoints[np.newaxis, ...], scores[np.newaxis, ...], image_size
         )
         
-        # 렌더링
         skeleton_image = self.renderer.render_skeleton_only(
             (image_size[0], image_size[1], 3), keypoints, scores
         )

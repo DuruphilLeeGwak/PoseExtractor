@@ -1,7 +1,6 @@
 """
-Pose Transfer API Module (Updated)
-- Naming Convention Changed: src, ref, trans / kp, sk, rend
-- Output Format: JPG
+Pose Transfer API Module (Final v2)
+- Added 'retain_inputs' option to prevent file deletion/movement.
 """
 import sys
 import os
@@ -95,14 +94,21 @@ def execute_pose_transfer(
     else:
         pipeline_config = PipelineConfig()
 
+    # [수정] 시스템 설정 로드 (retain_inputs 추가)
     system_cfg = yaml_config.get('system', {})
     enable_archiving = system_cfg.get('enable_archiving', False)
+    retain_inputs = system_cfg.get('retain_inputs', False) # 기본값 False
+
+    # 출력 옵션 로드
+    output_cfg = yaml_config.get('output', {})
+    do_save_json = output_cfg.get('save_json', True)
+    do_save_skel = output_cfg.get('save_skeleton_image', True)
+    do_save_debug = output_cfg.get('save_debug_image', False)
 
     date_str = datetime.now().strftime("%Y%m%d")
     time_str = datetime.now().strftime("%H%M%S")
     job_id = f"{date_str}_{time_str}_{src_p.stem}_to_{ref_p.stem}"
     
-    # [수정] 디렉토리 설정 로직 호출
     out_dirs = _setup_directories(output_root, job_id)
 
     print(f"\n🚀 [Start Job] {job_id}")
@@ -111,37 +117,37 @@ def execute_pose_transfer(
         pipeline = PoseTransferPipeline(pipeline_config, yaml_config=yaml_config)
         
         print("📊 Analyzing Inputs...")
-        # [수정] prefix를 'source' -> 'src', 'reference' -> 'ref'로 변경
-        _save_analysis(pipeline, src_p, out_dirs["src"], "src")
-        _save_analysis(pipeline, ref_p, out_dirs["ref"], "ref")
+        _save_analysis(pipeline, src_p, out_dirs["src"], "src", do_save_json, do_save_skel, do_save_debug)
+        _save_analysis(pipeline, ref_p, out_dirs["ref"], "ref", do_save_json, do_save_skel, do_save_debug)
         
         print("✨ Running Transfer...")
         result = pipeline.transfer(src_p, ref_p)
         
         res_paths = {}
         
-        # [수정] 파일명 변경: transferred -> trans, keypoints -> kp
-        path_json = out_dirs["trans"] / "trans_kp.json"
-        save_json(result.to_json(), str(path_json))
-        res_paths['json'] = str(path_json)
+        if do_save_json:
+            path_json = out_dirs["trans"] / "trans_kp.json"
+            save_json(result.to_json(), str(path_json))
+            res_paths['json'] = str(path_json)
         
-        # [수정] 파일명 변경: skeleton -> sk, 포맷 -> jpg
-        path_skel = out_dirs["trans"] / "trans_sk.jpg"
-        save_image(result.skeleton_image, str(path_skel))
-        res_paths['skeleton'] = str(path_skel)
+        if do_save_skel:
+            path_skel = out_dirs["trans"] / "trans_sk.jpg"
+            save_image(result.skeleton_image, str(path_skel))
+            res_paths['skeleton'] = str(path_skel)
         
-        # [수정] 파일명 변경: overlay -> rend, 포맷 -> jpg
-        path_overlay = out_dirs["trans"] / "trans_rend.jpg"
-        src_img = load_image(src_p)
-        overlay = pipeline.renderer.render(src_img, result.transferred_keypoints, result.transferred_scores)
-        save_image(overlay, str(path_overlay))
-        res_paths['overlay'] = str(path_overlay)
+        if do_save_debug:
+            path_overlay = out_dirs["trans"] / "trans_rend.jpg"
+            src_img = load_image(src_p)
+            overlay = pipeline.renderer.render(src_img, result.transferred_keypoints, result.transferred_scores)
+            save_image(overlay, str(path_overlay))
+            res_paths['overlay'] = str(path_overlay)
         
         res_paths['job_dir'] = str(out_dirs['root'])
         
-        print(f"✅ Finished: {path_skel}")
+        print(f"✅ Finished Job")
         
-        _cleanup_inputs(src_p, ref_p, enable_archiving)
+        # [수정] 파일 정리 함수 호출 (retain_inputs 전달)
+        _cleanup_inputs(src_p, ref_p, enable_archiving, retain_inputs)
         
         return res_paths
 
@@ -156,7 +162,6 @@ def execute_pose_transfer(
 # ====================================================
 def _setup_directories(output_root: str, job_id: str):
     base_dir = Path(output_root) / job_id
-    # [수정] 폴더명 변경: 01_source -> src, 02_reference -> ref, 03_result -> trans
     dirs = {
         "root": base_dir,
         "src": base_dir / "src",
@@ -167,20 +172,30 @@ def _setup_directories(output_root: str, job_id: str):
         d.mkdir(parents=True, exist_ok=True)
     return dirs
 
-def _save_analysis(pipeline, image_path: Path, output_dir: Path, prefix: str):
+def _save_analysis(pipeline, image_path: Path, output_dir: Path, prefix: str, save_json_flag, save_skel_flag, save_debug_flag):
     json_data, skel_img, overlay_img = pipeline.extract_and_render(image_path)
     
-    # [수정] 파일명 및 확장자 변경
-    save_json(json_data, str(output_dir / f"{prefix}_kp.json"))
-    save_image(skel_img, str(output_dir / f"{prefix}_sk.jpg"))   # png -> jpg
-    save_image(overlay_img, str(output_dir / f"{prefix}_rend.jpg")) # png -> jpg
+    if save_json_flag:
+        save_json(json_data, str(output_dir / f"{prefix}_kp.json"))
+    if save_skel_flag:
+        save_image(skel_img, str(output_dir / f"{prefix}_sk.jpg"))
+    if save_debug_flag:
+        save_image(overlay_img, str(output_dir / f"{prefix}_rend.jpg"))
 
-def _cleanup_inputs(src_path: Path, ref_path: Path, enable_archiving: bool, archive_root: str = "archive"):
+def _cleanup_inputs(src_path: Path, ref_path: Path, enable_archiving: bool, retain_inputs: bool, archive_root: str = "archive"):
+    """입력 파일 정리 로직 (수정됨)"""
+    
+    # 1. 파일 유지 모드 (가장 강력함)
+    if retain_inputs:
+        print("🛡️  Inputs retained (System setting: retain_inputs=True)")
+        return
+
+    # 2. 아카이빙 모드 (이동)
     if enable_archiving:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         archive_dir = Path(archive_root)
-        (archive_dir / "src").mkdir(parents=True, exist_ok=True) # source -> src
-        (archive_dir / "ref").mkdir(parents=True, exist_ok=True) # reference -> ref
+        (archive_dir / "src").mkdir(parents=True, exist_ok=True)
+        (archive_dir / "ref").mkdir(parents=True, exist_ok=True)
         
         dest_src = archive_dir / "src" / f"{timestamp}_{src_path.name}"
         dest_ref = archive_dir / "ref" / f"{timestamp}_{ref_path.name}"
@@ -188,6 +203,8 @@ def _cleanup_inputs(src_path: Path, ref_path: Path, enable_archiving: bool, arch
         shutil.move(str(src_path), str(dest_src))
         shutil.move(str(ref_path), str(dest_ref))
         print(f"📦 Archived inputs to {archive_dir}")
+        
+    # 3. 휘발 모드 (삭제)
     else:
         try:
             if src_path.exists(): os.remove(str(src_path))
