@@ -9,8 +9,8 @@ input_mode:
 
   internal:
     root_dir: "inputs"
-    source_name: "source.jpg"
-    reference_name: "reference.jpg"
+    src_dir: "src"      # 소스 이미지가 있는 하위 폴더명
+    ref_dir: "ref"      # 레퍼런스 이미지가 있는 하위 폴더명
 
   external:
     source_path: "/var/data/users/user_123.jpg"

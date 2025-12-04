@@ -1,3 +1,9 @@
+
+"""
+Pose Transfer CLI Entry Point (Renamed)
+Filename: PoseExtractor.py
+...
+"""
 """
 Pose Transfer CLI Entry Point
 """

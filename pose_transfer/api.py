@@ -15,9 +15,15 @@ from .pipeline import PipelineConfig, PoseTransferPipeline
 from .utils.io import save_json, save_image, load_image
 
 # ====================================================
-# [Helper] 경로 결정 로직
+# [Helper] 경로 결정 로직 (수정됨: 폴더 스캔 기능)
 # ====================================================
 def resolve_input_paths(cli_args, yaml_config) -> Tuple[Path, Path]:
+    """
+    경로 결정 로직
+    1. CLI 인자 우선
+    2. Internal Mode: inputs/src 및 inputs/ref 폴더 내의 첫 번째 이미지를 자동 선택
+    """
+    # 1. CLI가 있으면 최우선
     if cli_args.source and cli_args.reference:
         print("ℹ️  [Input] Using CLI arguments.")
         return Path(cli_args.source), Path(cli_args.reference)
@@ -28,19 +34,51 @@ def resolve_input_paths(cli_args, yaml_config) -> Tuple[Path, Path]:
     if mode == 'external':
         src = input_cfg.get('external', {}).get('source_path', '')
         ref = input_cfg.get('external', {}).get('reference_path', '')
-        print(f"ℹ️  [Input] Using YAML External Mode: {src}, {ref}")
+        print(f"ℹ️  [Input] Using YAML External Mode.")
         return Path(src), Path(ref)
     else:
+        # Internal Mode
         internal_cfg = input_cfg.get('internal', {})
         root = internal_cfg.get('root_dir', 'inputs')
-        src_name = internal_cfg.get('source_name', 'source.jpg')
-        ref_name = internal_cfg.get('reference_name', 'reference.jpg')
+        src_dir_name = internal_cfg.get('src_dir', 'src')
+        ref_dir_name = internal_cfg.get('ref_dir', 'ref')
         
-        # 프로젝트 루트 기준 경로 추정 (api.py -> pose_transfer -> root)
         project_root = Path(__file__).parent.parent
-        base_path = project_root / root
-        print(f"ℹ️  [Input] Using YAML Internal Mode: {base_path}")
-        return base_path / src_name, base_path / ref_name
+        inputs_root = project_root / root
+        
+        src_dir_path = inputs_root / src_dir_name
+        ref_dir_path = inputs_root / ref_dir_name
+        
+        print(f"ℹ️  [Input] Internal Mode: Scanning folders...")
+        print(f"    - Src: {src_dir_path}")
+        print(f"    - Ref: {ref_dir_path}")
+
+        # 폴더 내 이미지 찾기 함수
+        def find_first_image(directory: Path, label: str) -> Path:
+            if not directory.exists():
+                raise FileNotFoundError(f"❌ '{label}' directory not found: {directory}")
+            
+            valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+            files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
+            
+            if not files:
+                raise FileNotFoundError(f"❌ No images found in '{label}' directory: {directory}")
+            
+            # 첫 번째 파일 선택
+            selected = files[0]
+            if len(files) > 1:
+                print(f"    ⚠️ Warning: {len(files)} images in {label}. Using first one: {selected.name}")
+            
+            return selected
+
+        # 자동 탐색
+        src_p = find_first_image(src_dir_path, "src")
+        ref_p = find_first_image(ref_dir_path, "ref")
+        
+        print(f"    👉 Auto-selected Source: {src_p.name}")
+        print(f"    👉 Auto-selected Reference: {ref_p.name}")
+
+        return src_p, ref_p
 
 # ====================================================
 # [API] 외부에서 호출하는 핵심 함수
