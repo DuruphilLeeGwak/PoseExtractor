@@ -1,7 +1,8 @@
 """
-포즈 전이 파이프라인 v3
+포즈 전이 파이프라인 v4
 - Ghost Legs 클리핑
-- [NEW] 키포인트 기반 자동 패딩/크롭 (trans_sk용)
+- 키포인트 기반 자동 패딩/크롭 (trans_sk용)
+- [NEW] 머리 방향 추가 패딩 (코 벡터 기반)
 """
 import cv2
 import numpy as np
@@ -77,9 +78,12 @@ class PipelineConfig:
     lower_body_confidence_threshold: float = 2.0
     lower_body_margin_ratio: float = 0.10
     
-    # [NEW] 키포인트 기반 크롭 설정
+    # 키포인트 기반 크롭 설정
     auto_crop_enabled: bool = True
-    crop_padding_px: int = 50  # 바운딩 박스 외부에 추가할 패딩 (픽셀)
+    crop_padding_px: int = 50
+    
+    # [NEW] 머리 방향 추가 패딩
+    head_padding_ratio: float = 0.5
     
     @classmethod
     def from_yaml(cls, yaml_path: str) -> 'PipelineConfig':
@@ -96,6 +100,7 @@ class PipelineConfig:
         print(f"  transfer.lower_body_margin_ratio: {transfer.get('lower_body_margin_ratio')}")
         print(f"  output.auto_crop_enabled: {output.get('auto_crop_enabled')}")
         print(f"  output.crop_padding_px: {output.get('crop_padding_px')}")
+        print(f"  output.head_padding_ratio: {output.get('head_padding_ratio')}")
         
         return cls(
             backend=config.get('model', {}).get('backend', 'onnxruntime'),
@@ -119,9 +124,11 @@ class PipelineConfig:
             ghost_legs_clipping_enabled=transfer.get('ghost_legs_clipping_enabled', True),
             lower_body_confidence_threshold=transfer.get('lower_body_confidence_threshold', 2.0),
             lower_body_margin_ratio=transfer.get('lower_body_margin_ratio', 0.10),
-            # [NEW] 크롭 설정
+            # 크롭 설정
             auto_crop_enabled=output.get('auto_crop_enabled', True),
             crop_padding_px=output.get('crop_padding_px', 50),
+            # [NEW] 머리 패딩
+            head_padding_ratio=output.get('head_padding_ratio', 0.5),
         )
 
 
@@ -168,6 +175,7 @@ class PoseTransferPipeline:
         print(f"  lower_body_margin_ratio: {self.config.lower_body_margin_ratio}")
         print(f"  auto_crop_enabled: {self.config.auto_crop_enabled}")
         print(f"  crop_padding_px: {self.config.crop_padding_px}")
+        print(f"  head_padding_ratio: {self.config.head_padding_ratio}")
         
         # 추출기
         self.extractor = DWPoseExtractorFactory.get_instance(
@@ -215,7 +223,7 @@ class PoseTransferPipeline:
         )
     
     # ============================================================
-    # [NEW] 키포인트 바운딩 박스 계산
+    # 키포인트 바운딩 박스 계산
     # ============================================================
     def _get_keypoint_bbox(
         self,
@@ -223,12 +231,7 @@ class PoseTransferPipeline:
         scores: np.ndarray,
         score_threshold: float = 0.1
     ) -> Tuple[float, float, float, float]:
-        """
-        유효한 키포인트들의 바운딩 박스 계산
-        
-        Returns:
-            (min_x, min_y, max_x, max_y)
-        """
+        """유효한 키포인트들의 바운딩 박스 계산"""
         valid_mask = scores > score_threshold
         valid_kpts = keypoints[valid_mask]
         
@@ -243,7 +246,91 @@ class PoseTransferPipeline:
         return (min_x, min_y, max_x, max_y)
     
     # ============================================================
-    # [NEW] 키포인트 기반 캔버스 크기 계산 및 좌표 변환
+    # [NEW] 머리 방향 및 추가 패딩 계산 (가상 정수리 포인트 기반)
+    # ============================================================
+    def _calculate_head_padding(
+        self,
+        keypoints: np.ndarray,
+        scores: np.ndarray
+    ) -> Tuple[float, float, float, float]:
+        """
+        코 벡터(목 → 코)를 기반으로 머리 방향을 파악하고,
+        가상의 정수리 포인트까지 포함하도록 패딩 계산
+        
+        Returns:
+            (pad_left, pad_top, pad_right, pad_bottom) - 각 방향 추가 패딩
+        """
+        # 키포인트 인덱스
+        nose_idx = BODY_KEYPOINTS.get('nose', 0)
+        l_shoulder_idx = BODY_KEYPOINTS.get('left_shoulder', 5)
+        r_shoulder_idx = BODY_KEYPOINTS.get('right_shoulder', 6)
+        l_eye_idx = BODY_KEYPOINTS.get('left_eye', 1)
+        r_eye_idx = BODY_KEYPOINTS.get('right_eye', 2)
+        
+        # 유효성 체크
+        nose_valid = scores[nose_idx] > 0.1
+        l_sh_valid = scores[l_shoulder_idx] > 0.1
+        r_sh_valid = scores[r_shoulder_idx] > 0.1
+        
+        if not nose_valid or not (l_sh_valid or r_sh_valid):
+            print(f"   🗣️ [Head] Skip - nose_valid={nose_valid}, shoulders={l_sh_valid}/{r_sh_valid}")
+            return (0, 0, 0, 0)
+        
+        # 목 위치 (어깨 중심)
+        if l_sh_valid and r_sh_valid:
+            neck = (keypoints[l_shoulder_idx] + keypoints[r_shoulder_idx]) / 2
+        elif l_sh_valid:
+            neck = keypoints[l_shoulder_idx]
+        else:
+            neck = keypoints[r_shoulder_idx]
+        
+        nose = keypoints[nose_idx]
+        
+        # 머리 방향 벡터 (목 → 코)
+        head_vec = nose - neck
+        head_length = np.linalg.norm(head_vec)
+        
+        if head_length < 1:
+            print(f"   🗣️ [Head] Skip - head_length too small: {head_length:.1f}")
+            return (0, 0, 0, 0)
+        
+        # 정규화된 머리 방향
+        head_dir = head_vec / head_length
+        
+        # 머리 크기 추정 (눈 사이 거리 또는 머리 벡터 길이 기반)
+        if scores[l_eye_idx] > 0.1 and scores[r_eye_idx] > 0.1:
+            eye_dist = np.linalg.norm(keypoints[l_eye_idx] - keypoints[r_eye_idx])
+            head_size = eye_dist * 2.5
+        else:
+            head_size = head_length * 1.5
+        
+        # 가상 정수리 포인트 계산 (코에서 머리 방향으로 head_size만큼 더 감)
+        # head_padding_ratio를 곱해서 최종 패딩 거리 결정
+        extend_distance = head_size * self.config.head_padding_ratio
+        
+        # 정수리 방향 = 머리 방향과 동일 (목→코 방향의 연장선)
+        crown_point = nose + head_dir * extend_distance
+        
+        # 현재 바운딩 박스 기준으로 정수리 포인트가 얼마나 벗어나는지 계산
+        # 바운딩 박스의 min/max는 호출 시점에서 이미 계산되므로,
+        # 여기서는 코 위치 대비 정수리까지의 오프셋만 반환
+        offset_x = crown_point[0] - nose[0]
+        offset_y = crown_point[1] - nose[1]
+        
+        # 방향별 패딩 계산 (정수리가 바운딩 박스 밖으로 나가는 양)
+        pad_left = max(0, -offset_x)
+        pad_right = max(0, offset_x)
+        pad_top = max(0, -offset_y)
+        pad_bottom = max(0, offset_y)
+        
+        print(f"   🗣️ [Head] dir=({head_dir[0]:.2f}, {head_dir[1]:.2f}), size={head_size:.0f}")
+        print(f"       nose=({nose[0]:.0f}, {nose[1]:.0f}) -> crown=({crown_point[0]:.0f}, {crown_point[1]:.0f})")
+        print(f"       pad: L={pad_left:.0f}, T={pad_top:.0f}, R={pad_right:.0f}, B={pad_bottom:.0f}")
+        
+        return (pad_left, pad_top, pad_right, pad_bottom)
+    
+    # ============================================================
+    # 키포인트 기반 캔버스 크기 계산 (머리 패딩 포함)
     # ============================================================
     def _calculate_canvas_and_offset(
         self,
@@ -252,21 +339,7 @@ class PoseTransferPipeline:
         base_size: Tuple[int, int],
         padding: int
     ) -> Tuple[Tuple[int, int], Tuple[int, int], np.ndarray]:
-        """
-        키포인트가 모두 들어오도록 캔버스 크기와 오프셋 계산
-        
-        Args:
-            keypoints: 키포인트 좌표
-            scores: 키포인트 신뢰도
-            base_size: 기준 이미지 크기 (height, width)
-            padding: 바운딩 박스 외부 패딩 (픽셀)
-        
-        Returns:
-            (canvas_size, offset, adjusted_keypoints)
-            - canvas_size: (height, width)
-            - offset: (offset_x, offset_y) - 원본 좌표에서 캔버스 좌표로의 오프셋
-            - adjusted_keypoints: 오프셋이 적용된 키포인트
-        """
+        """키포인트가 모두 들어오도록 캔버스 크기와 오프셋 계산 (머리 패딩 포함)"""
         base_h, base_w = base_size
         
         # 바운딩 박스 계산
@@ -274,11 +347,16 @@ class PoseTransferPipeline:
             keypoints, scores, self.config.kpt_threshold
         )
         
-        # 패딩 적용한 바운딩 박스
-        bbox_left = min_x - padding
-        bbox_top = min_y - padding
-        bbox_right = max_x + padding
-        bbox_bottom = max_y + padding
+        # [NEW] 머리 방향 추가 패딩
+        head_pad_l, head_pad_t, head_pad_r, head_pad_b = self._calculate_head_padding(
+            keypoints, scores
+        )
+        
+        # 기본 패딩 + 머리 패딩 적용
+        bbox_left = min_x - padding - head_pad_l
+        bbox_top = min_y - padding - head_pad_t
+        bbox_right = max_x + padding + head_pad_r
+        bbox_bottom = max_y + padding + head_pad_b
         
         # 필요한 확장 계산
         expand_left = max(0, -bbox_left)
@@ -306,7 +384,7 @@ class PoseTransferPipeline:
         return (canvas_h, canvas_w), (int(offset_x), int(offset_y)), adjusted_kpts
     
     # ============================================================
-    # [NEW] 키포인트 기반 최종 크롭
+    # 키포인트 기반 최종 크롭 (머리 패딩 포함)
     # ============================================================
     def _crop_to_keypoints(
         self,
@@ -315,12 +393,7 @@ class PoseTransferPipeline:
         scores: np.ndarray,
         padding: int
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        키포인트 바운딩 박스 + 패딩으로 이미지 크롭
-        
-        Returns:
-            (cropped_image, cropped_keypoints)
-        """
+        """키포인트 바운딩 박스 + 패딩 + 머리 패딩으로 이미지 크롭"""
         h, w = image.shape[:2]
         
         # 바운딩 박스 계산
@@ -328,11 +401,16 @@ class PoseTransferPipeline:
             keypoints, scores, self.config.kpt_threshold
         )
         
+        # 머리 방향 추가 패딩
+        head_pad_l, head_pad_t, head_pad_r, head_pad_b = self._calculate_head_padding(
+            keypoints, scores
+        )
+        
         # 패딩 적용 + 경계 클리핑
-        crop_x1 = max(0, int(min_x - padding))
-        crop_y1 = max(0, int(min_y - padding))
-        crop_x2 = min(w, int(max_x + padding))
-        crop_y2 = min(h, int(max_y + padding))
+        crop_x1 = max(0, int(min_x - padding - head_pad_l))
+        crop_y1 = max(0, int(min_y - padding - head_pad_t))
+        crop_x2 = min(w, int(max_x + padding + head_pad_r))
+        crop_y2 = min(h, int(max_y + padding + head_pad_b))
         
         # 크롭
         cropped = image[crop_y1:crop_y2, crop_x1:crop_x2]
@@ -523,7 +601,7 @@ class PoseTransferPipeline:
         transferred_kpts = transfer_result.keypoints
         transferred_scores = transfer_result.scores
         
-        # [NEW] 자동 패딩/크롭 적용
+        # 자동 패딩/크롭 적용
         if self.config.auto_crop_enabled:
             skeleton_image, final_kpts, final_size = self._render_with_auto_crop(
                 transferred_kpts, transferred_scores,
@@ -553,7 +631,7 @@ class PoseTransferPipeline:
         )
     
     # ============================================================
-    # [NEW] 자동 패딩/크롭으로 렌더링
+    # 자동 패딩/크롭으로 렌더링
     # ============================================================
     def _render_with_auto_crop(
         self,
@@ -562,13 +640,9 @@ class PoseTransferPipeline:
         base_size: Tuple[int, int],
         padding: int
     ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
-        """
-        키포인트가 모두 포함되도록 자동으로 캔버스 확장 후 크롭
+        """키포인트가 모두 포함되도록 자동으로 캔버스 확장 후 크롭"""
         
-        Returns:
-            (skeleton_image, adjusted_keypoints, final_size)
-        """
-        # 1. 캔버스 크기 및 오프셋 계산
+        # 1. 캔버스 크기 및 오프셋 계산 (머리 패딩 포함)
         canvas_size, offset, adjusted_kpts = self._calculate_canvas_and_offset(
             keypoints, scores, base_size, padding
         )
@@ -580,7 +654,7 @@ class PoseTransferPipeline:
             adjusted_kpts, scores
         )
         
-        # 3. 키포인트 바운딩 박스 + 패딩으로 크롭
+        # 3. 키포인트 바운딩 박스 + 패딩으로 크롭 (머리 패딩 포함)
         cropped_image, cropped_kpts = self._crop_to_keypoints(
             skeleton_image, adjusted_kpts, scores, padding
         )
