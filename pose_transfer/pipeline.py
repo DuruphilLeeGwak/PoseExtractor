@@ -1,5 +1,5 @@
 """
-포즈 전이 파이프라인 v11 (Fix: 초기화 순서 오류 수정)
+포즈 전이 파이프라인 v11 (DEBUG VERSION)
 """
 import cv2
 import numpy as np
@@ -173,13 +173,11 @@ class PoseTransferPipeline:
         self.config = config or PipelineConfig()
         self.yaml_config = yaml_config
         
-        # [FIX] 매니저 초기화를 먼저 수행 (순서 변경)
         self.bbox_mgr = BboxManager(self.config)
         self.align_mgr = AlignManager(self.config)
         self.post_proc = PostProcessor(self.config)
         self.canvas_mgr = CanvasManager(self.config)
         
-        # 그 다음 모듈 초기화 (이제 self.bbox_mgr에 접근 가능)
         self._init_modules()
         
     def _init_modules(self):
@@ -206,10 +204,7 @@ class PoseTransferPipeline:
             hand_line_thickness=self.config.hand_line_thickness
         )
         
-        # [FIX] 초기화 시점에 YOLO 로드 시도 (매니저 내부 메서드 호출)
         if self.config.yolo_verification_enabled:
-            # BboxManager 생성자에서 이미 _init_models()를 호출했으므로 
-            # 여기서는 중복 호출할 필요가 없으나, 명시적으로 체크할 수도 있음
             pass
 
     def extract_pose(self, image: Union[np.ndarray, str, Path], filter_person: bool = True) -> Tuple[np.ndarray, np.ndarray, int, Tuple[int,int]]:
@@ -226,24 +221,47 @@ class PoseTransferPipeline:
         return kpts, scores, idx, image_size
 
     def transfer(self, source_image, reference_image, output_image_size=None):
+        print("\n" + "#"*70)
+        print("# 🔍 [DEBUG] PoseTransferPipeline.transfer() START")
+        print("#"*70)
+        
         if isinstance(source_image, (str, Path)): src_img = load_image(source_image)
         else: src_img = source_image
         if isinstance(reference_image, (str, Path)): ref_img = load_image(reference_image)
         else: ref_img = reference_image
         
         src_h, src_w = src_img.shape[:2]; ref_h, ref_w = ref_img.shape[:2]
+        print(f"\n📐 Image Sizes: src={src_w}x{src_h}, ref={ref_w}x{ref_h}")
         
-        print("\n[STEP 1] Extracting poses...")
+        print("\n" + "-"*50)
+        print("[STEP 1] Extracting poses...")
+        print("-"*50)
         src_kpts, src_scores, src_idx, src_size = self.extract_pose(src_img)
         ref_kpts, ref_scores, ref_idx, ref_size = self.extract_pose(ref_img)
         
-        print("\n[STEP 2] Determining Body Type...")
-        src_type, ref_type, case = self.align_mgr.determine_case(src_kpts, src_scores, ref_kpts, ref_scores)
-        print(f"   Case {case.value} ({src_type.value} -> {ref_type.value})")
+        # 추출 직후 하반신 점수 확인
+        print("\n📊 Extracted Keypoints - Lower Body Scores:")
+        lower_names = ['left_hip', 'right_hip', 'left_knee', 'right_knee', 'left_ankle', 'right_ankle']
+        for name in lower_names:
+            idx = BODY_KEYPOINTS.get(name, -1)
+            if idx >= 0:
+                src_score = src_scores[idx]
+                ref_score = ref_scores[idx]
+                print(f"   {name:15}: src={src_score:.3f}, ref={ref_score:.3f}")
         
-        print("\n[STEP 3] Bbox Calculation...")
+        print("\n" + "-"*50)
+        print("[STEP 2] Determining Body Type...")
+        print("-"*50)
+        src_type, ref_type, case = self.align_mgr.determine_case(src_kpts, src_scores, ref_kpts, ref_scores)
+        print(f"   Result: Case {case.value} ({src_type.value} -> {ref_type.value})")
+        
+        print("\n" + "-"*50)
+        print("[STEP 3] Bbox Calculation...")
+        print("-"*50)
         src_person, src_face, src_debug = self.bbox_mgr.get_bboxes(src_img, src_kpts, src_scores)
         ref_person, ref_face, ref_debug = self.bbox_mgr.get_bboxes(ref_img, ref_kpts, ref_scores)
+        print(f"   src_person: {src_person.bbox}")
+        print(f"   src_face: {src_face.bbox}")
         
         src_debug_img = None; ref_debug_img = None
         if self.config.debug_bbox_visualization:
@@ -252,39 +270,100 @@ class PoseTransferPipeline:
             ref_ov = self.renderer.render(ref_img, ref_kpts, ref_scores)
             ref_debug_img = self.bbox_mgr.draw_debug(ref_ov, ref_debug)
 
-        print("\n[STEP 4] Transferring...")
+        print("\n" + "-"*50)
+        print("[STEP 4] Transferring...")
+        print("-"*50)
         result = self.transfer_engine.transfer(
             src_kpts, src_scores, ref_kpts, ref_scores,
             source_image_size=(src_h, src_w), reference_image_size=(ref_h, ref_w)
         )
         trans_kpts, trans_scores = result.keypoints, result.scores
         
-        print("\n[STEP 5] Post-processing Keys...")
+        # 전이 직후 하반신 점수 확인
+        print("\n📊 After Transfer - Lower Body Scores:")
+        for name in lower_names:
+            idx = BODY_KEYPOINTS.get(name, -1)
+            if idx >= 0:
+                score = trans_scores[idx]
+                pos = trans_kpts[idx]
+                status = "✅" if score > 0 else "❌"
+                print(f"   {status} {name:15}: score={score:.3f}, pos=({pos[0]:.1f}, {pos[1]:.1f})")
+        
+        print("\n" + "-"*50)
+        print("[STEP 5] Post-processing Keys...")
+        print("-"*50)
         trans_kpts, trans_scores = self.post_proc.process_by_case(trans_kpts, trans_scores, case, src_scores)
         
-        print("\n[STEP 7] Scaling...")
-        scale = self.align_mgr.calc_scale(src_face.size, ref_face.size)
-        trans_kpts *= scale
-        print(f"   Scale Factor: {scale:.2f}")
+        # 후처리 후 하반신 점수 확인
+        print("\n📊 After Post-process - Lower Body Scores:")
+        for name in lower_names:
+            idx = BODY_KEYPOINTS.get(name, -1)
+            if idx >= 0:
+                score = trans_scores[idx]
+                status = "✅" if score > 0 else "❌"
+                print(f"   {status} {name:15}: score={score:.3f}")
         
-        print("\n[STEP 8] Aligning...")
+        print("\n" + "-"*50)
+        print("[STEP 7] Scaling...")
+        print("-"*50)
+        scale = self.align_mgr.calc_scale(src_face.size, ref_face.size)
+        print(f"   src_face.size: {src_face.size}, ref_face.size: {ref_face.size}")
+        print(f"   Scale Factor: {scale:.3f}")
+        trans_kpts *= scale
+        
+        print("\n" + "-"*50)
+        print("[STEP 8] Aligning...")
+        print("-"*50)
         trans_kpts = self.align_mgr.align_coordinates(
             trans_kpts, trans_scores, case, src_person, src_face,
             lambda k, s: self.bbox_mgr._kpt_to_face_public(k, s) 
         )
         
-        print("\n[STEP 9] Head Padding...")
-        head_pad = self.post_proc.apply_head_padding(trans_kpts, trans_scores)
+        # 정렬 후 하반신 위치 확인
+        print("\n📊 After Alignment - Lower Body Positions:")
+        for name in lower_names:
+            idx = BODY_KEYPOINTS.get(name, -1)
+            if idx >= 0:
+                score = trans_scores[idx]
+                pos = trans_kpts[idx]
+                in_bounds = 0 <= pos[0] <= src_w and 0 <= pos[1] <= src_h
+                status = "✅" if score > 0 else "❌"
+                bounds = "📍" if in_bounds else "⚠️ OUT"
+                print(f"   {status} {name:15}: pos=({pos[0]:.1f}, {pos[1]:.1f}) {bounds}")
         
-        print("\n[STEP 10] Canvas Expansion...")
+        print("\n" + "-"*50)
+        print("[STEP 9] Head Padding...")
+        print("-"*50)
+        head_pad = self.post_proc.apply_head_padding(trans_kpts, trans_scores)
+        print(f"   head_pad: {head_pad:.1f}")
+        
+        print("\n" + "-"*50)
+        print("[STEP 10] Canvas Expansion...")
+        print("-"*50)
         final_src_img, final_kpts, final_size = self.canvas_mgr.expand_canvas_to_fit(
             src_img, trans_kpts, trans_scores, head_pad_px=head_pad
         )
         final_h, final_w = final_size
+        
+        # 최종 하반신 위치 확인
+        print("\n📊 Final - Lower Body Positions:")
+        for name in lower_names:
+            idx = BODY_KEYPOINTS.get(name, -1)
+            if idx >= 0:
+                score = trans_scores[idx]
+                pos = final_kpts[idx]
+                in_bounds = 0 <= pos[0] <= final_w and 0 <= pos[1] <= final_h
+                status = "✅" if score > 0 else "❌"
+                bounds = "📍" if in_bounds else "⚠️ OUT"
+                print(f"   {status} {name:15}: pos=({pos[0]:.1f}, {pos[1]:.1f}) {bounds}")
 
+        print("\n" + "-"*50)
+        print("[RENDER] Skeleton...")
+        print("-"*50)
         skeleton_image = self.renderer.render_skeleton_only(
             (final_h, final_w, 3), final_kpts, trans_scores
         )
+        print(f"   skeleton_image size: {skeleton_image.shape}")
         
         align_info = AlignmentInfo(
             case=case, src_body_type=src_type, ref_body_type=ref_type,
@@ -292,6 +371,10 @@ class PoseTransferPipeline:
             face_scale_ratio=scale, alignment_method="feet" if case==AlignmentCase.A else "face",
             yolo_log=src_debug.yolo_person is not None
         )
+        
+        print("\n" + "#"*70)
+        print("# 🔍 [DEBUG] PoseTransferPipeline.transfer() END")
+        print("#"*70 + "\n")
         
         return PipelineResult(
             transferred_keypoints=final_kpts, transferred_scores=trans_scores,
