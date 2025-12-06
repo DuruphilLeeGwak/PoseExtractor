@@ -1,21 +1,19 @@
 # =============================================================================
-# Pose Transfer Configuration v10 (AspectPadding + Case-based Alignment)
+# Pose Transfer Configuration v11 (Final Integration)
 # =============================================================================
 
 # [0] 입력 모드 설정
-# --------------------------------------------------------
 input_mode:
-  type: "internal"
+  type: "internal"  # 'internal' or 'external'
 
   internal:
     root_dir: "inputs"
-    src_dir: "src"
-    ref_dir: "ref"
+    src_dir: "src"      
+    ref_dir: "ref"      
 
   external:
     source_path: "/var/data/users/user_123.jpg"
     reference_path: "/var/data/poses/pose_dance.jpg"
-
 
 # [1] 모델 설정
 model:
@@ -38,40 +36,22 @@ hand_refinement:
   min_hand_size: 48
   max_scale_factor: 4.0
 
-  # [NEW] Bbox 패딩 설정 (마진)
-# --------------------------------------------------------
-# 키포인트 최소/최대 좌표 기준으로 얼마나 더 넓게 잡을지 결정 (비율)
-# 0.0 = 딱 맞게 (Tight)
-# 0.1 = 상하좌우 10%씩 여유
-bbox:
-  person_margin: 0.0  # 전신 박스 패딩
-  face_margin: 0.0    # 얼굴 박스 패딩
-
-# =============================================================================
-# [4] 포즈 전이 & Ghost Legs 클리핑 설정
-# =============================================================================
+# [4] 포즈 전이 & Ghost Legs 설정
 transfer:
   normalization_base: "shoulder_width"
   confidence_threshold: 0.3
   
-  # ============================================================
-  # Ghost Legs 클리핑 설정
-  # ============================================================
+  # Ghost Legs 클리핑 (입력 단계 검증용)
   ghost_legs_clipping_enabled: true
   
-  # [조절 1] 신뢰도 임계값
-  # 값 조절: 너무 많이 절삭 → 낮추기 (1.5, 1.0)
-  #          Ghost Legs 남음 → 높이기 (2.5, 3.0)
-  lower_body_confidence_threshold: 1.5
+  # [중요] 하반신 신뢰도 임계값 (낮춰서 데이터 보존)
+  lower_body_confidence_threshold: 0.5
   
-  # [조절 2] 경계 영역 비율
-  # 값 조절: 발이 잘림 → 낮추기 (0.05)
-  #          하단 Ghost Legs 남음 → 높이기 (0.12, 0.15)
+  # [중요] 이미지 바닥 마진 (0.025 = 2.5% 여유)
   lower_body_margin_ratio: 0.025
   
-  # [조절 3] 화면 밖 허용 범위 (전이 후 최종 클리핑용)
+  # [중요] 화면 밖 허용 범위 (0.5 = 50%까지 벗어나도 데이터 유지 -> 캔버스 확장으로 해결)
   visibility_margin: 0.5
-
 
 # [5] 폴백 전략
 fallback:
@@ -79,98 +59,48 @@ fallback:
   hierarchical_estimation: true
   fallback_confidence_decay: 0.5
 
-# [6] 렌더링 스타일
+# [6] 렌더링 스타일 (동적 스케일링 적용)
 rendering:
   line_thickness: 4
   face_line_thickness: 4
   hand_line_thickness: 4
   point_radius: 2
   background_color: [0, 0, 0]
-  kpt_threshold: 0.1
+  kpt_threshold: 0.1          # 낮은 점수도 일단 그림
 
-# =============================================================================
 # [7] 출력 설정
-# =============================================================================
 output:
   save_json: true
   save_skeleton_image: true
   save_debug_image: true
   
-  # ============================================================
-  # 키포인트 기반 자동 크롭 설정 (trans_sk용)
-  # ============================================================
+  # 키포인트 기반 자동 캔버스 조정
   auto_crop_enabled: true
   
-  # [조절] 크롭 패딩 (픽셀) - 0이면 딱 맞게 크롭
+  # [NEW] 캔버스 여백 비율 (10% 여유 -> 발 잘림 방지)
+  canvas_padding_ratio: 0.1
+  
+  # 고정 픽셀 패딩
   crop_padding_px: 0
   
-  # ============================================================
-  # 머리 방향 추가 패딩
-  # ============================================================
-  # 0이면 비활성화
-  # 머리가 잘린다면: 값을 높이세요 (예: 0.5 → 1.0)
-  head_padding_ratio: 0
+  # 머리 위 추가 패딩
+  head_padding_ratio: 0.5
 
-# =============================================================================
-# [NEW v10] 정렬 및 패딩 설정 (AspectPadding)
-# =============================================================================
-alignment:
-  # ============================================================
-  # 신체 유형 판별
-  # ============================================================
-  # 전신 판별 기준: 유효한 하반신 키포인트(hip, knee, ankle) 최소 개수
-  # 이 수치 미만이면 "상반신"으로 판별됨
-  # 케이스 분류:
-  #   A: 전신 → 전신 (발 기준 정렬)
-  #   B: 상반신 → 상반신 (얼굴 기준 정렬)
-  #   C: 전신 → 상반신 (얼굴 기준 정렬, ref 하반신 무시)
-  #   D: 상반신 → 전신 (얼굴 기준 정렬, ref 하반신 커팅)
-  full_body_min_valid_lower: 4
-  
-  # ============================================================
-  # YOLO 2차 검증
-  # ============================================================
-  # 키포인트 기반 bbox (1차) 후 YOLO로 확증 (2차)
-  # YOLO 실패 시 키포인트 bbox 사용 + 로그 기록
-  yolo_verification_enabled: true
-  yolo_person_conf: 0.5
-  yolo_face_conf: 0.3
-  
-  # ============================================================
-  # 얼굴 크기 기반 스케일링
-  # ============================================================
-  # src_face_size / ref_face_size 비율로 스켈레톤 스케일링
-  # false면 스케일링 안 함 (1:1)
-  face_scale_enabled: true
-
-# [8] 시스템 설정 (파일 관리)
+# [8] 시스템 설정
 system:
-  # 입력 파일 유지 여부 (최우선 적용)
-  # true: 작업 후 아무것도 하지 않음 (파일이 inputs 폴더에 그대로 남음) - 반복 테스트용
-  # false: 아래 enable_archiving 설정에 따라 이동하거나 삭제함
-  retain_inputs: true
-
-  # retain_inputs가 false일 때의 동작
-  # true: archive 폴더로 이동 (보관)
-  # false: 삭제 (휘발성)
+  retain_inputs: true    # 테스트용 (파일 유지)
   enable_archiving: false
 
-# =============================================================================
-# [NEW] 디버그 설정
-# =============================================================================
+# [NEW] 디버그 Bbox 시각화
 debug:
-  # Bbox 시각화 (src_rend.jpg, ref_rend.jpg에 표시)
-  # true: Person bbox (핫핑크), Face bbox (청록) 표시
-  # false: bbox 표시 안 함
   bbox_visualization: true
-  visualize_keypoint_bbox: true  # 1차: 키포인트 기반 (초록색)
-  visualize_yolo_bbox: true      # 2차: YOLO 모델 기반 (파란색)
-  visualize_hybrid_bbox: true    # 최종: IoU 검증 및 교정된 결과 (핫핑크/청록색)
+  visualize_keypoint_bbox: true
+  visualize_yolo_bbox: true
+  visualize_hybrid_bbox: true
 
 # [9] 얼굴 부위별 렌더링 제어
 face_rendering:
   enabled: true
-  
   parts:
     jawline:
       enabled: true

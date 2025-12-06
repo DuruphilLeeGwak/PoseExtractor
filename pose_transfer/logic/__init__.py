@@ -4,3 +4,4 @@ from .bbox_manager import (
 )
 from .align_manager import AlignManager, AlignmentCase, BodyType
 from .post_processor import PostProcessor
+from .canvas_manager import CanvasManager  # [NEW] 추가됨

@@ -1,5 +1,5 @@
 """
-포즈 전이 파이프라인 v8.1 (Fix: PipelineResult 필드 누락 수정)
+포즈 전이 파이프라인 v11 (Fix: 초기화 순서 오류 수정)
 """
 import cv2
 import numpy as np
@@ -8,26 +8,21 @@ from typing import Dict, Any, Optional, Tuple, Union, Set, List
 from dataclasses import dataclass, field
 from enum import Enum
 
-# 모듈 임포트
 from .extractors import (
     DWPoseExtractor, DWPoseExtractorFactory, PersonFilter, RTMLIB_AVAILABLE
 )
+from .extractors.keypoint_constants import BODY_KEYPOINTS
 from .transfer import PoseTransferEngine, TransferConfig, FallbackStrategy
 from .refiners import HandRefiner
 from .renderers import SkeletonRenderer
 from .utils import load_config, convert_to_openpose_format, load_image
 
-# [NEW] 로직 모듈 임포트
+# [NEW] Logic Modules
 from .logic import (
-    BboxManager, AlignManager, PostProcessor,
-    AlignmentCase, BodyType, DebugBboxData
+    BboxManager, AlignManager, PostProcessor, CanvasManager,
+    AlignmentCase, BodyType, DebugBboxData, BboxInfo,
+    COLOR_KPT_BBOX, COLOR_YOLO_BBOX, COLOR_HYBRID_PERSON, COLOR_HYBRID_FACE
 )
-
-# Bbox 색상 정의 (BGR)
-COLOR_KPT_BBOX = (0, 255, 0)
-COLOR_YOLO_BBOX = (255, 0, 0)
-COLOR_HYBRID_PERSON = (127, 0, 255)
-COLOR_HYBRID_FACE = (128, 128, 0)
 
 @dataclass
 class PipelineConfig:
@@ -68,6 +63,7 @@ class PipelineConfig:
     auto_crop_enabled: bool = True
     crop_padding_px: int = 50
     head_padding_ratio: float = 1.0
+    canvas_padding_ratio: float = 0.1
     
     # Alignment / Logic
     full_body_min_valid_lower: int = 4
@@ -121,6 +117,7 @@ class PipelineConfig:
             auto_crop_enabled=output.get('auto_crop_enabled', True),
             crop_padding_px=output.get('crop_padding_px', 50),
             head_padding_ratio=output.get('head_padding_ratio', 1.0),
+            canvas_padding_ratio=output.get('canvas_padding_ratio', 0.1),
             full_body_min_valid_lower=alignment.get('full_body_min_valid_lower', 4),
             yolo_verification_enabled=alignment.get('yolo_verification_enabled', True),
             yolo_person_conf=alignment.get('yolo_person_conf', 0.5),
@@ -136,30 +133,28 @@ class PipelineConfig:
 
 @dataclass
 class AlignmentInfo:
-    """정렬 정보 결과"""
     case: AlignmentCase
     src_body_type: BodyType
     ref_body_type: BodyType
-    face_scale_ratio: float
-    alignment_method: str
-    yolo_log: Dict[str, bool]
     src_person_bbox: Any
     src_face_bbox: Any
     ref_face_bbox: Any
+    face_scale_ratio: float
+    alignment_method: str
+    yolo_log: Dict[str, bool]
 
 @dataclass
 class PipelineResult:
-    """최종 결과 데이터"""
     transferred_keypoints: np.ndarray
     transferred_scores: np.ndarray
     source_keypoints: np.ndarray
     source_scores: np.ndarray
-    # [FIX] 누락되었던 필드 추가
-    source_bone_lengths: Dict[str, float] 
+    source_bone_lengths: Dict[str, float]
     reference_keypoints: np.ndarray
     reference_scores: np.ndarray
     skeleton_image: np.ndarray
     image_size: Tuple[int, int]
+    modified_source_image: Optional[np.ndarray] = None
     selected_person_idx: Dict[str, int] = field(default_factory=dict)
     processing_info: Dict[str, Any] = field(default_factory=dict)
     alignment_info: Optional[AlignmentInfo] = None
@@ -177,12 +172,16 @@ class PoseTransferPipeline:
     def __init__(self, config: Optional[PipelineConfig] = None, yaml_config: Optional[dict] = None):
         self.config = config or PipelineConfig()
         self.yaml_config = yaml_config
-        self._init_modules()
         
+        # [FIX] 매니저 초기화를 먼저 수행 (순서 변경)
         self.bbox_mgr = BboxManager(self.config)
         self.align_mgr = AlignManager(self.config)
         self.post_proc = PostProcessor(self.config)
-    
+        self.canvas_mgr = CanvasManager(self.config)
+        
+        # 그 다음 모듈 초기화 (이제 self.bbox_mgr에 접근 가능)
+        self._init_modules()
+        
     def _init_modules(self):
         if not RTMLIB_AVAILABLE: raise RuntimeError("rtmlib not installed.")
         
@@ -206,29 +205,24 @@ class PoseTransferPipeline:
             kpt_threshold=self.config.kpt_threshold, face_line_thickness=self.config.face_line_thickness,
             hand_line_thickness=self.config.hand_line_thickness
         )
+        
+        # [FIX] 초기화 시점에 YOLO 로드 시도 (매니저 내부 메서드 호출)
+        if self.config.yolo_verification_enabled:
+            # BboxManager 생성자에서 이미 _init_models()를 호출했으므로 
+            # 여기서는 중복 호출할 필요가 없으나, 명시적으로 체크할 수도 있음
+            pass
 
     def extract_pose(self, image: Union[np.ndarray, str, Path], filter_person: bool = True) -> Tuple[np.ndarray, np.ndarray, int, Tuple[int,int]]:
         if isinstance(image, (str, Path)): img = load_image(image)
         else: img = image
-        
         image_size = img.shape[:2]
         all_kpts, all_scores = self.extractor.extract(img)
-        
-        if len(all_kpts) == 0:
-            return np.zeros((133, 2)), np.zeros(133), -1, image_size
-        
+        if len(all_kpts) == 0: return np.zeros((133, 2)), np.zeros(133), -1, image_size
         if filter_person and self.config.filter_enabled and len(all_kpts) > 1:
-            kpts, scores, idx, _ = self.person_filter.select_main_person(
-                all_kpts, all_scores, image_size
-            )
-        else:
-            kpts, scores, idx = all_kpts[0], all_scores[0], 0
-        
+            kpts, scores, idx, _ = self.person_filter.select_main_person(all_kpts, all_scores, image_size)
+        else: kpts, scores, idx = all_kpts[0], all_scores[0], 0
         if self.config.hand_refinement_enabled:
-            kpts, scores, _ = self.hand_refiner.refine_both_hands(
-                img, kpts, scores, self.extractor
-            )
-        
+            kpts, scores, _ = self.hand_refiner.refine_both_hands(img, kpts, scores, self.extractor)
         return kpts, scores, idx, image_size
 
     def transfer(self, source_image, reference_image, output_image_size=None):
@@ -239,22 +233,18 @@ class PoseTransferPipeline:
         
         src_h, src_w = src_img.shape[:2]; ref_h, ref_w = ref_img.shape[:2]
         
-        # [STEP 1] 포즈 추출
         print("\n[STEP 1] Extracting poses...")
         src_kpts, src_scores, src_idx, src_size = self.extract_pose(src_img)
         ref_kpts, ref_scores, ref_idx, ref_size = self.extract_pose(ref_img)
         
-        # [STEP 2] 신체 유형 판별
         print("\n[STEP 2] Determining Body Type...")
         src_type, ref_type, case = self.align_mgr.determine_case(src_kpts, src_scores, ref_kpts, ref_scores)
         print(f"   Case {case.value} ({src_type.value} -> {ref_type.value})")
         
-        # [STEP 3] Bbox 추출 (Manager 위임)
         print("\n[STEP 3] Bbox Calculation...")
         src_person, src_face, src_debug = self.bbox_mgr.get_bboxes(src_img, src_kpts, src_scores)
         ref_person, ref_face, ref_debug = self.bbox_mgr.get_bboxes(ref_img, ref_kpts, ref_scores)
         
-        # 디버그 이미지 생성
         src_debug_img = None; ref_debug_img = None
         if self.config.debug_bbox_visualization:
             src_ov = self.renderer.render(src_img, src_kpts, src_scores)
@@ -262,7 +252,6 @@ class PoseTransferPipeline:
             ref_ov = self.renderer.render(ref_img, ref_kpts, ref_scores)
             ref_debug_img = self.bbox_mgr.draw_debug(ref_ov, ref_debug)
 
-        # [STEP 4] 포즈 전이 (Engine)
         print("\n[STEP 4] Transferring...")
         result = self.transfer_engine.transfer(
             src_kpts, src_scores, ref_kpts, ref_scores,
@@ -270,49 +259,47 @@ class PoseTransferPipeline:
         )
         trans_kpts, trans_scores = result.keypoints, result.scores
         
-        # [STEP 5] 케이스별 키포인트 후처리
         print("\n[STEP 5] Post-processing Keys...")
         trans_kpts, trans_scores = self.post_proc.process_by_case(trans_kpts, trans_scores, case, src_scores)
         
-        # [STEP 7] 얼굴 크기 기반 스케일링
         print("\n[STEP 7] Scaling...")
         scale = self.align_mgr.calc_scale(src_face.size, ref_face.size)
         trans_kpts *= scale
         print(f"   Scale Factor: {scale:.2f}")
         
-        # [STEP 8] 케이스별 정렬 (좌표 이동)
         print("\n[STEP 8] Aligning...")
         trans_kpts = self.align_mgr.align_coordinates(
             trans_kpts, trans_scores, case, src_person, src_face,
-            lambda k, s: self.bbox_mgr._kpt_to_face(k, s) 
+            lambda k, s: self.bbox_mgr._kpt_to_face_public(k, s) 
         )
         
-        # [STEP 9] 머리 방향 패딩 계산
         print("\n[STEP 9] Head Padding...")
         head_pad = self.post_proc.apply_head_padding(trans_kpts, trans_scores)
         
-        # [STEP 10] 최종 크롭 (캔버스 확정)
-        print("\n[STEP 10] Finalizing...")
-        final_kpts, final_size = self.post_proc.finalize_canvas(trans_kpts, trans_scores, head_pad)
-        
-        # 최종 렌더링
+        print("\n[STEP 10] Canvas Expansion...")
+        final_src_img, final_kpts, final_size = self.canvas_mgr.expand_canvas_to_fit(
+            src_img, trans_kpts, trans_scores, head_pad_px=head_pad
+        )
+        final_h, final_w = final_size
+
         skeleton_image = self.renderer.render_skeleton_only(
-            (final_size[0], final_size[1], 3), final_kpts, trans_scores
+            (final_h, final_w, 3), final_kpts, trans_scores
         )
         
         align_info = AlignmentInfo(
             case=case, src_body_type=src_type, ref_body_type=ref_type,
+            src_person_bbox=src_person, src_face_bbox=src_face, ref_face_bbox=ref_face,
             face_scale_ratio=scale, alignment_method="feet" if case==AlignmentCase.A else "face",
-            yolo_log=src_debug.hybrid_person.source if src_debug.hybrid_person else "none",
-            src_person_bbox=src_person, src_face_bbox=src_face, ref_face_bbox=ref_face
+            yolo_log=src_debug.yolo_person is not None
         )
         
         return PipelineResult(
             transferred_keypoints=final_kpts, transferred_scores=trans_scores,
             source_keypoints=src_kpts, source_scores=src_scores,
             reference_keypoints=ref_kpts, reference_scores=ref_scores,
-            source_bone_lengths=result.source_bone_lengths, # [FIX] 이제 클래스 정의에 포함됨
+            source_bone_lengths=result.source_bone_lengths,
             skeleton_image=skeleton_image, image_size=final_size,
+            modified_source_image=final_src_img,
             selected_person_idx={'source': src_idx, 'reference': ref_idx},
             processing_info={'transfer_log': result.transfer_log},
             alignment_info=align_info,
