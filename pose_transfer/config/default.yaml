@@ -70,7 +70,7 @@ transfer:
   lower_body_margin_ratio: 0.025
   
   # [조절 3] 화면 밖 허용 범위 (전이 후 최종 클리핑용)
-  visibility_margin: 0.2
+  visibility_margin: 0.5
 
 
 # [5] 폴백 전략
