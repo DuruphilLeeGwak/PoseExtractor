@@ -343,6 +343,9 @@ class PoseTransferPipeline:
         return BboxInfo((x1, y1, x2, y2), 
                         ((x1+x2)/2, (y1+y2)/2), size, "keypoint")
 
+# ============================================================
+    # [UPDATED] YOLO 2차 검증 및 Hybrid 결정 로직 (Union Merge)
+    # ============================================================
     def _run_yolo_and_merge(self, image: np.ndarray, kpt_person: BboxInfo, kpt_face: BboxInfo) -> Tuple[DebugBboxData, Dict]:
         debug_data = DebugBboxData(kpt_person=kpt_person, kpt_face=kpt_face)
         yolo_log = {"person": False, "face": False}
@@ -353,7 +356,7 @@ class PoseTransferPipeline:
             return debug_data, yolo_log
 
         try:
-            # Person
+            # 1. Person Detection
             res = self._yolo_person.predict(image, conf=self.config.yolo_person_conf, verbose=False)[0].boxes
             mask = (res.cls == 0)
             hybrid_person = kpt_person
@@ -361,20 +364,44 @@ class PoseTransferPipeline:
             if mask.sum() > 0:
                 yolo_log["person"] = True
                 boxes = res.xyxy[mask].cpu().numpy()
+                # 가장 큰 박스 선택
                 areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
                 yb = boxes[np.argmax(areas)].astype(int)
+                
                 yolo_info = BboxInfo((yb[0], yb[1], yb[2], yb[3]), 
                                      ((yb[0]+yb[2])/2, (yb[1]+yb[3])/2), 
                                      max(yb[2]-yb[0], yb[3]-yb[1]), "yolo")
                 debug_data.yolo_person = yolo_info
                 
+                # IoU Check & Union Merge
                 iou = self._calc_iou(kpt_person.bbox, yb)
-                if iou > 0.5: hybrid_person = yolo_info
-                else: hybrid_person = kpt_person
+                if iou > 0.3: # IoU가 조금이라도 겹치면 합집합으로 병합 (0.3으로 완화 추천)
+                    # Union Bbox 계산 (두 박스를 모두 포함하는 최소 사각형)
+                    kb = kpt_person.bbox
+                    x1 = min(kb[0], yb[0])
+                    y1 = min(kb[1], yb[1])
+                    x2 = max(kb[2], yb[2])
+                    y2 = max(kb[3], yb[3])
+                    
+                    hybrid_person = BboxInfo((x1, y1, x2, y2), 
+                                             ((x1+x2)/2, (y1+y2)/2), 
+                                             max(x2-x1, y2-y1), "hybrid(union)")
+                else:
+                    # 겹치지 않으면 KPT 우선 (YOLO가 엉뚱한 사람 잡았을 가능성 배제)
+                    hybrid_person = kpt_person
+            else:
+                hybrid_person = kpt_person
+            
             debug_data.hybrid_person = hybrid_person
 
-            # Face
+            # 2. Face Detection
+            # 검색 영역을 (확장된) Hybrid Person Bbox로 설정
             px1, py1, px2, py2 = hybrid_person.bbox
+            # 이미지 경계 체크
+            h, w = image.shape[:2]
+            px1, py1 = max(0, px1), max(0, py1)
+            px2, py2 = min(w, px2), min(h, py2)
+            
             crop = image[py1:py2, px1:px2]
             hybrid_face = kpt_face
             
@@ -383,12 +410,34 @@ class PoseTransferPipeline:
                 if len(f_res) > 0:
                     yolo_log["face"] = True
                     fb = f_res[0].xyxy[0].cpu().numpy().astype(int)
+                    # 원본 좌표 변환
                     fx1, fy1, fx2, fy2 = fb[0]+px1, fb[1]+py1, fb[2]+px1, fb[3]+py1
                     yolo_info = BboxInfo((fx1, fy1, fx2, fy2), 
                                          ((fx1+fx2)/2, (fy1+fy2)/2), 
                                          max(fx2-fx1, fy2-fy1), "yolo")
                     debug_data.yolo_face = yolo_info
-                    hybrid_face = yolo_info
+                    
+                    # Face도 IoU 체크 후 Union Merge
+                    f_iou = self._calc_iou(kpt_face.bbox, (fx1, fy1, fx2, fy2))
+                    if f_iou > 0.1: # 얼굴은 작아서 조금만 겹쳐도 병합
+                        kb = kpt_face.bbox
+                        ux1 = min(kb[0], fx1)
+                        uy1 = min(kb[1], fy1)
+                        ux2 = max(kb[2], fx2)
+                        uy2 = max(kb[3], fy2)
+                        hybrid_face = BboxInfo((ux1, uy1, ux2, uy2), 
+                                               ((ux1+ux2)/2, (uy1+uy2)/2), 
+                                               max(ux2-ux1, uy2-uy1), "hybrid(union)")
+                    else:
+                        # 안 겹치면 YOLO 신뢰 (키포인트가 얼굴 놓쳤을 때 YOLO가 찾은 경우)
+                        # 단, KPT가 아예 없으면(fallback) YOLO 사용
+                        if kpt_face.source == "fallback":
+                            hybrid_face = yolo_info
+                        else:
+                            # 둘 다 잡았는데 위치가 다르면? -> 보통 YOLO가 더 정확하지만 안전하게 Union 할 수도 있음
+                            # 여기선 YOLO가 얼굴은 더 잘 잡으므로 YOLO 우선 채택하되 Union
+                            hybrid_face = yolo_info 
+
             debug_data.hybrid_face = hybrid_face
 
         except Exception as e:
@@ -397,7 +446,7 @@ class PoseTransferPipeline:
             debug_data.hybrid_face = kpt_face
             
         return debug_data, yolo_log
-
+    
     def _calc_iou(self, b1, b2):
         x1, y1 = max(b1[0], b2[0]), max(b1[1], b2[1])
         x2, y2 = min(b1[2], b2[2]), min(b1[3], b2[3])

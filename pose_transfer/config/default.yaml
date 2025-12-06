@@ -164,8 +164,8 @@ debug:
   # false: bbox 표시 안 함
   bbox_visualization: true
   visualize_keypoint_bbox: true  # 1차: 키포인트 기반 (초록색)
-  visualize_yolo_bbox: false      # 2차: YOLO 모델 기반 (파란색)
-  visualize_hybrid_bbox: false    # 최종: IoU 검증 및 교정된 결과 (핫핑크/청록색)
+  visualize_yolo_bbox: true      # 2차: YOLO 모델 기반 (파란색)
+  visualize_hybrid_bbox: true    # 최종: IoU 검증 및 교정된 결과 (핫핑크/청록색)
 
 # [9] 얼굴 부위별 렌더링 제어
 face_rendering:
