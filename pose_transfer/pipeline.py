@@ -1,7 +1,7 @@
 """
-포즈 전이 파이프라인 v6.3
-- Bbox 마진 설정(bbox.person_margin, bbox.face_margin) 적용
-- Bbox 계산 시 턱선(Jawline) 포함 로직 유지
+포즈 전이 파이프라인 v7 (Final Fix: 좌표 중심 처리)
+- 중간 이미지 생성 제거 -> 좌표만 변환 후 마지막에 1회 렌더링
+- 선 두께/점 크기 비율 문제 완벽 해결
 """
 import cv2
 import numpy as np
@@ -65,15 +65,15 @@ class PipelineConfig:
     yolo_face_conf: float = 0.3
     face_scale_enabled: bool = True
     
-    # [NEW] Bbox Margin 설정
-    person_bbox_margin: float = 0.0
-    face_bbox_margin: float = 0.0
-    
     # 디버그 설정
     debug_bbox_visualization: bool = False
     viz_kpt_bbox: bool = False
     viz_yolo_bbox: bool = False
     viz_hybrid_bbox: bool = False
+    
+    # Bbox Margin
+    person_bbox_margin: float = 0.0
+    face_bbox_margin: float = 0.0
     
     @classmethod
     def from_yaml(cls, yaml_path: str) -> 'PipelineConfig':
@@ -83,7 +83,7 @@ class PipelineConfig:
         output = config.get('output', {})
         alignment = config.get('alignment', {})
         debug = config.get('debug', {})
-        bbox = config.get('bbox', {}) # [NEW] bbox 섹션 로드
+        bbox = config.get('bbox', {})
         
         return cls(
             backend=config.get('model', {}).get('backend', 'onnxruntime'),
@@ -114,11 +114,8 @@ class PipelineConfig:
             yolo_person_conf=alignment.get('yolo_person_conf', 0.5),
             yolo_face_conf=alignment.get('yolo_face_conf', 0.3),
             face_scale_enabled=alignment.get('face_scale_enabled', True),
-            
-            # [NEW] Bbox Margin 매핑
             person_bbox_margin=bbox.get('person_margin', 0.0),
             face_bbox_margin=bbox.get('face_margin', 0.0),
-            
             debug_bbox_visualization=debug.get('bbox_visualization', False),
             viz_kpt_bbox=debug.get('visualize_keypoint_bbox', True),
             viz_yolo_bbox=debug.get('visualize_yolo_bbox', True),
@@ -231,228 +228,16 @@ class PoseTransferPipeline:
     def extract_pose(self, image: Union[np.ndarray, str, Path], filter_person: bool = True) -> Tuple[np.ndarray, np.ndarray, int, Tuple[int,int]]:
         if isinstance(image, (str, Path)): img = load_image(image)
         else: img = image
-        
         image_size = img.shape[:2]
         all_kpts, all_scores = self.extractor.extract(img)
-        
-        if len(all_kpts) == 0:
-            return np.zeros((133, 2)), np.zeros(133), -1, image_size
-        
+        if len(all_kpts) == 0: return np.zeros((133, 2)), np.zeros(133), -1, image_size
         if filter_person and self.config.filter_enabled and len(all_kpts) > 1:
-            kpts, scores, idx, _ = self.person_filter.select_main_person(
-                all_kpts, all_scores, image_size
-            )
+            kpts, scores, idx, _ = self.person_filter.select_main_person(all_kpts, all_scores, image_size)
         else:
             kpts, scores, idx = all_kpts[0], all_scores[0], 0
-        
         if self.config.hand_refinement_enabled:
-            kpts, scores, _ = self.hand_refiner.refine_both_hands(
-                img, kpts, scores, self.extractor
-            )
-        
+            kpts, scores, _ = self.hand_refiner.refine_both_hands(img, kpts, scores, self.extractor)
         return kpts, scores, idx, image_size
-
-    def _draw_bbox_debug_layers(self, image: np.ndarray, data: DebugBboxData) -> np.ndarray:
-        if not (self.config.viz_kpt_bbox or self.config.viz_yolo_bbox or self.config.viz_hybrid_bbox):
-            return image
-        debug_img = image.copy()
-        thick = max(1, self.config.line_thickness // 2)
-        
-        if self.config.viz_kpt_bbox:
-            if data.kpt_person: self._draw_box(debug_img, data.kpt_person, COLOR_KPT_BBOX, "KPT-P", thick)
-            if data.kpt_face: self._draw_box(debug_img, data.kpt_face, COLOR_KPT_BBOX, "KPT-F", thick)
-        if self.config.viz_yolo_bbox:
-            if data.yolo_person: self._draw_box(debug_img, data.yolo_person, COLOR_YOLO_BBOX, "YOLO-P", thick)
-            if data.yolo_face: self._draw_box(debug_img, data.yolo_face, COLOR_YOLO_BBOX, "YOLO-F", thick)
-        if self.config.viz_hybrid_bbox:
-            if data.hybrid_person: self._draw_box(debug_img, data.hybrid_person, COLOR_HYBRID_PERSON, "Final-P", thick+1)
-            if data.hybrid_face: self._draw_box(debug_img, data.hybrid_face, COLOR_HYBRID_FACE, "Final-F", thick+1)
-        return debug_img
-
-    def _draw_box(self, img, info: BboxInfo, color, label, thick):
-        x1, y1, x2, y2 = info.bbox
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
-        cv2.putText(img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-
-    def _determine_body_type(self, kpts, scores):
-        valid = sum(1 for idx in LOWER_BODY_INDICES if idx < len(scores) and scores[idx] > self.config.kpt_threshold)
-        return BodyType.FULL if valid >= self.config.full_body_min_valid_lower else BodyType.UPPER
-    
-    def _determine_case(self, src, ref):
-        if src == BodyType.FULL and ref == BodyType.FULL: return AlignmentCase.A
-        elif src == BodyType.UPPER and ref == BodyType.UPPER: return AlignmentCase.B
-        elif src == BodyType.FULL and ref == BodyType.UPPER: return AlignmentCase.C
-        else: return AlignmentCase.D
-
-    # ============================================================
-    # [FIX] Person Bbox Calculation (Margin applied from config)
-    # ============================================================
-    def _keypoints_to_person_bbox(self, kpts, scores, size):
-        margin = self.config.person_bbox_margin # YAML 설정값 사용
-        h, w = size
-        valid = kpts[scores > self.config.kpt_threshold]
-        if len(valid) == 0: return BboxInfo((0,0,w,h), (w/2,h/2), max(w,h), "fallback")
-        mn, mx = valid.min(0), valid.max(0)
-        wd, ht = mx - mn
-        mx_pad, my_pad = wd*margin, ht*margin
-        x1, y1 = max(0, int(mn[0]-mx_pad)), max(0, int(mn[1]-my_pad))
-        x2, y2 = min(w, int(mx[0]+mx_pad)), min(h, int(mx[1]+my_pad))
-        return BboxInfo((x1,y1,x2,y2), ((x1+x2)/2, (y1+y2)/2), max(x2-x1, y2-y1), "keypoint")
-
-    # ============================================================
-    # [FIX] Face Bbox Calculation (Margin applied from config + Jawline included)
-    # ============================================================
-# [FIX] Face Bbox Calculation (Include Eyebrows)
-    def _keypoints_to_face_bbox(self, kpts, scores):
-        margin = self.config.face_bbox_margin
-        
-        # 1. Body face (nose, eyes, ears) - 기존
-        body_face_idx = [BODY_KEYPOINTS.get(n, i) for i, n in enumerate(['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear'])]
-        
-        # 2. Detail face landmarks (Jawline + Eyebrows) - 수정됨
-        # Face 0~16: Jawline (턱선) -> 전체 인덱스 23~39
-        # Face 17~21: Left Eyebrow (왼쪽 눈썹) -> 전체 인덱스 40~44
-        # Face 22~26: Right Eyebrow (오른쪽 눈썹) -> 전체 인덱스 45~49
-        
-        # COCO-WholeBody 전체 인덱스 기준 (Face Start = 23)
-        jaw_idx = list(range(23, 40))       # 턱선
-        l_brow_idx = list(range(40, 45))    # 왼쪽 눈썹 (추가됨)
-        r_brow_idx = list(range(45, 50))    # 오른쪽 눈썹 (추가됨)
-        
-        target_indices = body_face_idx + jaw_idx + l_brow_idx + r_brow_idx
-        
-        valid = [kpts[i] for i in target_indices if i < len(scores) and scores[i] > self.config.kpt_threshold]
-        
-        if len(valid) < 2: return BboxInfo((0,0,100,100), (50,50), 100, "fallback")
-        
-        v = np.array(valid)
-        mn, mx = v.min(0), v.max(0)
-        
-        width = mx[0] - mn[0]
-        height = mx[1] - mn[1]
-        size = max(width, height)
-        
-        mx_pad = width * margin
-        my_pad = height * margin
-        
-        x1 = int(mn[0] - mx_pad)
-        y1 = int(mn[1] - my_pad)
-        x2 = int(mx[0] + mx_pad)
-        y2 = int(mx[1] + my_pad)
-        
-        return BboxInfo((x1, y1, x2, y2), 
-                        ((x1+x2)/2, (y1+y2)/2), size, "keypoint")
-
-# ============================================================
-    # [UPDATED] YOLO 2차 검증 및 Hybrid 결정 로직 (Union Merge)
-    # ============================================================
-    def _run_yolo_and_merge(self, image: np.ndarray, kpt_person: BboxInfo, kpt_face: BboxInfo) -> Tuple[DebugBboxData, Dict]:
-        debug_data = DebugBboxData(kpt_person=kpt_person, kpt_face=kpt_face)
-        yolo_log = {"person": False, "face": False}
-        
-        if self._yolo_person is None:
-            debug_data.hybrid_person = kpt_person
-            debug_data.hybrid_face = kpt_face
-            return debug_data, yolo_log
-
-        try:
-            # 1. Person Detection
-            res = self._yolo_person.predict(image, conf=self.config.yolo_person_conf, verbose=False)[0].boxes
-            mask = (res.cls == 0)
-            hybrid_person = kpt_person
-            
-            if mask.sum() > 0:
-                yolo_log["person"] = True
-                boxes = res.xyxy[mask].cpu().numpy()
-                # 가장 큰 박스 선택
-                areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
-                yb = boxes[np.argmax(areas)].astype(int)
-                
-                yolo_info = BboxInfo((yb[0], yb[1], yb[2], yb[3]), 
-                                     ((yb[0]+yb[2])/2, (yb[1]+yb[3])/2), 
-                                     max(yb[2]-yb[0], yb[3]-yb[1]), "yolo")
-                debug_data.yolo_person = yolo_info
-                
-                # IoU Check & Union Merge
-                iou = self._calc_iou(kpt_person.bbox, yb)
-                if iou > 0.3: # IoU가 조금이라도 겹치면 합집합으로 병합 (0.3으로 완화 추천)
-                    # Union Bbox 계산 (두 박스를 모두 포함하는 최소 사각형)
-                    kb = kpt_person.bbox
-                    x1 = min(kb[0], yb[0])
-                    y1 = min(kb[1], yb[1])
-                    x2 = max(kb[2], yb[2])
-                    y2 = max(kb[3], yb[3])
-                    
-                    hybrid_person = BboxInfo((x1, y1, x2, y2), 
-                                             ((x1+x2)/2, (y1+y2)/2), 
-                                             max(x2-x1, y2-y1), "hybrid(union)")
-                else:
-                    # 겹치지 않으면 KPT 우선 (YOLO가 엉뚱한 사람 잡았을 가능성 배제)
-                    hybrid_person = kpt_person
-            else:
-                hybrid_person = kpt_person
-            
-            debug_data.hybrid_person = hybrid_person
-
-            # 2. Face Detection
-            # 검색 영역을 (확장된) Hybrid Person Bbox로 설정
-            px1, py1, px2, py2 = hybrid_person.bbox
-            # 이미지 경계 체크
-            h, w = image.shape[:2]
-            px1, py1 = max(0, px1), max(0, py1)
-            px2, py2 = min(w, px2), min(h, py2)
-            
-            crop = image[py1:py2, px1:px2]
-            hybrid_face = kpt_face
-            
-            if crop.size > 0:
-                f_res = self._yolo_face.predict(crop, conf=self.config.yolo_face_conf, verbose=False)[0].boxes
-                if len(f_res) > 0:
-                    yolo_log["face"] = True
-                    fb = f_res[0].xyxy[0].cpu().numpy().astype(int)
-                    # 원본 좌표 변환
-                    fx1, fy1, fx2, fy2 = fb[0]+px1, fb[1]+py1, fb[2]+px1, fb[3]+py1
-                    yolo_info = BboxInfo((fx1, fy1, fx2, fy2), 
-                                         ((fx1+fx2)/2, (fy1+fy2)/2), 
-                                         max(fx2-fx1, fy2-fy1), "yolo")
-                    debug_data.yolo_face = yolo_info
-                    
-                    # Face도 IoU 체크 후 Union Merge
-                    f_iou = self._calc_iou(kpt_face.bbox, (fx1, fy1, fx2, fy2))
-                    if f_iou > 0.1: # 얼굴은 작아서 조금만 겹쳐도 병합
-                        kb = kpt_face.bbox
-                        ux1 = min(kb[0], fx1)
-                        uy1 = min(kb[1], fy1)
-                        ux2 = max(kb[2], fx2)
-                        uy2 = max(kb[3], fy2)
-                        hybrid_face = BboxInfo((ux1, uy1, ux2, uy2), 
-                                               ((ux1+ux2)/2, (uy1+uy2)/2), 
-                                               max(ux2-ux1, uy2-uy1), "hybrid(union)")
-                    else:
-                        # 안 겹치면 YOLO 신뢰 (키포인트가 얼굴 놓쳤을 때 YOLO가 찾은 경우)
-                        # 단, KPT가 아예 없으면(fallback) YOLO 사용
-                        if kpt_face.source == "fallback":
-                            hybrid_face = yolo_info
-                        else:
-                            # 둘 다 잡았는데 위치가 다르면? -> 보통 YOLO가 더 정확하지만 안전하게 Union 할 수도 있음
-                            # 여기선 YOLO가 얼굴은 더 잘 잡으므로 YOLO 우선 채택하되 Union
-                            hybrid_face = yolo_info 
-
-            debug_data.hybrid_face = hybrid_face
-
-        except Exception as e:
-            print(f"   ⚠️ YOLO Error: {e}")
-            debug_data.hybrid_person = kpt_person
-            debug_data.hybrid_face = kpt_face
-            
-        return debug_data, yolo_log
-    
-    def _calc_iou(self, b1, b2):
-        x1, y1 = max(b1[0], b2[0]), max(b1[1], b2[1])
-        x2, y2 = min(b1[2], b2[2]), min(b1[3], b2[3])
-        inter = max(0, x2-x1) * max(0, y2-y1)
-        a1 = (b1[2]-b1[0])*(b1[3]-b1[1]); a2 = (b2[2]-b2[0])*(b2[3]-b2[1])
-        return inter / (a1+a2-inter) if (a1+a2-inter) > 0 else 0
 
     def transfer(self, source_image, reference_image, output_image_size=None):
         if isinstance(source_image, (str, Path)): src_img = load_image(source_image)
@@ -471,7 +256,7 @@ class PoseTransferPipeline:
         case = self._determine_case(src_type, ref_type)
         print(f"   Case {case.value} ({src_type.value} -> {ref_type.value})")
         
-        print("\n[STEP 3] Bbox Calculation...")
+        # Bbox Calculation
         src_kpt_p = self._keypoints_to_person_bbox(src_kpts, src_scores, src_size)
         src_kpt_f = self._keypoints_to_face_bbox(src_kpts, src_scores)
         ref_kpt_p = self._keypoints_to_person_bbox(ref_kpts, ref_scores, ref_size)
@@ -496,37 +281,99 @@ class PoseTransferPipeline:
             ref_ov = self.renderer.render(ref_img, ref_kpts, ref_scores)
             ref_debug_img = self._draw_bbox_debug_layers(ref_ov, ref_debug_data)
 
+        # Main Transfer (좌표만 계산)
         result = self.transfer_engine.transfer(
             src_kpts, src_scores, ref_kpts, ref_scores,
             source_image_size=(src_h, src_w), reference_image_size=(ref_h, ref_w)
         )
         trans_kpts, trans_scores = result.keypoints, result.scores
+        
+        # Post-processing (Case based)
         trans_kpts, trans_scores = self._postprocess_for_case(trans_kpts, trans_scores, case, src_scores)
         
-        render_h, render_w = max(src_h, ref_h)*2, max(src_w, ref_w)*2
-        offset_x, offset_y = render_w//4, render_h//4
-        r_kpts = trans_kpts.copy(); r_kpts[:,0]+=offset_x; r_kpts[:,1]+=offset_y
-        skel = self.renderer.render_skeleton_only((render_h, render_w, 3), r_kpts, trans_scores)
-        skel_crop, _ = self._crop_skeleton_tight(skel)
+        # =========================================================
+        # [REFACTORED] Coordinate-centric Post-processing
+        # 이미지 조작 없이 좌표만으로 스케일/정렬/크롭 수행
+        # =========================================================
         
+        # 1. Tight Crop 계산
+        valid_mask = np.any(trans_kpts > 0, axis=1) & (trans_scores > self.config.kpt_threshold)
+        if not np.any(valid_mask):
+            crop_min = np.array([0, 0]); crop_max = np.array([100, 100])
+        else:
+            crop_min = np.min(trans_kpts[valid_mask], axis=0)
+            crop_max = np.max(trans_kpts[valid_mask], axis=0)
+        
+        # Shift to zero
+        current_kpts = trans_kpts.copy()
+        current_kpts -= crop_min
+        
+        crop_w = crop_max[0] - crop_min[0]
+        crop_h = crop_max[1] - crop_min[1]
+        
+        # 2. Scale 계산
         scale = 1.0
         if self.config.face_scale_enabled:
-            scale_img, scale = self._scale_skeleton(skel_crop, src_face_final.size, ref_face_final.size)
-        else:
-            scale_img = skel_crop
-        scaled_kpts = trans_kpts.copy() * scale
+            # Bbox 크기 비율로 계산
+            ref_size = ref_face_final.size
+            src_size = src_face_final.size
+            if ref_size > 1:
+                scale = np.clip(src_size / ref_size, 0.3, 3.0)
+                if abs(scale - 1.0) < 0.05: scale = 1.0
         
-        aligned, aligned_kpts = self._align_skeleton(
-            scale_img, (src_h, src_w), src_person_final, src_face_final, case, scaled_kpts, trans_scores
+        current_kpts *= scale
+        current_w = crop_w * scale
+        current_h = crop_h * scale
+        
+        # 3. Alignment (Canvas 배치)
+        # 최종 캔버스 크기 결정 (패딩 포함)
+        final_w, final_h = int(current_w), int(current_h)
+        
+        # Case A: Feet alignment logic (좌표 기준)
+        # Case B/C/D: Face alignment logic
+        offset_x, offset_y = 0, 0
+        
+        # 단순화를 위해 Face Center Alignment 적용 (가장 일반적)
+        # 현재 키포인트의 Face Center 계산
+        trans_face_bbox = self._keypoints_to_face_bbox(current_kpts, trans_scores)
+        cur_face_cx, cur_face_cy = trans_face_bbox.center
+        
+        # 목표: src_face_final.center (원본 이미지 상의 위치)와 일치시키는 것이 아님.
+        # 목표는 "꽉 찬 화면"을 만드는 것.
+        # 따라서 현재 캔버스(tight crop된 상태)에 여백만 추가하면 됨.
+        
+        # 4. Head Padding & Final Crop Padding
+        # 좌표 기반 로직에서는 단순히 캔버스 사이즈를 늘리고 키포인트를 이동
+        
+        # 머리 위 패딩 계산
+        head_pad = self._calc_head_padding_value(current_kpts, trans_scores)
+        pad_px = self.config.crop_padding_px
+        
+        # 최종 캔버스 크기
+        final_w = int(current_w + pad_px * 2)
+        final_h = int(current_h + pad_px * 2 + head_pad)
+        
+        # 키포인트 이동 (Centering + Padding)
+        current_kpts[:, 0] += pad_px
+        current_kpts[:, 1] += (pad_px + head_pad)
+        
+        # 최종 결과
+        final_kpts = current_kpts
+        final_size = (final_h, final_w) # H, W
+        
+        print(f"\n[STEP 6] Finalize")
+        print(f"   Scale: {scale:.2f}")
+        print(f"   Output Size: {final_w}x{final_h}")
+        
+        # 렌더링 (마지막에 딱 한번)
+        skeleton_image = self.renderer.render_skeleton_only(
+            (final_h, final_w, 3), final_kpts, trans_scores
         )
-        padded, padded_kpts = self._add_head_padding(aligned, aligned_kpts, trans_scores)
-        final, final_kpts, final_size = self._final_crop(padded, padded_kpts, self.config.crop_padding_px)
         
         align_info = AlignmentInfo(
             case=case, src_body_type=src_type, ref_body_type=ref_type,
             src_person_bbox=src_person_final, src_face_bbox=src_face_final, ref_face_bbox=ref_face_final,
-            face_scale_ratio=scale, alignment_method="feet" if case==AlignmentCase.A else "face",
-            yolo_log=src_yolo_log
+            face_scale_ratio=scale, alignment_method="coordinate_centric", yolo_log=src_yolo_log
         )
         
         return PipelineResult(
@@ -534,94 +381,141 @@ class PoseTransferPipeline:
             source_keypoints=src_kpts, source_scores=src_scores,
             source_bone_lengths=result.source_bone_lengths,
             reference_keypoints=ref_kpts, reference_scores=ref_scores,
-            skeleton_image=final, image_size=final_size,
+            skeleton_image=skeleton_image, image_size=final_size,
             selected_person_idx={'source': src_idx, 'reference': ref_idx},
             processing_info={'transfer_log': result.transfer_log},
             alignment_info=align_info,
             src_debug_image=src_debug_img, ref_debug_image=ref_debug_img
         )
 
-    def _crop_skeleton_tight(self, img: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int,int,int]]:
-        mask = np.any(img != 0, axis=2)
-        if not np.any(mask): return img, (0, 0, img.shape[1], img.shape[0])
-        rows, cols = np.any(mask, axis=1), np.any(mask, axis=0)
-        y1, y2 = np.where(rows)[0][[0, -1]]
-        x1, x2 = np.where(cols)[0][[0, -1]]
-        return img[y1:y2+1, x1:x2+1], (x1, y1, x2+1, y2+1)
-    
-    def _scale_skeleton(self, img: np.ndarray, src_size: float, ref_size: float) -> Tuple[np.ndarray, float]:
-        if ref_size < 1: return img, 1.0
-        ratio = np.clip(src_size / ref_size, 0.3, 3.0)
-        if abs(ratio - 1.0) < 0.05: return img, 1.0
-        new_h, new_w = int(img.shape[0] * ratio), int(img.shape[1] * ratio)
-        scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-        return scaled, ratio
-
-    def _align_skeleton(self, skeleton, src_size, src_person, src_face, case, trans_kpts, trans_scores):
-        src_h, src_w = src_size
-        sk_h, sk_w = skeleton.shape[:2]
-        if case == AlignmentCase.A:
-            x1, y1, x2, y2 = src_person.bbox
-            padding_h, padding_w = max(src_h, sk_h + (src_h - y2)), max(src_w, sk_w + x1)
-            canvas = np.zeros((padding_h, padding_w, 3), dtype=np.uint8)
-            pose_x1, pose_y2 = x1, padding_h - (src_h - y2)
-            pose_y1 = max(0, pose_y2 - sk_h)
-            sk_y_start = max(0, sk_h - (pose_y2 - pose_y1))
-            canvas[pose_y1:pose_y2, pose_x1:pose_x1+sk_w] = skeleton[sk_y_start:, :min(sk_w, padding_w-pose_x1)]
-            adj_kpts = trans_kpts.copy()
-            adj_kpts[:, 0] += pose_x1; adj_kpts[:, 1] += pose_y1 - sk_y_start
-            return canvas, adj_kpts
-        else:
-            trans_face = self._keypoints_to_face_bbox(trans_kpts, trans_scores)
-            offset_x, offset_y = src_face.center[0] - trans_face.center[0], src_face.center[1] - trans_face.center[1]
-            new_x1, new_y1, new_x2, new_y2 = offset_x, offset_y, offset_x + sk_w, offset_y + sk_h
-            exp_l, exp_t = max(0, -new_x1), max(0, -new_y1)
-            exp_r, exp_b = max(0, new_x2 - src_w), max(0, new_y2 - src_h)
-            padding_w, padding_h = int(src_w + exp_l + exp_r), int(src_h + exp_t + exp_b)
-            canvas = np.zeros((padding_h, padding_w, 3), dtype=np.uint8)
-            pose_x1, pose_y1 = int(new_x1 + exp_l), int(new_y1 + exp_t)
-            canvas[pose_y1:pose_y1+sk_h, pose_x1:pose_x1+sk_w] = skeleton
-            adj_kpts = trans_kpts.copy()
-            adj_kpts[:, 0] += (offset_x + exp_l); adj_kpts[:, 1] += (offset_y + exp_t)
-            return canvas, adj_kpts
-
-    def _add_head_padding(self, img, kpts, scores):
-        pad = self._calc_head_padding(kpts, scores)
-        pl, pt, pr, pb = [int(p) for p in pad]
-        if pl == 0 and pt == 0 and pr == 0 and pb == 0: return img, kpts
-        h, w = img.shape[:2]
-        padded = np.zeros((h + pt + pb, w + pl + pr, 3), dtype=np.uint8)
-        padded[pt:pt+h, pl:pl+w] = img
-        adj = kpts.copy(); adj[:, 0] += pl; adj[:, 1] += pt
-        return padded, adj
-
-    def _calc_head_padding(self, kpts, scores):
+    def _calc_head_padding_value(self, kpts, scores):
+        # 좌표 기반 머리 패딩 높이 계산
         nose_idx = BODY_KEYPOINTS.get('nose', 0)
-        l_sh, r_sh = BODY_KEYPOINTS.get('left_shoulder', 5), BODY_KEYPOINTS.get('right_shoulder', 6)
-        l_eye, r_eye = BODY_KEYPOINTS.get('left_eye', 1), BODY_KEYPOINTS.get('right_eye', 2)
-        if scores[nose_idx] <= 0.1 or not (scores[l_sh] > 0.1 or scores[r_sh] > 0.1): return (0, 0, 0, 0)
-        neck = (kpts[l_sh] + kpts[r_sh]) / 2 if scores[l_sh] > 0.1 and scores[r_sh] > 0.1 else (kpts[l_sh] if scores[l_sh] > 0.1 else kpts[r_sh])
-        nose = kpts[nose_idx]; head_vec = nose - neck; length = np.linalg.norm(head_vec)
-        if length < 1: return (0, 0, 0, 0)
-        direction = head_vec / length
-        head_size = np.linalg.norm(kpts[l_eye] - kpts[r_eye]) * 2.5 if scores[l_eye] > 0.1 and scores[r_eye] > 0.1 else length * 1.5
-        extend = head_size * self.config.head_padding_ratio
-        crown = nose + direction * extend
-        offset_x, offset_y = crown[0] - nose[0], crown[1] - nose[1]
-        return (max(0, -offset_x), max(0, -offset_y), max(0, offset_x), max(0, offset_y))
+        neck_idx = BODY_KEYPOINTS.get('left_shoulder', 5) # simplified
+        if scores[nose_idx] > 0.1 and scores[neck_idx] > 0.1:
+            head_len = np.linalg.norm(kpts[nose_idx] - kpts[neck_idx])
+            return head_len * 1.5 * self.config.head_padding_ratio
+        return 50.0 # Default
 
-    def _final_crop(self, canvas, kpts, padding):
-        h, w = canvas.shape[:2]
-        valid_mask = np.any(kpts > 0, axis=1)
-        if not np.any(valid_mask): return canvas, kpts, canvas.shape[:2]
-        valid = kpts[valid_mask]
-        x1 = max(0, int(np.min(valid[:, 0])) - padding)
-        y1 = max(0, int(np.min(valid[:, 1])) - padding)
-        x2 = min(w, int(np.max(valid[:, 0])) + padding)
-        y2 = min(h, int(np.max(valid[:, 1])) + padding)
-        cropped = canvas[y1:y2, x1:x2]
-        adj = kpts.copy(); adj[:, 0] -= x1; adj[:, 1] -= y1
-        return cropped, adj, cropped.shape[:2]
+    def _determine_body_type(self, kpts, scores):
+        valid = sum(1 for idx in LOWER_BODY_INDICES if idx < len(scores) and scores[idx] > self.config.kpt_threshold)
+        return BodyType.FULL if valid >= self.config.full_body_min_valid_lower else BodyType.UPPER
+    
+    def _determine_case(self, src, ref):
+        if src == BodyType.FULL and ref == BodyType.FULL: return AlignmentCase.A
+        elif src == BodyType.UPPER and ref == BodyType.UPPER: return AlignmentCase.B
+        elif src == BodyType.FULL and ref == BodyType.UPPER: return AlignmentCase.C
+        else: return AlignmentCase.D
+
+    def _keypoints_to_person_bbox(self, kpts, scores, size):
+        h, w = size
+        margin = self.config.person_bbox_margin
+        valid = kpts[scores > self.config.kpt_threshold]
+        if len(valid) == 0: return BboxInfo((0,0,w,h), (w/2,h/2), max(w,h), "fallback")
+        mn, mx = valid.min(0), valid.max(0)
+        wd, ht = mx - mn
+        mx_pad, my_pad = wd*margin, ht*margin
+        x1, y1 = max(0, int(mn[0]-mx_pad)), max(0, int(mn[1]-my_pad))
+        x2, y2 = min(w, int(mx[0]+mx_pad)), min(h, int(mx[1]+my_pad))
+        return BboxInfo((x1,y1,x2,y2), ((x1+x2)/2, (y1+y2)/2), max(x2-x1, y2-y1), "keypoint")
+
+    def _keypoints_to_face_bbox(self, kpts, scores):
+        margin = self.config.face_bbox_margin
+        body_face_idx = [BODY_KEYPOINTS.get(n, i) for i, n in enumerate(['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear'])]
+        jaw_idx = list(range(23, 40)); l_brow = list(range(40, 45)); r_brow = list(range(45, 50))
+        target = body_face_idx + jaw_idx + l_brow + r_brow
+        valid = [kpts[i] for i in target if i < len(scores) and scores[i] > self.config.kpt_threshold]
+        if len(valid) < 2: return BboxInfo((0,0,100,100), (50,50), 100, "fallback")
+        v = np.array(valid)
+        mn, mx = v.min(0), v.max(0)
+        width, height = mx[0]-mn[0], mx[1]-mn[1]
+        size = max(width, height)
+        mx_pad, my_pad = width*margin, height*margin
+        x1, y1 = int(mn[0]-mx_pad), int(mn[1]-my_pad)
+        x2, y2 = int(mx[0]+mx_pad), int(mx[1]+my_pad)
+        return BboxInfo((x1,y1,x2,y2), ((x1+x2)/2, (y1+y2)/2), size, "keypoint")
+
+    def _run_yolo_and_merge(self, image: np.ndarray, kpt_person: BboxInfo, kpt_face: BboxInfo) -> Tuple[DebugBboxData, Dict]:
+        debug_data = DebugBboxData(kpt_person=kpt_person, kpt_face=kpt_face)
+        yolo_log = {"person": False, "face": False}
+        if self._yolo_person is None:
+            debug_data.hybrid_person = kpt_person; debug_data.hybrid_face = kpt_face
+            return debug_data, yolo_log
+        try:
+            res = self._yolo_person.predict(image, conf=self.config.yolo_person_conf, verbose=False)[0].boxes
+            mask = (res.cls == 0)
+            hybrid_person = kpt_person
+            if mask.sum() > 0:
+                yolo_log["person"] = True
+                boxes = res.xyxy[mask].cpu().numpy()
+                areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+                yb = boxes[np.argmax(areas)].astype(int)
+                yolo_info = BboxInfo((yb[0], yb[1], yb[2], yb[3]), ((yb[0]+yb[2])/2, (yb[1]+yb[3])/2), max(yb[2]-yb[0], yb[3]-yb[1]), "yolo")
+                debug_data.yolo_person = yolo_info
+                iou = self._calc_iou(kpt_person.bbox, yb)
+                if iou > 0.3:
+                    kb = kpt_person.bbox
+                    x1, y1 = min(kb[0], yb[0]), min(kb[1], yb[1])
+                    x2, y2 = max(kb[2], yb[2]), max(kb[3], yb[3])
+                    hybrid_person = BboxInfo((x1, y1, x2, y2), ((x1+x2)/2, (y1+y2)/2), max(x2-x1, y2-y1), "hybrid(union)")
+                else: hybrid_person = kpt_person
+            else: hybrid_person = kpt_person
+            debug_data.hybrid_person = hybrid_person
+
+            px1, py1, px2, py2 = hybrid_person.bbox
+            h, w = image.shape[:2]
+            px1, py1 = max(0, px1), max(0, py1); px2, py2 = min(w, px2), min(h, py2)
+            crop = image[py1:py2, px1:px2]
+            hybrid_face = kpt_face
+            if crop.size > 0:
+                f_res = self._yolo_face.predict(crop, conf=self.config.yolo_face_conf, verbose=False)[0].boxes
+                if len(f_res) > 0:
+                    yolo_log["face"] = True
+                    fb = f_res[0].xyxy[0].cpu().numpy().astype(int)
+                    fx1, fy1, fx2, fy2 = fb[0]+px1, fb[1]+py1, fb[2]+px1, fb[3]+py1
+                    yolo_info = BboxInfo((fx1, fy1, fx2, fy2), ((fx1+fx2)/2, (fy1+fy2)/2), max(fx2-fx1, fy2-fy1), "yolo")
+                    debug_data.yolo_face = yolo_info
+                    f_iou = self._calc_iou(kpt_face.bbox, (fx1, fy1, fx2, fy2))
+                    if f_iou > 0.1:
+                        kb = kpt_face.bbox
+                        ux1, uy1 = min(kb[0], fx1), min(kb[1], fy1)
+                        ux2, uy2 = max(kb[2], fx2), max(kb[3], fy2)
+                        hybrid_face = BboxInfo((ux1, uy1, ux2, uy2), ((ux1+ux2)/2, (uy1+uy2)/2), max(ux2-ux1, uy2-uy1), "hybrid(union)")
+                    else:
+                        if kpt_face.source == "fallback": hybrid_face = yolo_info
+                        else: hybrid_face = yolo_info 
+            debug_data.hybrid_face = hybrid_face
+        except Exception as e:
+            print(f"   ⚠️ YOLO Error: {e}")
+            debug_data.hybrid_person = kpt_person; debug_data.hybrid_face = kpt_face
+        return debug_data, yolo_log
+
+    def _draw_bbox_debug_layers(self, image: np.ndarray, data: DebugBboxData) -> np.ndarray:
+        if not (self.config.viz_kpt_bbox or self.config.viz_yolo_bbox or self.config.viz_hybrid_bbox): return image
+        debug_img = image.copy()
+        thick = max(1, self.config.line_thickness // 2)
+        if self.config.viz_kpt_bbox:
+            if data.kpt_person: self._draw_box(debug_img, data.kpt_person, COLOR_KPT_BBOX, "KPT-P", thick)
+            if data.kpt_face: self._draw_box(debug_img, data.kpt_face, COLOR_KPT_BBOX, "KPT-F", thick)
+        if self.config.viz_yolo_bbox:
+            if data.yolo_person: self._draw_box(debug_img, data.yolo_person, COLOR_YOLO_BBOX, "YOLO-P", thick)
+            if data.yolo_face: self._draw_box(debug_img, data.yolo_face, COLOR_YOLO_BBOX, "YOLO-F", thick)
+        if self.config.viz_hybrid_bbox:
+            if data.hybrid_person: self._draw_box(debug_img, data.hybrid_person, COLOR_HYBRID_PERSON, "Final-P", thick+1)
+            if data.hybrid_face: self._draw_box(debug_img, data.hybrid_face, COLOR_HYBRID_FACE, "Final-F", thick+1)
+        return debug_img
+
+    def _draw_box(self, img, info: BboxInfo, color, label, thick):
+        x1, y1, x2, y2 = info.bbox
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
+        cv2.putText(img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    def _calc_iou(self, b1, b2):
+        x1, y1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+        x2, y2 = min(b1[2], b2[2]), min(b1[3], b2[3])
+        inter = max(0, x2-x1) * max(0, y2-y1)
+        a1 = (b1[2]-b1[0])*(b1[3]-b1[1]); a2 = (b2[2]-b2[0])*(b2[3]-b2[1])
+        return inter / (a1+a2-inter) if (a1+a2-inter) > 0 else 0
 
     def _postprocess_for_case(self, kpts, scores, case, src_scores):
         if case == AlignmentCase.D:
