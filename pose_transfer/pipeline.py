@@ -1,106 +1,89 @@
 """
-포즈 전이 파이프라인 v4
-- Ghost Legs 클리핑
-- 키포인트 기반 자동 패딩/크롭 (trans_sk용)
-- [NEW] 머리 방향 추가 패딩 (코 벡터 기반)
+포즈 전이 파이프라인 v6.3
+- Bbox 마진 설정(bbox.person_margin, bbox.face_margin) 적용
+- Bbox 계산 시 턱선(Jawline) 포함 로직 유지
 """
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple, Union, Set
+from typing import Dict, Any, Optional, Tuple, Union, Set, List
 from dataclasses import dataclass, field
+from enum import Enum
 
 from .extractors import (
-    DWPoseExtractor,
-    DWPoseExtractorFactory,
-    PersonFilter,
-    filter_main_person,
-    RTMLIB_AVAILABLE
+    DWPoseExtractor, DWPoseExtractorFactory, PersonFilter, RTMLIB_AVAILABLE
 )
 from .extractors.keypoint_constants import BODY_KEYPOINTS, FEET_KEYPOINTS
-from .analyzers import BoneCalculator, DirectionExtractor
 from .transfer import PoseTransferEngine, TransferConfig, FallbackStrategy
 from .refiners import HandRefiner
-from .renderers import SkeletonRenderer, render_skeleton
-from .utils import (
-    load_config, save_json, load_image, save_image,
-    convert_to_openpose_format, PoseResult
-)
+from .renderers import SkeletonRenderer
+from .utils import load_config, convert_to_openpose_format, load_image
 
+# Bbox 색상 정의 (BGR)
+COLOR_KPT_BBOX = (0, 255, 0)
+COLOR_YOLO_BBOX = (255, 0, 0)
+COLOR_HYBRID_PERSON = (127, 0, 255)
+COLOR_HYBRID_FACE = (128, 128, 0)
 
-# ============================================================
-# Ghost Legs 클리핑을 위한 계층 구조
-# ============================================================
-LOWER_BODY_HIERARCHY = {
-    'left_hip': ['left_knee'],
-    'right_hip': ['right_knee'],
-    'left_knee': ['left_ankle'],
-    'right_knee': ['right_ankle'],
-    'left_ankle': ['left_big_toe', 'left_small_toe', 'left_heel'],
-    'right_ankle': ['right_big_toe', 'right_small_toe', 'right_heel'],
-}
+class BodyType(Enum):
+    FULL = "full"
+    UPPER = "upper"
 
+class AlignmentCase(Enum):
+    A = "A"; B = "B"; C = "C"; D = "D"
+
+LOWER_BODY_INDICES = [11, 12, 13, 14, 15, 16]
 
 @dataclass
 class PipelineConfig:
-    """파이프라인 설정"""
-    # 모델 설정
     backend: str = 'onnxruntime'
     device: str = 'cuda'
     mode: str = 'performance'
     to_openpose: bool = False
-    
-    # 다중 인물 필터링
     filter_enabled: bool = True
     area_weight: float = 0.6
     center_weight: float = 0.4
     filter_confidence_threshold: float = 0.3
-    
-    # 손 정밀화
     hand_refinement_enabled: bool = True
     min_hand_size: int = 48
-    
-    # 폴백
     fallback_enabled: bool = True
-    
-    # 전이 신뢰도 임계값
     transfer_confidence_threshold: float = 0.3
-    
-    # 렌더링
     line_thickness: int = 4
     face_line_thickness: int = 2
     hand_line_thickness: int = 2
     point_radius: int = 4
     kpt_threshold: float = 0.3
-    
-    # Ghost Legs 클리핑 설정
     ghost_legs_clipping_enabled: bool = True
     lower_body_confidence_threshold: float = 2.0
     lower_body_margin_ratio: float = 0.10
-    
-    # 키포인트 기반 크롭 설정
     auto_crop_enabled: bool = True
     crop_padding_px: int = 50
+    head_padding_ratio: float = 1.0
+    full_body_min_valid_lower: int = 4
+    yolo_verification_enabled: bool = True
+    yolo_person_conf: float = 0.5
+    yolo_face_conf: float = 0.3
+    face_scale_enabled: bool = True
     
-    # [NEW] 머리 방향 추가 패딩
-    head_padding_ratio: float = 0.5
+    # [NEW] Bbox Margin 설정
+    person_bbox_margin: float = 0.0
+    face_bbox_margin: float = 0.0
+    
+    # 디버그 설정
+    debug_bbox_visualization: bool = False
+    viz_kpt_bbox: bool = False
+    viz_yolo_bbox: bool = False
+    viz_hybrid_bbox: bool = False
     
     @classmethod
     def from_yaml(cls, yaml_path: str) -> 'PipelineConfig':
-        """YAML 파일에서 설정 로드"""
         config = load_config(yaml_path)
         rendering = config.get('rendering', {})
         transfer = config.get('transfer', {})
         output = config.get('output', {})
-        
-        print("\n[DEBUG] Loading YAML config...")
-        print(f"  model.backend: {config.get('model', {}).get('backend')}")
-        print(f"  rendering.kpt_threshold: {rendering.get('kpt_threshold')}")
-        print(f"  transfer.lower_body_confidence_threshold: {transfer.get('lower_body_confidence_threshold')}")
-        print(f"  transfer.lower_body_margin_ratio: {transfer.get('lower_body_margin_ratio')}")
-        print(f"  output.auto_crop_enabled: {output.get('auto_crop_enabled')}")
-        print(f"  output.crop_padding_px: {output.get('crop_padding_px')}")
-        print(f"  output.head_padding_ratio: {output.get('head_padding_ratio')}")
+        alignment = config.get('alignment', {})
+        debug = config.get('debug', {})
+        bbox = config.get('bbox', {}) # [NEW] bbox 섹션 로드
         
         return cls(
             backend=config.get('model', {}).get('backend', 'onnxruntime'),
@@ -120,21 +103,58 @@ class PipelineConfig:
             hand_line_thickness=rendering.get('hand_line_thickness', 2),
             point_radius=rendering.get('point_radius', 4),
             kpt_threshold=rendering.get('kpt_threshold', 0.3),
-            # Ghost Legs 설정
             ghost_legs_clipping_enabled=transfer.get('ghost_legs_clipping_enabled', True),
             lower_body_confidence_threshold=transfer.get('lower_body_confidence_threshold', 2.0),
             lower_body_margin_ratio=transfer.get('lower_body_margin_ratio', 0.10),
-            # 크롭 설정
             auto_crop_enabled=output.get('auto_crop_enabled', True),
             crop_padding_px=output.get('crop_padding_px', 50),
-            # [NEW] 머리 패딩
-            head_padding_ratio=output.get('head_padding_ratio', 0.5),
+            head_padding_ratio=output.get('head_padding_ratio', 1.0),
+            full_body_min_valid_lower=alignment.get('full_body_min_valid_lower', 4),
+            yolo_verification_enabled=alignment.get('yolo_verification_enabled', True),
+            yolo_person_conf=alignment.get('yolo_person_conf', 0.5),
+            yolo_face_conf=alignment.get('yolo_face_conf', 0.3),
+            face_scale_enabled=alignment.get('face_scale_enabled', True),
+            
+            # [NEW] Bbox Margin 매핑
+            person_bbox_margin=bbox.get('person_margin', 0.0),
+            face_bbox_margin=bbox.get('face_margin', 0.0),
+            
+            debug_bbox_visualization=debug.get('bbox_visualization', False),
+            viz_kpt_bbox=debug.get('visualize_keypoint_bbox', True),
+            viz_yolo_bbox=debug.get('visualize_yolo_bbox', True),
+            viz_hybrid_bbox=debug.get('visualize_hybrid_bbox', True),
         )
 
+@dataclass
+class BboxInfo:
+    bbox: Tuple[int, int, int, int]
+    center: Tuple[float, float]
+    size: float
+    source: str
+
+@dataclass
+class DebugBboxData:
+    kpt_person: Optional[BboxInfo] = None
+    kpt_face: Optional[BboxInfo] = None
+    yolo_person: Optional[BboxInfo] = None
+    yolo_face: Optional[BboxInfo] = None
+    hybrid_person: Optional[BboxInfo] = None
+    hybrid_face: Optional[BboxInfo] = None
+
+@dataclass
+class AlignmentInfo:
+    case: AlignmentCase
+    src_body_type: BodyType
+    ref_body_type: BodyType
+    src_person_bbox: BboxInfo
+    src_face_bbox: BboxInfo
+    ref_face_bbox: BboxInfo
+    face_scale_ratio: float
+    alignment_method: str
+    yolo_log: Dict[str, bool]
 
 @dataclass
 class PipelineResult:
-    """파이프라인 결과"""
     transferred_keypoints: np.ndarray
     transferred_scores: np.ndarray
     source_keypoints: np.ndarray
@@ -146,6 +166,9 @@ class PipelineResult:
     image_size: Tuple[int, int]
     selected_person_idx: Dict[str, int] = field(default_factory=dict)
     processing_info: Dict[str, Any] = field(default_factory=dict)
+    alignment_info: Optional[AlignmentInfo] = None
+    src_debug_image: Optional[np.ndarray] = None
+    ref_debug_image: Optional[np.ndarray] = None
     
     def to_json(self) -> Dict[str, Any]:
         return convert_to_openpose_format(
@@ -154,540 +177,422 @@ class PipelineResult:
             self.image_size
         )
 
-
 class PoseTransferPipeline:
-    """포즈 전이 파이프라인"""
-    
     def __init__(self, config: Optional[PipelineConfig] = None, yaml_config: Optional[dict] = None):
         self.config = config or PipelineConfig()
         self.yaml_config = yaml_config
+        self._yolo_person = None
+        self._yolo_face = None
         self._init_modules()
     
     def _init_modules(self):
-        """모듈 초기화"""
-        if not RTMLIB_AVAILABLE:
-            raise RuntimeError("rtmlib is not installed.")
+        if not RTMLIB_AVAILABLE: raise RuntimeError("rtmlib not installed.")
         
-        print("\n[DEBUG] Initializing modules with config:")
-        print(f"  kpt_threshold: {self.config.kpt_threshold}")
-        print(f"  ghost_legs_clipping_enabled: {self.config.ghost_legs_clipping_enabled}")
-        print(f"  lower_body_confidence_threshold: {self.config.lower_body_confidence_threshold}")
-        print(f"  lower_body_margin_ratio: {self.config.lower_body_margin_ratio}")
-        print(f"  auto_crop_enabled: {self.config.auto_crop_enabled}")
-        print(f"  crop_padding_px: {self.config.crop_padding_px}")
-        print(f"  head_padding_ratio: {self.config.head_padding_ratio}")
-        
-        # 추출기
         self.extractor = DWPoseExtractorFactory.get_instance(
-            backend=self.config.backend,
-            device=self.config.device,
-            mode=self.config.mode,
-            to_openpose=self.config.to_openpose,
-            force_new=True
+            backend=self.config.backend, device=self.config.device,
+            mode=self.config.mode, to_openpose=self.config.to_openpose, force_new=True
         )
-        
-        # 인물 필터
         self.person_filter = PersonFilter(
-            area_weight=self.config.area_weight,
-            center_weight=self.config.center_weight,
+            area_weight=self.config.area_weight, center_weight=self.config.center_weight,
             confidence_threshold=self.config.filter_confidence_threshold
         )
-        
-        # 전이 엔진
-        transfer_config = TransferConfig(
-            confidence_threshold=self.config.transfer_confidence_threshold
-        )
-        self.transfer_engine = PoseTransferEngine(
-            config=transfer_config,
-            yaml_config=self.yaml_config
-        )
-        
-        # 폴백 전략
-        self.fallback_strategy = FallbackStrategy(
-            confidence_threshold=self.config.transfer_confidence_threshold
-        )
-        
-        # 손 정밀화
-        self.hand_refiner = HandRefiner(
-            min_hand_size=self.config.min_hand_size,
-            confidence_threshold=self.config.transfer_confidence_threshold
-        )
-        
-        # 렌더러
+        transfer_config = TransferConfig(confidence_threshold=self.config.transfer_confidence_threshold)
+        self.transfer_engine = PoseTransferEngine(config=transfer_config, yaml_config=self.yaml_config)
+        self.fallback_strategy = FallbackStrategy(confidence_threshold=self.config.transfer_confidence_threshold)
+        self.hand_refiner = HandRefiner(min_hand_size=self.config.min_hand_size, confidence_threshold=self.config.transfer_confidence_threshold)
         self.renderer = SkeletonRenderer(
-            line_thickness=self.config.line_thickness,
-            point_radius=self.config.point_radius,
-            kpt_threshold=self.config.kpt_threshold,
-            face_line_thickness=self.config.face_line_thickness,
+            line_thickness=self.config.line_thickness, point_radius=self.config.point_radius,
+            kpt_threshold=self.config.kpt_threshold, face_line_thickness=self.config.face_line_thickness,
             hand_line_thickness=self.config.hand_line_thickness
         )
-    
-    # ============================================================
-    # 키포인트 바운딩 박스 계산
-    # ============================================================
-    def _get_keypoint_bbox(
-        self,
-        keypoints: np.ndarray,
-        scores: np.ndarray,
-        score_threshold: float = 0.1
-    ) -> Tuple[float, float, float, float]:
-        """유효한 키포인트들의 바운딩 박스 계산"""
-        valid_mask = scores > score_threshold
-        valid_kpts = keypoints[valid_mask]
-        
-        if len(valid_kpts) == 0:
-            return (0, 0, 100, 100)
-        
-        min_x = np.min(valid_kpts[:, 0])
-        min_y = np.min(valid_kpts[:, 1])
-        max_x = np.max(valid_kpts[:, 0])
-        max_y = np.max(valid_kpts[:, 1])
-        
-        return (min_x, min_y, max_x, max_y)
-    
-    # ============================================================
-    # [NEW] 머리 방향 및 추가 패딩 계산 (가상 정수리 포인트 기반)
-    # ============================================================
-    def _calculate_head_padding(
-        self,
-        keypoints: np.ndarray,
-        scores: np.ndarray
-    ) -> Tuple[float, float, float, float]:
-        """
-        코 벡터(목 → 코)를 기반으로 머리 방향을 파악하고,
-        가상의 정수리 포인트까지 포함하도록 패딩 계산
-        
-        Returns:
-            (pad_left, pad_top, pad_right, pad_bottom) - 각 방향 추가 패딩
-        """
-        # 키포인트 인덱스
-        nose_idx = BODY_KEYPOINTS.get('nose', 0)
-        l_shoulder_idx = BODY_KEYPOINTS.get('left_shoulder', 5)
-        r_shoulder_idx = BODY_KEYPOINTS.get('right_shoulder', 6)
-        l_eye_idx = BODY_KEYPOINTS.get('left_eye', 1)
-        r_eye_idx = BODY_KEYPOINTS.get('right_eye', 2)
-        
-        # 유효성 체크
-        nose_valid = scores[nose_idx] > 0.1
-        l_sh_valid = scores[l_shoulder_idx] > 0.1
-        r_sh_valid = scores[r_shoulder_idx] > 0.1
-        
-        if not nose_valid or not (l_sh_valid or r_sh_valid):
-            print(f"   🗣️ [Head] Skip - nose_valid={nose_valid}, shoulders={l_sh_valid}/{r_sh_valid}")
-            return (0, 0, 0, 0)
-        
-        # 목 위치 (어깨 중심)
-        if l_sh_valid and r_sh_valid:
-            neck = (keypoints[l_shoulder_idx] + keypoints[r_shoulder_idx]) / 2
-        elif l_sh_valid:
-            neck = keypoints[l_shoulder_idx]
-        else:
-            neck = keypoints[r_shoulder_idx]
-        
-        nose = keypoints[nose_idx]
-        
-        # 머리 방향 벡터 (목 → 코)
-        head_vec = nose - neck
-        head_length = np.linalg.norm(head_vec)
-        
-        if head_length < 1:
-            print(f"   🗣️ [Head] Skip - head_length too small: {head_length:.1f}")
-            return (0, 0, 0, 0)
-        
-        # 정규화된 머리 방향
-        head_dir = head_vec / head_length
-        
-        # 머리 크기 추정 (눈 사이 거리 또는 머리 벡터 길이 기반)
-        if scores[l_eye_idx] > 0.1 and scores[r_eye_idx] > 0.1:
-            eye_dist = np.linalg.norm(keypoints[l_eye_idx] - keypoints[r_eye_idx])
-            head_size = eye_dist * 2.5
-        else:
-            head_size = head_length * 1.5
-        
-        # 가상 정수리 포인트 계산 (코에서 머리 방향으로 head_size만큼 더 감)
-        # head_padding_ratio를 곱해서 최종 패딩 거리 결정
-        extend_distance = head_size * self.config.head_padding_ratio
-        
-        # 정수리 방향 = 머리 방향과 동일 (목→코 방향의 연장선)
-        crown_point = nose + head_dir * extend_distance
-        
-        # 현재 바운딩 박스 기준으로 정수리 포인트가 얼마나 벗어나는지 계산
-        # 바운딩 박스의 min/max는 호출 시점에서 이미 계산되므로,
-        # 여기서는 코 위치 대비 정수리까지의 오프셋만 반환
-        offset_x = crown_point[0] - nose[0]
-        offset_y = crown_point[1] - nose[1]
-        
-        # 방향별 패딩 계산 (정수리가 바운딩 박스 밖으로 나가는 양)
-        pad_left = max(0, -offset_x)
-        pad_right = max(0, offset_x)
-        pad_top = max(0, -offset_y)
-        pad_bottom = max(0, offset_y)
-        
-        print(f"   🗣️ [Head] dir=({head_dir[0]:.2f}, {head_dir[1]:.2f}), size={head_size:.0f}")
-        print(f"       nose=({nose[0]:.0f}, {nose[1]:.0f}) -> crown=({crown_point[0]:.0f}, {crown_point[1]:.0f})")
-        print(f"       pad: L={pad_left:.0f}, T={pad_top:.0f}, R={pad_right:.0f}, B={pad_bottom:.0f}")
-        
-        return (pad_left, pad_top, pad_right, pad_bottom)
-    
-    # ============================================================
-    # 키포인트 기반 캔버스 크기 계산 (머리 패딩 포함)
-    # ============================================================
-    def _calculate_canvas_and_offset(
-        self,
-        keypoints: np.ndarray,
-        scores: np.ndarray,
-        base_size: Tuple[int, int],
-        padding: int
-    ) -> Tuple[Tuple[int, int], Tuple[int, int], np.ndarray]:
-        """키포인트가 모두 들어오도록 캔버스 크기와 오프셋 계산 (머리 패딩 포함)"""
-        base_h, base_w = base_size
-        
-        # 바운딩 박스 계산
-        min_x, min_y, max_x, max_y = self._get_keypoint_bbox(
-            keypoints, scores, self.config.kpt_threshold
-        )
-        
-        # [NEW] 머리 방향 추가 패딩
-        head_pad_l, head_pad_t, head_pad_r, head_pad_b = self._calculate_head_padding(
-            keypoints, scores
-        )
-        
-        # 기본 패딩 + 머리 패딩 적용
-        bbox_left = min_x - padding - head_pad_l
-        bbox_top = min_y - padding - head_pad_t
-        bbox_right = max_x + padding + head_pad_r
-        bbox_bottom = max_y + padding + head_pad_b
-        
-        # 필요한 확장 계산
-        expand_left = max(0, -bbox_left)
-        expand_top = max(0, -bbox_top)
-        expand_right = max(0, bbox_right - base_w)
-        expand_bottom = max(0, bbox_bottom - base_h)
-        
-        # 캔버스 크기 (확장 포함)
-        canvas_w = int(base_w + expand_left + expand_right)
-        canvas_h = int(base_h + expand_top + expand_bottom)
-        
-        # 오프셋 (원본 좌표 -> 캔버스 좌표)
-        offset_x = expand_left
-        offset_y = expand_top
-        
-        # 키포인트 좌표 조정
-        adjusted_kpts = keypoints.copy()
-        adjusted_kpts[:, 0] += offset_x
-        adjusted_kpts[:, 1] += offset_y
-        
-        print(f"   📐 [Canvas] base={base_w}x{base_h} -> canvas={canvas_w}x{canvas_h}")
-        print(f"       expand: L={expand_left:.0f}, T={expand_top:.0f}, R={expand_right:.0f}, B={expand_bottom:.0f}")
-        print(f"       offset: ({offset_x:.0f}, {offset_y:.0f})")
-        
-        return (canvas_h, canvas_w), (int(offset_x), int(offset_y)), adjusted_kpts
-    
-    # ============================================================
-    # 키포인트 기반 최종 크롭 (머리 패딩 포함)
-    # ============================================================
-    def _crop_to_keypoints(
-        self,
-        image: np.ndarray,
-        keypoints: np.ndarray,
-        scores: np.ndarray,
-        padding: int
-    ) -> Tuple[np.ndarray, np.ndarray]:
-        """키포인트 바운딩 박스 + 패딩 + 머리 패딩으로 이미지 크롭"""
-        h, w = image.shape[:2]
-        
-        # 바운딩 박스 계산
-        min_x, min_y, max_x, max_y = self._get_keypoint_bbox(
-            keypoints, scores, self.config.kpt_threshold
-        )
-        
-        # 머리 방향 추가 패딩
-        head_pad_l, head_pad_t, head_pad_r, head_pad_b = self._calculate_head_padding(
-            keypoints, scores
-        )
-        
-        # 패딩 적용 + 경계 클리핑
-        crop_x1 = max(0, int(min_x - padding - head_pad_l))
-        crop_y1 = max(0, int(min_y - padding - head_pad_t))
-        crop_x2 = min(w, int(max_x + padding + head_pad_r))
-        crop_y2 = min(h, int(max_y + padding + head_pad_b))
-        
-        # 크롭
-        cropped = image[crop_y1:crop_y2, crop_x1:crop_x2]
-        
-        # 키포인트 좌표 조정
-        cropped_kpts = keypoints.copy()
-        cropped_kpts[:, 0] -= crop_x1
-        cropped_kpts[:, 1] -= crop_y1
-        
-        print(f"   ✂️ [Crop] ({crop_x1}, {crop_y1}) ~ ({crop_x2}, {crop_y2}) -> {crop_x2-crop_x1}x{crop_y2-crop_y1}")
-        
-        return cropped, cropped_kpts
-    
-    # ============================================================
-    # Ghost Legs 클리핑 함수들
-    # ============================================================
-    def _clip_ghost_legs(
-        self, 
-        keypoints: np.ndarray, 
-        scores: np.ndarray, 
-        image_height: int,
-        image_width: int
-    ) -> Tuple[np.ndarray, np.ndarray, int]:
-        """프레임 경계 밖 또는 저신뢰도 하반신 키포인트 제거"""
-        if not self.config.ghost_legs_clipping_enabled:
-            return keypoints, scores, 0
-        
-        boundary_y = image_height * (1 - self.config.lower_body_margin_ratio)
-        conf_threshold = self.config.lower_body_confidence_threshold
-        
-        invalid_indices = self._get_invalid_lower_body_indices(
-            keypoints, scores, boundary_y, conf_threshold
-        )
-        
-        clipped_count = 0
-        for idx in invalid_indices:
-            if scores[idx] > 0:
-                scores[idx] = 0.0
-                clipped_count += 1
-        
-        if clipped_count > 0:
-            print(f"   🔧 [Ghost Legs] Clipped {clipped_count} keypoints")
-        
-        return keypoints, scores, clipped_count
-    
-    def _get_invalid_lower_body_indices(
-        self,
-        keypoints: np.ndarray,
-        scores: np.ndarray,
-        boundary_y: float,
-        conf_threshold: float
-    ) -> Set[int]:
-        """무효화할 하반신 키포인트 인덱스 집합 반환"""
-        invalid = set()
-        
-        lower_body_parts = [
-            ('left_hip', BODY_KEYPOINTS.get('left_hip', 11)),
-            ('right_hip', BODY_KEYPOINTS.get('right_hip', 12)),
-            ('left_knee', BODY_KEYPOINTS.get('left_knee', 13)),
-            ('right_knee', BODY_KEYPOINTS.get('right_knee', 14)),
-            ('left_ankle', BODY_KEYPOINTS.get('left_ankle', 15)),
-            ('right_ankle', BODY_KEYPOINTS.get('right_ankle', 16)),
-        ]
-        
-        feet_parts = []
-        if FEET_KEYPOINTS:
-            feet_parts = [
-                ('left_big_toe', FEET_KEYPOINTS.get('left_big_toe', 17)),
-                ('left_small_toe', FEET_KEYPOINTS.get('left_small_toe', 18)),
-                ('left_heel', FEET_KEYPOINTS.get('left_heel', 19)),
-                ('right_big_toe', FEET_KEYPOINTS.get('right_big_toe', 20)),
-                ('right_small_toe', FEET_KEYPOINTS.get('right_small_toe', 21)),
-                ('right_heel', FEET_KEYPOINTS.get('right_heel', 22)),
-            ]
-        
-        for part_name, idx in lower_body_parts + feet_parts:
-            if idx >= len(keypoints):
-                continue
-                
-            y = keypoints[idx][1]
-            conf = scores[idx]
+        if self.config.yolo_verification_enabled:
+            self._init_yolo_models()
+
+    def _init_yolo_models(self):
+        try:
+            from ultralytics import YOLO
+            base_dir = Path(__file__).parent.parent
+            models_dir = base_dir / "models"
+            person_local = models_dir / "yolo11n.pt"
+            face_local = models_dir / "yolo11n-face.pt"
             
-            over_boundary = y >= boundary_y
-            low_confidence = conf < conf_threshold and conf > 0
+            if person_local.exists(): self._yolo_person = YOLO(str(person_local))
+            else: self._yolo_person = YOLO('yolo11n.pt')
             
-            if over_boundary or low_confidence:
-                invalid.add(idx)
-                self._invalidate_children(part_name, invalid)
-        
-        return invalid
-    
-    def _invalidate_children(self, parent_name: str, invalid: Set[int]):
-        """부모가 무효화되면 자식도 재귀적으로 무효화"""
-        if parent_name not in LOWER_BODY_HIERARCHY:
-            return
-        
-        for child_name in LOWER_BODY_HIERARCHY[parent_name]:
-            if child_name in BODY_KEYPOINTS:
-                child_idx = BODY_KEYPOINTS[child_name]
-            elif FEET_KEYPOINTS and child_name in FEET_KEYPOINTS:
-                child_idx = FEET_KEYPOINTS[child_name]
+            if face_local.exists(): self._yolo_face = YOLO(str(face_local))
             else:
-                continue
-            
-            invalid.add(child_idx)
-            self._invalidate_children(child_name, invalid)
-    
-    # ============================================================
-    # 포즈 추출 (Ghost Legs 클리핑 포함)
-    # ============================================================
-    def extract_pose(
-        self,
-        image: Union[np.ndarray, str, Path],
-        filter_person: bool = True
-    ) -> Tuple[np.ndarray, np.ndarray, int, Tuple[int, int]]:
-        """포즈 추출 + Ghost Legs 클리핑"""
-        if isinstance(image, (str, Path)):
-            img = load_image(image)
-        else:
-            img = image
+                from huggingface_hub import hf_hub_download
+                path = hf_hub_download(repo_id="AdamCodd/YOLOv11n-face-detection", filename="model.pt")
+                self._yolo_face = YOLO(path)
+        except Exception as e:
+            print(f"   ⚠️ YOLO Init Failed: {e}")
+            self._yolo_person = None; self._yolo_face = None
+
+    def extract_pose(self, image: Union[np.ndarray, str, Path], filter_person: bool = True) -> Tuple[np.ndarray, np.ndarray, int, Tuple[int,int]]:
+        if isinstance(image, (str, Path)): img = load_image(image)
+        else: img = image
         
         image_size = img.shape[:2]
-        img_h, img_w = image_size
+        all_kpts, all_scores = self.extractor.extract(img)
         
-        all_keypoints, all_scores = self.extractor.extract(img)
-        
-        if len(all_keypoints) == 0:
+        if len(all_kpts) == 0:
             return np.zeros((133, 2)), np.zeros(133), -1, image_size
         
-        if filter_person and self.config.filter_enabled and len(all_keypoints) > 1:
-            keypoints, scores, selected_idx, best = self.person_filter.select_main_person(
-                all_keypoints, all_scores, image_size
+        if filter_person and self.config.filter_enabled and len(all_kpts) > 1:
+            kpts, scores, idx, _ = self.person_filter.select_main_person(
+                all_kpts, all_scores, image_size
             )
         else:
-            keypoints = all_keypoints[0]
-            scores = all_scores[0]
-            selected_idx = 0
+            kpts, scores, idx = all_kpts[0], all_scores[0], 0
         
         if self.config.hand_refinement_enabled:
-            keypoints, scores, _ = self.hand_refiner.refine_both_hands(
-                img, keypoints, scores, self.extractor
+            kpts, scores, _ = self.hand_refiner.refine_both_hands(
+                img, kpts, scores, self.extractor
             )
         
-        keypoints, scores, clipped = self._clip_ghost_legs(
-            keypoints, scores, img_h, img_w
-        )
+        return kpts, scores, idx, image_size
+
+    def _draw_bbox_debug_layers(self, image: np.ndarray, data: DebugBboxData) -> np.ndarray:
+        if not (self.config.viz_kpt_bbox or self.config.viz_yolo_bbox or self.config.viz_hybrid_bbox):
+            return image
+        debug_img = image.copy()
+        thick = max(1, self.config.line_thickness // 2)
         
-        return keypoints, scores, selected_idx, image_size
+        if self.config.viz_kpt_bbox:
+            if data.kpt_person: self._draw_box(debug_img, data.kpt_person, COLOR_KPT_BBOX, "KPT-P", thick)
+            if data.kpt_face: self._draw_box(debug_img, data.kpt_face, COLOR_KPT_BBOX, "KPT-F", thick)
+        if self.config.viz_yolo_bbox:
+            if data.yolo_person: self._draw_box(debug_img, data.yolo_person, COLOR_YOLO_BBOX, "YOLO-P", thick)
+            if data.yolo_face: self._draw_box(debug_img, data.yolo_face, COLOR_YOLO_BBOX, "YOLO-F", thick)
+        if self.config.viz_hybrid_bbox:
+            if data.hybrid_person: self._draw_box(debug_img, data.hybrid_person, COLOR_HYBRID_PERSON, "Final-P", thick+1)
+            if data.hybrid_face: self._draw_box(debug_img, data.hybrid_face, COLOR_HYBRID_FACE, "Final-F", thick+1)
+        return debug_img
+
+    def _draw_box(self, img, info: BboxInfo, color, label, thick):
+        x1, y1, x2, y2 = info.bbox
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
+        cv2.putText(img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    def _determine_body_type(self, kpts, scores):
+        valid = sum(1 for idx in LOWER_BODY_INDICES if idx < len(scores) and scores[idx] > self.config.kpt_threshold)
+        return BodyType.FULL if valid >= self.config.full_body_min_valid_lower else BodyType.UPPER
     
+    def _determine_case(self, src, ref):
+        if src == BodyType.FULL and ref == BodyType.FULL: return AlignmentCase.A
+        elif src == BodyType.UPPER and ref == BodyType.UPPER: return AlignmentCase.B
+        elif src == BodyType.FULL and ref == BodyType.UPPER: return AlignmentCase.C
+        else: return AlignmentCase.D
+
     # ============================================================
-    # 전이 (Transfer) - 자동 패딩/크롭 포함
+    # [FIX] Person Bbox Calculation (Margin applied from config)
     # ============================================================
-    def transfer(
-        self,
-        source_image: Union[np.ndarray, str, Path],
-        reference_image: Union[np.ndarray, str, Path],
-        output_image_size: Optional[Tuple[int, int]] = None
-    ) -> PipelineResult:
-        """Source와 Reference 이미지 간 포즈 전이"""
+    def _keypoints_to_person_bbox(self, kpts, scores, size):
+        margin = self.config.person_bbox_margin # YAML 설정값 사용
+        h, w = size
+        valid = kpts[scores > self.config.kpt_threshold]
+        if len(valid) == 0: return BboxInfo((0,0,w,h), (w/2,h/2), max(w,h), "fallback")
+        mn, mx = valid.min(0), valid.max(0)
+        wd, ht = mx - mn
+        mx_pad, my_pad = wd*margin, ht*margin
+        x1, y1 = max(0, int(mn[0]-mx_pad)), max(0, int(mn[1]-my_pad))
+        x2, y2 = min(w, int(mx[0]+mx_pad)), min(h, int(mx[1]+my_pad))
+        return BboxInfo((x1,y1,x2,y2), ((x1+x2)/2, (y1+y2)/2), max(x2-x1, y2-y1), "keypoint")
+
+    # ============================================================
+    # [FIX] Face Bbox Calculation (Margin applied from config + Jawline included)
+    # ============================================================
+# [FIX] Face Bbox Calculation (Include Eyebrows)
+    def _keypoints_to_face_bbox(self, kpts, scores):
+        margin = self.config.face_bbox_margin
         
-        # 이미지 로드
-        if isinstance(source_image, (str, Path)):
-            source_img = load_image(source_image)
-        else:
-            source_img = source_image
+        # 1. Body face (nose, eyes, ears) - 기존
+        body_face_idx = [BODY_KEYPOINTS.get(n, i) for i, n in enumerate(['nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear'])]
         
-        src_h, src_w = source_img.shape[:2]
+        # 2. Detail face landmarks (Jawline + Eyebrows) - 수정됨
+        # Face 0~16: Jawline (턱선) -> 전체 인덱스 23~39
+        # Face 17~21: Left Eyebrow (왼쪽 눈썹) -> 전체 인덱스 40~44
+        # Face 22~26: Right Eyebrow (오른쪽 눈썹) -> 전체 인덱스 45~49
         
-        if isinstance(reference_image, (str, Path)):
-            ref_img = load_image(reference_image)
-        else:
-            ref_img = reference_image
+        # COCO-WholeBody 전체 인덱스 기준 (Face Start = 23)
+        jaw_idx = list(range(23, 40))       # 턱선
+        l_brow_idx = list(range(40, 45))    # 왼쪽 눈썹 (추가됨)
+        r_brow_idx = list(range(45, 50))    # 오른쪽 눈썹 (추가됨)
         
-        ref_h, ref_w = ref_img.shape[:2]
+        target_indices = body_face_idx + jaw_idx + l_brow_idx + r_brow_idx
         
-        # 포즈 추출
-        source_kpts, source_scores, source_idx, source_size = self.extract_pose(source_img)
+        valid = [kpts[i] for i in target_indices if i < len(scores) and scores[i] > self.config.kpt_threshold]
+        
+        if len(valid) < 2: return BboxInfo((0,0,100,100), (50,50), 100, "fallback")
+        
+        v = np.array(valid)
+        mn, mx = v.min(0), v.max(0)
+        
+        width = mx[0] - mn[0]
+        height = mx[1] - mn[1]
+        size = max(width, height)
+        
+        mx_pad = width * margin
+        my_pad = height * margin
+        
+        x1 = int(mn[0] - mx_pad)
+        y1 = int(mn[1] - my_pad)
+        x2 = int(mx[0] + mx_pad)
+        y2 = int(mx[1] + my_pad)
+        
+        return BboxInfo((x1, y1, x2, y2), 
+                        ((x1+x2)/2, (y1+y2)/2), size, "keypoint")
+
+    def _run_yolo_and_merge(self, image: np.ndarray, kpt_person: BboxInfo, kpt_face: BboxInfo) -> Tuple[DebugBboxData, Dict]:
+        debug_data = DebugBboxData(kpt_person=kpt_person, kpt_face=kpt_face)
+        yolo_log = {"person": False, "face": False}
+        
+        if self._yolo_person is None:
+            debug_data.hybrid_person = kpt_person
+            debug_data.hybrid_face = kpt_face
+            return debug_data, yolo_log
+
+        try:
+            # Person
+            res = self._yolo_person.predict(image, conf=self.config.yolo_person_conf, verbose=False)[0].boxes
+            mask = (res.cls == 0)
+            hybrid_person = kpt_person
+            
+            if mask.sum() > 0:
+                yolo_log["person"] = True
+                boxes = res.xyxy[mask].cpu().numpy()
+                areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+                yb = boxes[np.argmax(areas)].astype(int)
+                yolo_info = BboxInfo((yb[0], yb[1], yb[2], yb[3]), 
+                                     ((yb[0]+yb[2])/2, (yb[1]+yb[3])/2), 
+                                     max(yb[2]-yb[0], yb[3]-yb[1]), "yolo")
+                debug_data.yolo_person = yolo_info
+                
+                iou = self._calc_iou(kpt_person.bbox, yb)
+                if iou > 0.5: hybrid_person = yolo_info
+                else: hybrid_person = kpt_person
+            debug_data.hybrid_person = hybrid_person
+
+            # Face
+            px1, py1, px2, py2 = hybrid_person.bbox
+            crop = image[py1:py2, px1:px2]
+            hybrid_face = kpt_face
+            
+            if crop.size > 0:
+                f_res = self._yolo_face.predict(crop, conf=self.config.yolo_face_conf, verbose=False)[0].boxes
+                if len(f_res) > 0:
+                    yolo_log["face"] = True
+                    fb = f_res[0].xyxy[0].cpu().numpy().astype(int)
+                    fx1, fy1, fx2, fy2 = fb[0]+px1, fb[1]+py1, fb[2]+px1, fb[3]+py1
+                    yolo_info = BboxInfo((fx1, fy1, fx2, fy2), 
+                                         ((fx1+fx2)/2, (fy1+fy2)/2), 
+                                         max(fx2-fx1, fy2-fy1), "yolo")
+                    debug_data.yolo_face = yolo_info
+                    hybrid_face = yolo_info
+            debug_data.hybrid_face = hybrid_face
+
+        except Exception as e:
+            print(f"   ⚠️ YOLO Error: {e}")
+            debug_data.hybrid_person = kpt_person
+            debug_data.hybrid_face = kpt_face
+            
+        return debug_data, yolo_log
+
+    def _calc_iou(self, b1, b2):
+        x1, y1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+        x2, y2 = min(b1[2], b2[2]), min(b1[3], b2[3])
+        inter = max(0, x2-x1) * max(0, y2-y1)
+        a1 = (b1[2]-b1[0])*(b1[3]-b1[1]); a2 = (b2[2]-b2[0])*(b2[3]-b2[1])
+        return inter / (a1+a2-inter) if (a1+a2-inter) > 0 else 0
+
+    def transfer(self, source_image, reference_image, output_image_size=None):
+        if isinstance(source_image, (str, Path)): src_img = load_image(source_image)
+        else: src_img = source_image
+        if isinstance(reference_image, (str, Path)): ref_img = load_image(reference_image)
+        else: ref_img = reference_image
+        
+        src_h, src_w = src_img.shape[:2]; ref_h, ref_w = ref_img.shape[:2]
+        
+        print("\n[STEP 1] Extracting poses...")
+        src_kpts, src_scores, src_idx, src_size = self.extract_pose(src_img)
         ref_kpts, ref_scores, ref_idx, ref_size = self.extract_pose(ref_img)
         
-        # 전이 실행
-        transfer_result = self.transfer_engine.transfer(
-            source_kpts, source_scores,
-            ref_kpts, ref_scores,
-            source_image_size=(src_h, src_w),
-            reference_image_size=(ref_h, ref_w)
-        )
+        src_type = self._determine_body_type(src_kpts, src_scores)
+        ref_type = self._determine_body_type(ref_kpts, ref_scores)
+        case = self._determine_case(src_type, ref_type)
+        print(f"   Case {case.value} ({src_type.value} -> {ref_type.value})")
         
-        transferred_kpts = transfer_result.keypoints
-        transferred_scores = transfer_result.scores
+        print("\n[STEP 3] Bbox Calculation...")
+        src_kpt_p = self._keypoints_to_person_bbox(src_kpts, src_scores, src_size)
+        src_kpt_f = self._keypoints_to_face_bbox(src_kpts, src_scores)
+        ref_kpt_p = self._keypoints_to_person_bbox(ref_kpts, ref_scores, ref_size)
+        ref_kpt_f = self._keypoints_to_face_bbox(ref_kpts, ref_scores)
         
-        # 자동 패딩/크롭 적용
-        if self.config.auto_crop_enabled:
-            skeleton_image, final_kpts, final_size = self._render_with_auto_crop(
-                transferred_kpts, transferred_scores,
-                source_size, self.config.crop_padding_px
-            )
+        if self.config.yolo_verification_enabled:
+            src_debug_data, src_yolo_log = self._run_yolo_and_merge(src_img, src_kpt_p, src_kpt_f)
+            ref_debug_data, ref_yolo_log = self._run_yolo_and_merge(ref_img, ref_kpt_p, ref_kpt_f)
         else:
-            output_size = output_image_size or source_size
-            skeleton_image = self.renderer.render_skeleton_only(
-                (output_size[0], output_size[1], 3),
-                transferred_kpts, transferred_scores
-            )
-            final_kpts = transferred_kpts
-            final_size = output_size
+            src_debug_data = DebugBboxData(kpt_person=src_kpt_p, kpt_face=src_kpt_f, hybrid_person=src_kpt_p, hybrid_face=src_kpt_f)
+            ref_debug_data = DebugBboxData(kpt_person=ref_kpt_p, kpt_face=ref_kpt_f, hybrid_person=ref_kpt_p, hybrid_face=ref_kpt_f)
+            src_yolo_log = {"person": False, "face": False}
+
+        src_person_final = src_debug_data.hybrid_person
+        src_face_final = src_debug_data.hybrid_face
+        ref_face_final = ref_debug_data.hybrid_face
+        
+        src_debug_img = None; ref_debug_img = None
+        if self.config.debug_bbox_visualization:
+            src_ov = self.renderer.render(src_img, src_kpts, src_scores)
+            src_debug_img = self._draw_bbox_debug_layers(src_ov, src_debug_data)
+            ref_ov = self.renderer.render(ref_img, ref_kpts, ref_scores)
+            ref_debug_img = self._draw_bbox_debug_layers(ref_ov, ref_debug_data)
+
+        result = self.transfer_engine.transfer(
+            src_kpts, src_scores, ref_kpts, ref_scores,
+            source_image_size=(src_h, src_w), reference_image_size=(ref_h, ref_w)
+        )
+        trans_kpts, trans_scores = result.keypoints, result.scores
+        trans_kpts, trans_scores = self._postprocess_for_case(trans_kpts, trans_scores, case, src_scores)
+        
+        render_h, render_w = max(src_h, ref_h)*2, max(src_w, ref_w)*2
+        offset_x, offset_y = render_w//4, render_h//4
+        r_kpts = trans_kpts.copy(); r_kpts[:,0]+=offset_x; r_kpts[:,1]+=offset_y
+        skel = self.renderer.render_skeleton_only((render_h, render_w, 3), r_kpts, trans_scores)
+        skel_crop, _ = self._crop_skeleton_tight(skel)
+        
+        scale = 1.0
+        if self.config.face_scale_enabled:
+            scale_img, scale = self._scale_skeleton(skel_crop, src_face_final.size, ref_face_final.size)
+        else:
+            scale_img = skel_crop
+        scaled_kpts = trans_kpts.copy() * scale
+        
+        aligned, aligned_kpts = self._align_skeleton(
+            scale_img, (src_h, src_w), src_person_final, src_face_final, case, scaled_kpts, trans_scores
+        )
+        padded, padded_kpts = self._add_head_padding(aligned, aligned_kpts, trans_scores)
+        final, final_kpts, final_size = self._final_crop(padded, padded_kpts, self.config.crop_padding_px)
+        
+        align_info = AlignmentInfo(
+            case=case, src_body_type=src_type, ref_body_type=ref_type,
+            src_person_bbox=src_person_final, src_face_bbox=src_face_final, ref_face_bbox=ref_face_final,
+            face_scale_ratio=scale, alignment_method="feet" if case==AlignmentCase.A else "face",
+            yolo_log=src_yolo_log
+        )
         
         return PipelineResult(
-            transferred_keypoints=final_kpts,
-            transferred_scores=transferred_scores,
-            source_keypoints=source_kpts,
-            source_scores=source_scores,
-            source_bone_lengths=transfer_result.source_bone_lengths,
-            reference_keypoints=ref_kpts,
-            reference_scores=ref_scores,
-            skeleton_image=skeleton_image,
-            image_size=final_size,
-            selected_person_idx={'source': source_idx, 'reference': ref_idx},
-            processing_info={'transfer_log': transfer_result.transfer_log}
+            transferred_keypoints=final_kpts, transferred_scores=trans_scores,
+            source_keypoints=src_kpts, source_scores=src_scores,
+            source_bone_lengths=result.source_bone_lengths,
+            reference_keypoints=ref_kpts, reference_scores=ref_scores,
+            skeleton_image=final, image_size=final_size,
+            selected_person_idx={'source': src_idx, 'reference': ref_idx},
+            processing_info={'transfer_log': result.transfer_log},
+            alignment_info=align_info,
+            src_debug_image=src_debug_img, ref_debug_image=ref_debug_img
         )
+
+    def _crop_skeleton_tight(self, img: np.ndarray) -> Tuple[np.ndarray, Tuple[int,int,int,int]]:
+        mask = np.any(img != 0, axis=2)
+        if not np.any(mask): return img, (0, 0, img.shape[1], img.shape[0])
+        rows, cols = np.any(mask, axis=1), np.any(mask, axis=0)
+        y1, y2 = np.where(rows)[0][[0, -1]]
+        x1, x2 = np.where(cols)[0][[0, -1]]
+        return img[y1:y2+1, x1:x2+1], (x1, y1, x2+1, y2+1)
     
-    # ============================================================
-    # 자동 패딩/크롭으로 렌더링
-    # ============================================================
-    def _render_with_auto_crop(
-        self,
-        keypoints: np.ndarray,
-        scores: np.ndarray,
-        base_size: Tuple[int, int],
-        padding: int
-    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
-        """키포인트가 모두 포함되도록 자동으로 캔버스 확장 후 크롭"""
-        
-        # 1. 캔버스 크기 및 오프셋 계산 (머리 패딩 포함)
-        canvas_size, offset, adjusted_kpts = self._calculate_canvas_and_offset(
-            keypoints, scores, base_size, padding
-        )
-        
-        # 2. 확장된 캔버스에 렌더링
-        canvas_h, canvas_w = canvas_size
-        skeleton_image = self.renderer.render_skeleton_only(
-            (canvas_h, canvas_w, 3),
-            adjusted_kpts, scores
-        )
-        
-        # 3. 키포인트 바운딩 박스 + 패딩으로 크롭 (머리 패딩 포함)
-        cropped_image, cropped_kpts = self._crop_to_keypoints(
-            skeleton_image, adjusted_kpts, scores, padding
-        )
-        
-        final_size = cropped_image.shape[:2]
-        
-        return cropped_image, cropped_kpts, final_size
-    
-    # ============================================================
-    # 추출 + 렌더링 (단일 이미지용)
-    # ============================================================
-    def extract_and_render(
-        self,
-        image: Union[np.ndarray, str, Path]
-    ) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray]:
-        """단일 이미지 추출 및 렌더링"""
-        if isinstance(image, (str, Path)):
-            img = load_image(image)
+    def _scale_skeleton(self, img: np.ndarray, src_size: float, ref_size: float) -> Tuple[np.ndarray, float]:
+        if ref_size < 1: return img, 1.0
+        ratio = np.clip(src_size / ref_size, 0.3, 3.0)
+        if abs(ratio - 1.0) < 0.05: return img, 1.0
+        new_h, new_w = int(img.shape[0] * ratio), int(img.shape[1] * ratio)
+        scaled = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+        return scaled, ratio
+
+    def _align_skeleton(self, skeleton, src_size, src_person, src_face, case, trans_kpts, trans_scores):
+        src_h, src_w = src_size
+        sk_h, sk_w = skeleton.shape[:2]
+        if case == AlignmentCase.A:
+            x1, y1, x2, y2 = src_person.bbox
+            padding_h, padding_w = max(src_h, sk_h + (src_h - y2)), max(src_w, sk_w + x1)
+            canvas = np.zeros((padding_h, padding_w, 3), dtype=np.uint8)
+            pose_x1, pose_y2 = x1, padding_h - (src_h - y2)
+            pose_y1 = max(0, pose_y2 - sk_h)
+            sk_y_start = max(0, sk_h - (pose_y2 - pose_y1))
+            canvas[pose_y1:pose_y2, pose_x1:pose_x1+sk_w] = skeleton[sk_y_start:, :min(sk_w, padding_w-pose_x1)]
+            adj_kpts = trans_kpts.copy()
+            adj_kpts[:, 0] += pose_x1; adj_kpts[:, 1] += pose_y1 - sk_y_start
+            return canvas, adj_kpts
         else:
-            img = image
-        
+            trans_face = self._keypoints_to_face_bbox(trans_kpts, trans_scores)
+            offset_x, offset_y = src_face.center[0] - trans_face.center[0], src_face.center[1] - trans_face.center[1]
+            new_x1, new_y1, new_x2, new_y2 = offset_x, offset_y, offset_x + sk_w, offset_y + sk_h
+            exp_l, exp_t = max(0, -new_x1), max(0, -new_y1)
+            exp_r, exp_b = max(0, new_x2 - src_w), max(0, new_y2 - src_h)
+            padding_w, padding_h = int(src_w + exp_l + exp_r), int(src_h + exp_t + exp_b)
+            canvas = np.zeros((padding_h, padding_w, 3), dtype=np.uint8)
+            pose_x1, pose_y1 = int(new_x1 + exp_l), int(new_y1 + exp_t)
+            canvas[pose_y1:pose_y1+sk_h, pose_x1:pose_x1+sk_w] = skeleton
+            adj_kpts = trans_kpts.copy()
+            adj_kpts[:, 0] += (offset_x + exp_l); adj_kpts[:, 1] += (offset_y + exp_t)
+            return canvas, adj_kpts
+
+    def _add_head_padding(self, img, kpts, scores):
+        pad = self._calc_head_padding(kpts, scores)
+        pl, pt, pr, pb = [int(p) for p in pad]
+        if pl == 0 and pt == 0 and pr == 0 and pb == 0: return img, kpts
+        h, w = img.shape[:2]
+        padded = np.zeros((h + pt + pb, w + pl + pr, 3), dtype=np.uint8)
+        padded[pt:pt+h, pl:pl+w] = img
+        adj = kpts.copy(); adj[:, 0] += pl; adj[:, 1] += pt
+        return padded, adj
+
+    def _calc_head_padding(self, kpts, scores):
+        nose_idx = BODY_KEYPOINTS.get('nose', 0)
+        l_sh, r_sh = BODY_KEYPOINTS.get('left_shoulder', 5), BODY_KEYPOINTS.get('right_shoulder', 6)
+        l_eye, r_eye = BODY_KEYPOINTS.get('left_eye', 1), BODY_KEYPOINTS.get('right_eye', 2)
+        if scores[nose_idx] <= 0.1 or not (scores[l_sh] > 0.1 or scores[r_sh] > 0.1): return (0, 0, 0, 0)
+        neck = (kpts[l_sh] + kpts[r_sh]) / 2 if scores[l_sh] > 0.1 and scores[r_sh] > 0.1 else (kpts[l_sh] if scores[l_sh] > 0.1 else kpts[r_sh])
+        nose = kpts[nose_idx]; head_vec = nose - neck; length = np.linalg.norm(head_vec)
+        if length < 1: return (0, 0, 0, 0)
+        direction = head_vec / length
+        head_size = np.linalg.norm(kpts[l_eye] - kpts[r_eye]) * 2.5 if scores[l_eye] > 0.1 and scores[r_eye] > 0.1 else length * 1.5
+        extend = head_size * self.config.head_padding_ratio
+        crown = nose + direction * extend
+        offset_x, offset_y = crown[0] - nose[0], crown[1] - nose[1]
+        return (max(0, -offset_x), max(0, -offset_y), max(0, offset_x), max(0, offset_y))
+
+    def _final_crop(self, canvas, kpts, padding):
+        h, w = canvas.shape[:2]
+        valid_mask = np.any(kpts > 0, axis=1)
+        if not np.any(valid_mask): return canvas, kpts, canvas.shape[:2]
+        valid = kpts[valid_mask]
+        x1 = max(0, int(np.min(valid[:, 0])) - padding)
+        y1 = max(0, int(np.min(valid[:, 1])) - padding)
+        x2 = min(w, int(np.max(valid[:, 0])) + padding)
+        y2 = min(h, int(np.max(valid[:, 1])) + padding)
+        cropped = canvas[y1:y2, x1:x2]
+        adj = kpts.copy(); adj[:, 0] -= x1; adj[:, 1] -= y1
+        return cropped, adj, cropped.shape[:2]
+
+    def _postprocess_for_case(self, kpts, scores, case, src_scores):
+        if case == AlignmentCase.D:
+            new_scores = scores.copy()
+            for idx in LOWER_BODY_INDICES:
+                if idx < len(src_scores) and src_scores[idx] < self.config.kpt_threshold:
+                    if idx < len(new_scores): new_scores[idx] = 0.0
+            if FEET_KEYPOINTS:
+                for name, idx in FEET_KEYPOINTS.items():
+                    if idx < len(src_scores) and src_scores[idx] < self.config.kpt_threshold:
+                        if idx < len(new_scores): new_scores[idx] = 0.0
+            return kpts, new_scores
+        return kpts, scores
+
+    def extract_and_render(self, image):
+        if isinstance(image, (str, Path)): img = load_image(image)
+        else: img = image
         image_size = img.shape[:2]
-        
-        keypoints, scores, selected_idx, _ = self.extract_pose(img)
-        
-        json_data = convert_to_openpose_format(
-            keypoints[np.newaxis, ...], scores[np.newaxis, ...], image_size
-        )
-        
-        skeleton_image = self.renderer.render_skeleton_only(
-            (image_size[0], image_size[1], 3), keypoints, scores
-        )
-        
-        overlay_image = self.renderer.render(img, keypoints, scores)
-        
-        return json_data, skeleton_image, overlay_image
+        kpts, scores, _, _ = self.extract_pose(img)
+        json_data = convert_to_openpose_format(kpts[np.newaxis, ...], scores[np.newaxis, ...], image_size)
+        skel_img = self.renderer.render_skeleton_only((image_size[0], image_size[1], 3), kpts, scores)
+        overlay_img = self.renderer.render(img, kpts, scores)
+        return json_data, skel_img, overlay_img
