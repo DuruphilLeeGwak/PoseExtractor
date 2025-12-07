@@ -170,14 +170,26 @@ class AlignManager:
         return BodyType.FULL
 
     def calc_scale(self, src_face_size, ref_face_size):
+        """
+        얼굴 크기 기반 스케일 팩터 계산
+        H_H, H_F 등에서 Src 얼굴 크기에 1:1로 맞추기 위함
+        """
         if not self.config.face_scale_enabled or ref_face_size < 1:
             return 1.0
-        scale = np.clip(src_face_size / ref_face_size, 0.3, 3.0)
-        return 1.0 if abs(scale - 1.0) < 0.05 else scale
+            
+        # 스케일 계산
+        scale = src_face_size / ref_face_size
+        
+        # [수정] 스케일 클리핑 범위 완화 (0.2 ~ 5.0)
+        # H_H에서 얼굴이 너무 작아지는 것 방지, 또는 너무 커져서 캔버스 확장 유도
+        scale = np.clip(scale, 0.2, 5.0)
+        
+        return scale
 
     def align_coordinates(self, kpts, scores, case, src_person_bbox, src_face_bbox, face_bbox_func):
         """
-        좌표(kpts) 자체를 이동(Shift)시켜 정렬
+        좌표(kpts) 이동(Shift)을 통한 정렬
+        전제: kpts는 이미 calc_scale()을 통해 Src와 크기(비율)가 맞춰진 상태임
         """
         print("\n" + "="*60)
         print(f"🔍 [DEBUG] AlignManager.align_coordinates(Case {case.value})")
@@ -185,9 +197,9 @@ class AlignManager:
         
         aligned_kpts = kpts.copy()
         
-        # F_F (전신→전신): 발 기준 정렬
+        # Case F_F (전신 -> 전신): 기존대로 발(Bottom) 기준 정렬
         if case == AlignmentCase.F_F:
-            print("\n🦶 Case F_F: Bottom-based alignment (전신→전신)")
+            print("\n🦶 Case F_F: Bottom-based alignment")
             
             src_bottom = src_person_bbox.bbox[3]
             print(f"   src_person_bbox: {src_person_bbox.bbox}")
@@ -204,7 +216,6 @@ class AlignManager:
                     score = scores[i] if i < len(scores) else 0
                     print(f"      idx={i}: score={score:.3f} ❌")
             
-            print(f"\n   valid_y list: {valid_y}")
             trans_bottom = max(valid_y) if valid_y else 0
             print(f"   trans_bottom (max): {trans_bottom}")
             
@@ -215,23 +226,33 @@ class AlignManager:
             else:
                 print(f"   ❌ trans_bottom = 0, NO SHIFT")
         
-        # 그 외 (상반신 포함): 얼굴 기준 정렬
+        # Case H_F, H_H, F_H: 얼굴 중심 기준 강력 정렬
         else:
-            print(f"\n👤 Case {case.value}: Face-based alignment")
+            print(f"\n👤 Case {case.value}: Face Center Alignment (Src 기준)")
             
+            # 1. Src 이미지의 얼굴 중심
             src_cx, src_cy = src_face_bbox.center
-            print(f"   src_face_center: ({src_cx:.1f}, {src_cy:.1f})")
             
+            # 2. 현재 전이된 키포인트(Trans)의 얼굴 중심 계산
+            # (이미 스케일링이 적용된 상태의 좌표에서 계산)
             trans_face_info = face_bbox_func(kpts, scores)
             trans_cx, trans_cy = trans_face_info.center
-            print(f"   trans_face_center: ({trans_cx:.1f}, {trans_cy:.1f})")
             
+            print(f"   Src Face Center: ({src_cx:.1f}, {src_cy:.1f})")
+            print(f"   Trans Face Center: ({trans_cx:.1f}, {trans_cy:.1f})")
+            
+            # 3. 이동량 계산 (Src 중심 - Trans 중심)
             shift_x = src_cx - trans_cx
             shift_y = src_cy - trans_cy
             
+            # 4. 전체 키포인트 이동
             aligned_kpts[:, 0] += shift_x
             aligned_kpts[:, 1] += shift_y
-            print(f"   ✅ shift: ({shift_x:.1f}, {shift_y:.1f})")
+            
+            print(f"   ✅ Shift Applied: x={shift_x:.1f}, y={shift_y:.1f}")
+            
+            # H_F의 경우 다리가 길어져서 화면 아래로 내려갈 수 있음.
+            # 이는 이후 CanvasManager가 처리함.
         
         # 정렬 후 하반신 위치 출력
         print(f"\n📊 After Alignment - Lower Body Status:")

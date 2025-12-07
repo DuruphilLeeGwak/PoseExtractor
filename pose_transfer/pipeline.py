@@ -1,7 +1,7 @@
 """
-포즈 전이 파이프라인 v14
-- 범용 Ghost Filter 적용 (손, 발, 하반신 모두)
-- Case: {SRC}_{REF} 형식 (F=Full, H=Half)
+포즈 전이 파이프라인 v15 (Source Scale Priority)
+- F_F 이외의 케이스(H_F, H_H 등)에서 Source 얼굴 크기를 기준으로 강력하게 스케일링
+- 캔버스 밖으로 나가는 포즈는 CanvasManager를 통해 패딩 처리
 """
 import cv2
 import numpy as np
@@ -245,20 +245,8 @@ class PoseTransferPipeline:
         return kpts, scores, idx, image_size
 
     def _apply_ghost_filter(self, kpts: np.ndarray, scores: np.ndarray, image_size: Tuple[int, int]) -> np.ndarray:
-        """
-        범용 Ghost 필터 적용
-        
-        Args:
-            kpts: 키포인트 좌표
-            scores: 키포인트 점수
-            image_size: (height, width)
-            
-        Returns:
-            필터링된 scores
-        """
         if not self.config.ghost_filter_enabled:
             return scores
-        
         return self.ghost_filter.filter(kpts, scores, image_size)
 
     def transfer(self, source_image, reference_image, output_image_size=None):
@@ -325,32 +313,53 @@ class PoseTransferPipeline:
         )
         trans_kpts, trans_scores = result.keypoints, result.scores
         
-        # 전이 직후 하반신 점수 확인
-        print("\n📊 After Transfer - Lower Body Scores:")
-        for name in lower_names:
-            idx = BODY_KEYPOINTS.get(name, -1)
-            if idx >= 0:
-                score = trans_scores[idx]
-                pos = trans_kpts[idx]
-                status = "✅" if score > 0 else "❌"
-                print(f"   {status} {name:15}: score={score:.3f}, pos=({pos[0]:.1f}, {pos[1]:.1f})")
-        
         print("\n" + "-"*50)
         print("[STEP 5] Post-processing Keys...")
         print("-"*50)
         trans_kpts, trans_scores = self.post_proc.process_by_case(trans_kpts, trans_scores, case, src_scores)
         
         print("\n" + "-"*50)
-        print("[STEP 7] Scaling...")
+        print("[STEP 7] Scaling (Size Matching)...")
         print("-"*50)
-        scale = self.align_mgr.calc_scale(src_face.size, ref_face.size)
-        print(f"   src_face.size: {src_face.size}, ref_face.size: {ref_face.size}")
-        print(f"   Scale Factor: {scale:.3f}")
-        trans_kpts *= scale
         
+        # [수정] F_F가 아닌 경우(H_F, H_H, F_H) Source 얼굴 크기에 강제 동기화
+        scale_factor = 1.0
+        
+        if case != AlignmentCase.F_F:
+            # 1. 현재 전이된 결과물(Engine 출력)의 얼굴 BBox 계산
+            #    (Engine 내부에서 이미 Global Scale이 적용된 상태임)
+            current_trans_face = self.bbox_mgr._kpt_to_face_public(trans_kpts, trans_scores)
+            
+            # 2. 크기 검증 (0으로 나누기 방지)
+            if current_trans_face.size > 1 and src_face.size > 1:
+                # 3. 보정 비율 계산: (목표 Src 크기) / (현재 Trans 크기)
+                #    Src/Ref를 쓰는 게 아니라, 현재 결과물을 Src에 맞춤
+                scale_factor = src_face.size / current_trans_face.size
+                
+                # 안전 장치: 너무 극단적인 스케일링 방지 (0.5배 ~ 2.0배 사이로만 보정)
+                # Engine이 이미 얼추 맞췄을 것이므로 보정치는 1.0 근처여야 함
+                scale_factor = np.clip(scale_factor, 0.5, 2.0)
+                
+                print(f"   Case {case.value}: Adjusting Scale to Match Src Face")
+                print(f"   Src Face Size: {src_face.size:.1f}")
+                print(f"   Cur Trans Face Size: {current_trans_face.size:.1f}")
+                print(f"   >>> Adjustment Scale: {scale_factor:.4f}")
+                
+                # 4. 스케일 적용 (0,0 기준 확대 -> Step 8에서 정렬됨)
+                trans_kpts *= scale_factor
+            else:
+                print("   ⚠️ Face size too small for scaling, skipping.")
+        else:
+            print(f"   Case {case.value}: Using Global Scale (Shoulder/Body based)")
+
+        # AlignInfo에 기록하기 위해 scale 변수 업데이트
+        scale = scale_factor
+
         print("\n" + "-"*50)
-        print("[STEP 8] Aligning...")
+        print("[STEP 8] Aligning (Anchoring)...")
         print("-"*50)
+        
+        # [수정] 정렬 로직 (스케일링 된 좌표를 Source 기준점(발 or 얼굴)으로 이동)
         trans_kpts = self.align_mgr.align_coordinates(
             trans_kpts, trans_scores, case, src_person, src_face,
             lambda k, s: self.bbox_mgr._kpt_to_face_public(k, s) 
@@ -365,6 +374,7 @@ class PoseTransferPipeline:
         print("\n" + "-"*50)
         print("[STEP 10] Canvas Expansion...")
         print("-"*50)
+        # 캔버스 확장: Source 이미지 리사이징 없이, 포즈가 튀어나가면 패딩 추가
         final_src_img, final_kpts, final_size = self.canvas_mgr.expand_canvas_to_fit(
             src_img, trans_kpts, trans_scores, head_pad_px=head_pad
         )
