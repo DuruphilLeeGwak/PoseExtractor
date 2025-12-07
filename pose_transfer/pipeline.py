@@ -275,7 +275,7 @@ class PoseTransferPipeline:
         print("-"*50)
         result = self.transfer_engine.transfer(
             src_kpts, src_scores, ref_kpts, ref_scores,
-            source_image_size=(src_h, src_w), reference_image_size=(ref_h, ref_w)
+            source_image_size=(src_h, src_w), reference_image_size=(ref_h, ref_w), alignment_case=case.value
         )
         trans_kpts, trans_scores = result.keypoints, result.scores
         

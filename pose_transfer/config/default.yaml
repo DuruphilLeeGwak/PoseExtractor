@@ -1,16 +1,14 @@
 # =============================================================================
-# Pose Transfer Configuration v11 (Final Integration)
+# Pose Transfer Configuration v12 (Ghost Leg Prevention Enhanced)
 # =============================================================================
 
 # [0] 입력 모드 설정
 input_mode:
-  type: "internal"  # 'internal' or 'external'
-
+  type: "internal"
   internal:
     root_dir: "inputs"
     src_dir: "src"      
     ref_dir: "ref"      
-
   external:
     source_path: "/var/data/users/user_123.jpg"
     reference_path: "/var/data/poses/pose_dance.jpg"
@@ -36,21 +34,33 @@ hand_refinement:
   min_hand_size: 48
   max_scale_factor: 4.0
 
-# [4] 포즈 전이 & Ghost Legs 설정
+# =============================================================================
+# [4] 포즈 전이 & Ghost Legs 방지 설정
+# =============================================================================
 transfer:
   normalization_base: "shoulder_width"
+  
+  # ---------------------------------------------------------------------------
+  # confidence_threshold: 전이 시 최소 신뢰도
+  # ---------------------------------------------------------------------------
+  # 범위: 0.1 ~ 0.5 | 권장: 0.3
   confidence_threshold: 0.3
   
-  # Ghost Legs 클리핑 (입력 단계 검증용)
   ghost_legs_clipping_enabled: true
   
-  # [중요] 하반신 신뢰도 임계값 (낮춰서 데이터 보존)
+  # ---------------------------------------------------------------------------
+  # lower_body_confidence_threshold: 하반신 전이 결정 임계값
+  # ---------------------------------------------------------------------------
+  # 범위: 0.3 ~ 2.0 | 권장: 0.5
+  # DWPose 정상 점수: 3~8, 추측 점수: 0.5~2.0
   lower_body_confidence_threshold: 0.5
   
-  # [중요] 이미지 바닥 마진 (0.025 = 2.5% 여유)
-  lower_body_margin_ratio: 0.025
+  # ---------------------------------------------------------------------------
+  # lower_body_margin_ratio: 이미지 하단 마진 비율
+  # ---------------------------------------------------------------------------
+  # 범위: 0.01 ~ 0.15 | 권장: 0.05 (5%)
+  lower_body_margin_ratio: 0.05
   
-  # [중요] 화면 밖 허용 범위 (0.5 = 50%까지 벗어나도 데이터 유지 -> 캔버스 확장으로 해결)
   visibility_margin: 0.5
 
 # [5] 폴백 전략
@@ -59,46 +69,84 @@ fallback:
   hierarchical_estimation: true
   fallback_confidence_decay: 0.5
 
-# [6] 렌더링 스타일 (동적 스케일링 적용)
+# [6] 렌더링 스타일
 rendering:
   line_thickness: 4
   face_line_thickness: 4
   hand_line_thickness: 4
   point_radius: 2
   background_color: [0, 0, 0]
-  kpt_threshold: 0.1          # 낮은 점수도 일단 그림
+  kpt_threshold: 0.1
 
 # [7] 출력 설정
 output:
   save_json: true
   save_skeleton_image: true
   save_debug_image: true
-  
-  # 키포인트 기반 자동 캔버스 조정
   auto_crop_enabled: true
-  
-  # [NEW] 캔버스 여백 비율 (10% 여유 -> 발 잘림 방지)
   canvas_padding_ratio: 0.1
-  
-  # 고정 픽셀 패딩
   crop_padding_px: 0
-  
-  # 머리 위 추가 패딩
   head_padding_ratio: 0.5
 
 # [8] 시스템 설정
 system:
-  retain_inputs: true    # 테스트용 (파일 유지)
+  retain_inputs: true
   enable_archiving: false
 
-# [NEW] 디버그 Bbox 시각화
+# [9] 디버그 설정
 debug:
   bbox_visualization: true
   visualize_keypoint_bbox: true
   visualize_yolo_bbox: true
   visualize_hybrid_bbox: true
 
-# [9] 얼굴 부위별 렌더링 제어
+# =============================================================================
+# [10] Body Type 판별 설정 (상반신/전신 구분) - v12 강화
+# =============================================================================
+alignment:
+  # ---------------------------------------------------------------------------
+  # full_body_min_valid_lower: 전신 판별 최소 유효 하반신 키포인트 수
+  # ---------------------------------------------------------------------------
+  # 범위: 2 ~ 6 | 권장: 4
+  # LOWER_INDICES = [11, 12, 13, 14, 15, 16]
+  full_body_min_valid_lower: 4
+  
+  # ---------------------------------------------------------------------------
+  # ghost_score_threshold: Ghost Leg 판별 점수 임계값 (NEW!)
+  # ---------------------------------------------------------------------------
+  # 범위: 1.5 ~ 3.0 | 권장: 2.0
+  #
+  # DWPose 점수 분포:
+  #   - 정상 검출: 3.0 ~ 8.0
+  #   - 추측/Ghost: 0.5 ~ 2.0
+  #
+  # knee/ankle의 max 점수가 이 값 미만이면 상반신으로 판별
+  #
+  # 낮은 값 (1.5):
+  #   - 느슨한 판별, Ghost Leg 허용 가능성
+  # 높은 값 (3.0):
+  #   - 엄격한 판별, 일부 정상 전신도 상반신 판정 가능
+  # ---------------------------------------------------------------------------
+  ghost_score_threshold: 3
+  
+  # ---------------------------------------------------------------------------
+  # 해부학적 순서 검증 (코드에서 자동 적용)
+  # ---------------------------------------------------------------------------
+  # 정상 전신: hip.y < knee.y < ankle.y
+  # 이 순서가 깨지면 상반신으로 판별 (Ghost Leg)
+  # ---------------------------------------------------------------------------
+  
+  yolo_verification_enabled: true
+  yolo_person_conf: 0.5
+  yolo_face_conf: 0.3
+  face_scale_enabled: true
+
+# [11] Bbox 설정
+bbox:
+  person_margin: 0.0
+  face_margin: 0.0
+
+# [12] 얼굴 부위별 렌더링 제어
 face_rendering:
   enabled: true
   parts:
