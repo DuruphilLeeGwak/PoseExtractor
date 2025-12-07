@@ -8,8 +8,9 @@ class PostProcessor:
 
     def process_by_case(self, kpts, scores, case, src_scores):
         new_scores = scores.copy()
-        # Case D: 상반신 -> 전신 (하반신 제거) - 기존 유지
-        if case == AlignmentCase.D:
+        
+        # Case H_F: 상반신 → 전신 (SRC에 없는 하반신 제거)
+        if case == AlignmentCase.H_F:
             for idx in LOWER_INDICES:
                 if idx < len(src_scores) and src_scores[idx] < self.config.kpt_threshold:
                     if idx < len(new_scores): new_scores[idx] = 0.0
@@ -17,6 +18,7 @@ class PostProcessor:
                 for idx in FEET_KEYPOINTS.values():
                     if idx < len(src_scores) and src_scores[idx] < self.config.kpt_threshold:
                         if idx < len(new_scores): new_scores[idx] = 0.0
+        
         return kpts, new_scores
 
     def apply_head_padding(self, kpts, scores):
@@ -42,8 +44,6 @@ class PostProcessor:
         base_pad = self.config.crop_padding_px
         
         # 2. 캔버스 크기 계산 (모든 점을 포함하도록)
-        # 너비 = (최대X - 최소X) + 패딩
-        # 높이 = (최대Y - 최소Y) + 패딩 + 머리패딩
         content_w = max_x - min_x
         content_h = max_y - min_y
         
@@ -51,8 +51,6 @@ class PostProcessor:
         final_h = int(content_h + base_pad * 2 + head_pad)
         
         # 3. 좌표 이동 (Shift)
-        # 모든 점이 (패딩, 패딩+머리패딩) 위치에서 시작하도록 이동
-        # 즉, min_x가 0이 되도록 빼고, 패딩을 더함
         shift_x = -min_x + base_pad
         shift_y = -min_y + base_pad + head_pad
         

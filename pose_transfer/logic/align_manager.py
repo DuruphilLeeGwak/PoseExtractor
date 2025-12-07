@@ -8,13 +8,18 @@ LOWER_INDICES = [11, 12, 13, 14, 15, 16]  # hips, knees, ankles
 
 class BodyType(Enum):
     FULL = "full"
-    UPPER = "upper"
+    HALF = "half"  # 상반신 (UPPER → HALF로 변경)
 
 class AlignmentCase(Enum):
-    A = "A"  # Full -> Full
-    B = "B"  # Upper -> Upper
-    C = "C"  # Full -> Upper
-    D = "D"  # Upper -> Full
+    """
+    정렬 케이스: {SRC}_{REF} 형식
+    F = Full (전신)
+    H = Half (상반신)
+    """
+    F_F = "F_F"  # Full → Full (전신 → 전신)
+    F_H = "F_H"  # Full → Half (전신 → 상반신)
+    H_F = "H_F"  # Half → Full (상반신 → 전신)
+    H_H = "H_H"  # Half → Half (상반신 → 상반신)
 
 class AlignManager:
     def __init__(self, config):
@@ -30,16 +35,17 @@ class AlignManager:
         src_type = self._get_type(src_scores, src_kpts, "src", src_img_size)
         ref_type = self._get_type(ref_scores, ref_kpts, "ref", ref_img_size)
         
+        # Case 결정: {SRC}_{REF}
         if src_type == BodyType.FULL and ref_type == BodyType.FULL:
-            case = AlignmentCase.A
-        elif src_type == BodyType.UPPER and ref_type == BodyType.UPPER:
-            case = AlignmentCase.B
-        elif src_type == BodyType.FULL and ref_type == BodyType.UPPER:
-            case = AlignmentCase.C
-        else:
-            case = AlignmentCase.D
+            case = AlignmentCase.F_F
+        elif src_type == BodyType.FULL and ref_type == BodyType.HALF:
+            case = AlignmentCase.F_H
+        elif src_type == BodyType.HALF and ref_type == BodyType.FULL:
+            case = AlignmentCase.H_F
+        else:  # HALF → HALF
+            case = AlignmentCase.H_H
         
-        print(f"   Result: {src_type.value} -> {ref_type.value} = Case {case.value}")
+        print(f"   Result: {src_type.value} → {ref_type.value} = Case {case.value}")
         
         return src_type, ref_type, case
 
@@ -52,7 +58,7 @@ class AlignManager:
         2. 해부학적 순서: hip.y < knee.y < ankle.y (한쪽이라도)
         3. knee/ankle 점수가 ghost_threshold 이상 (한쪽이라도)
         
-        하나라도 실패하면 상반신(UPPER)
+        하나라도 실패하면 상반신(HALF)
         """
         print(f"\n   🔍 [DEBUG] _get_type({label})")
         
@@ -78,8 +84,8 @@ class AlignManager:
         print(f"         valid_count: {valid_count} >= {min_valid}? {'PASS ✅' if score_check_pass else 'FAIL ❌'}")
         
         if not score_check_pass:
-            print(f"      → UPPER (점수 체크 실패)")
-            return BodyType.UPPER
+            print(f"      → HALF (점수 체크 실패)")
+            return BodyType.HALF
         
         # ============================================================
         # [조건 2] 해부학적 순서 검증 (핵심!)
@@ -124,8 +130,8 @@ class AlignManager:
         print(f"         At least one leg OK? {'PASS ✅' if anatomy_check_pass else 'FAIL ❌'}")
         
         if not anatomy_check_pass:
-            print(f"      → UPPER (해부학적 순서 검증 실패 - Ghost Leg)")
-            return BodyType.UPPER
+            print(f"      → HALF (해부학적 순서 검증 실패 - Ghost Leg)")
+            return BodyType.HALF
         
         # ============================================================
         # [조건 3] Ghost Score 검증
@@ -154,8 +160,8 @@ class AlignManager:
         print(f"         max(knee, ankle) >= {ghost_score_threshold}? {'PASS ✅' if ghost_check_pass else 'FAIL ❌'}")
         
         if not ghost_check_pass:
-            print(f"      → UPPER (Ghost Score 검증 실패 - 낮은 신뢰도)")
-            return BodyType.UPPER
+            print(f"      → HALF (Ghost Score 검증 실패 - 낮은 신뢰도)")
+            return BodyType.HALF
         
         # ============================================================
         # 모든 조건 통과 → FULL
@@ -179,8 +185,9 @@ class AlignManager:
         
         aligned_kpts = kpts.copy()
         
-        if case == AlignmentCase.A:
-            print("\n🦶 Case A: Bottom-based alignment")
+        # F_F (전신→전신): 발 기준 정렬
+        if case == AlignmentCase.F_F:
+            print("\n🦶 Case F_F: Bottom-based alignment (전신→전신)")
             
             src_bottom = src_person_bbox.bbox[3]
             print(f"   src_person_bbox: {src_person_bbox.bbox}")
@@ -188,20 +195,27 @@ class AlignManager:
             
             feet_idx = [15, 16, 17, 18, 19, 20, 21, 22]
             valid_y = []
+            print(f"\n   feet_idx to check: {feet_idx}")
             for i in feet_idx:
                 if i < len(scores) and scores[i] > 0.1:
                     valid_y.append(kpts[i][1])
+                    print(f"      idx={i}: score={scores[i]:.3f}, y={kpts[i][1]:.1f} ✅")
+                else:
+                    score = scores[i] if i < len(scores) else 0
+                    print(f"      idx={i}: score={score:.3f} ❌")
             
+            print(f"\n   valid_y list: {valid_y}")
             trans_bottom = max(valid_y) if valid_y else 0
-            print(f"   trans_bottom (max valid feet): {trans_bottom:.1f}")
+            print(f"   trans_bottom (max): {trans_bottom}")
             
             if trans_bottom > 0:
                 shift_y = src_bottom - trans_bottom
                 aligned_kpts[:, 1] += shift_y
-                print(f"   ✅ shift_y = {shift_y:.1f}")
+                print(f"   ✅ shift_y = {src_bottom} - {trans_bottom} = {shift_y:.1f}")
             else:
                 print(f"   ❌ trans_bottom = 0, NO SHIFT")
-                
+        
+        # 그 외 (상반신 포함): 얼굴 기준 정렬
         else:
             print(f"\n👤 Case {case.value}: Face-based alignment")
             
@@ -218,6 +232,17 @@ class AlignManager:
             aligned_kpts[:, 0] += shift_x
             aligned_kpts[:, 1] += shift_y
             print(f"   ✅ shift: ({shift_x:.1f}, {shift_y:.1f})")
+        
+        # 정렬 후 하반신 위치 출력
+        print(f"\n📊 After Alignment - Lower Body Status:")
+        lower_names = ['left_hip', 'right_hip', 'left_knee', 'right_knee', 'left_ankle', 'right_ankle']
+        lower_indices = [11, 12, 13, 14, 15, 16]
+        for name, idx in zip(lower_names, lower_indices):
+            if idx < len(scores):
+                score = scores[idx]
+                pos = aligned_kpts[idx]
+                status = "✅" if score > 0.1 else "❌"
+                print(f"   {status} {name:15} (idx={idx}): score={score:.3f}, pos={pos}")
         
         print("="*60)
         return aligned_kpts
