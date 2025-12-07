@@ -1,5 +1,5 @@
 """
-Pose Transfer Engine Module (FIX: Feet Transfer 추가)
+Pose Transfer Engine Module (FIX: Face에 r_scores 전달)
 """
 import numpy as np
 from typing import Dict, Tuple, Optional
@@ -119,7 +119,7 @@ class PoseTransferEngine:
                 trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, global_scale, processed, transfer_log, is_lower=True
             )
             
-            # [NEW] Feet 전이 추가
+            # Feet 전이
             print("\n   🦶 [Transfer] Generating Feet")
             self.body_logic.transfer_feet(
                 trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, global_scale, processed, transfer_log
@@ -139,9 +139,14 @@ class PoseTransferEngine:
                 status = "✅" if score > 0 else "❌"
                 print(f"   {status} {name:15} (idx={idx:2d}): score={score:.3f}, pos={pos}")
 
-        # [Face]
+        # [Face] - 수정: r_scores 추가 전달
         if self.config.use_face:
-            self.face_logic.transfer(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, transfer_log)
+            self.face_logic.transfer(
+                trans_kpts, trans_scores, 
+                source_keypoints, source_scores, 
+                reference_keypoints, reference_scores,  # r_scores 추가!
+                transfer_log
+            )
 
         # [Hands]
         if self.config.use_hands:
