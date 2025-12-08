@@ -1,7 +1,7 @@
 """
-포즈 전이 파이프라인 v15 (Source Scale Priority)
-- F_F 이외의 케이스(H_F, H_H 등)에서 Source 얼굴 크기를 기준으로 강력하게 스케일링
-- 캔버스 밖으로 나가는 포즈는 CanvasManager를 통해 패딩 처리
+포즈 전이 파이프라인 v16 (Sync with GhostFilter v2.1)
+- GhostFilterConfig 인자 불일치 오류 수정
+- F_F 이외 케이스에서 Source 얼굴 크기 동기화 로직 포함
 """
 import cv2
 import numpy as np
@@ -73,17 +73,19 @@ class PipelineConfig:
     
     # Alignment / Logic
     full_body_min_valid_lower: int = 4
-    ghost_score_threshold: float = 2.0
     yolo_verification_enabled: bool = True
     yolo_person_conf: float = 0.5
     yolo_face_conf: float = 0.3
     face_scale_enabled: bool = True
     
-    # Ghost Filter (NEW)
+    # Ghost Filter (Updated for v2.1)
     ghost_filter_enabled: bool = True
-    ghost_body_score_threshold: float = 2.0
-    ghost_hand_score_threshold: float = 1.5
-    ghost_wrist_score_threshold: float = 2.0
+    ghost_score_threshold: float = 0.5
+    ghost_check_anatomy: bool = False
+    ghost_check_bounds: bool = True
+    ghost_bounds_margin: float = 0.05
+    ghost_wrist_score_threshold: float = 0.3
+    ghost_elbow_score_threshold: float = 0.3
     
     # Bbox Margin
     person_bbox_margin: float = 0.0
@@ -133,15 +135,20 @@ class PipelineConfig:
             head_padding_ratio=output.get('head_padding_ratio', 1.0),
             canvas_padding_ratio=output.get('canvas_padding_ratio', 0.1),
             full_body_min_valid_lower=alignment.get('full_body_min_valid_lower', 4),
-            ghost_score_threshold=alignment.get('ghost_score_threshold', 2.0),
             yolo_verification_enabled=alignment.get('yolo_verification_enabled', True),
             yolo_person_conf=alignment.get('yolo_person_conf', 0.5),
             yolo_face_conf=alignment.get('yolo_face_conf', 0.3),
             face_scale_enabled=alignment.get('face_scale_enabled', True),
+            
+            # [Ghost Filter Config Mapping]
             ghost_filter_enabled=ghost.get('enabled', True),
-            ghost_body_score_threshold=ghost.get('body_score_threshold', 2.0),
-            ghost_hand_score_threshold=ghost.get('hand_score_threshold', 1.5),
-            ghost_wrist_score_threshold=ghost.get('wrist_score_threshold', 2.0),
+            ghost_score_threshold=ghost.get('ghost_score_threshold', 0.5),
+            ghost_check_anatomy=ghost.get('check_anatomy_order', False),
+            ghost_check_bounds=ghost.get('check_image_bounds', True),
+            ghost_bounds_margin=ghost.get('bounds_margin', 0.05),
+            ghost_wrist_score_threshold=ghost.get('wrist_score_threshold', 0.3),
+            ghost_elbow_score_threshold=ghost.get('elbow_score_threshold', 0.3),
+            
             person_bbox_margin=bbox.get('person_margin', 0.0),
             face_bbox_margin=bbox.get('face_margin', 0.0),
             debug_bbox_visualization=debug.get('bbox_visualization', False),
@@ -197,12 +204,15 @@ class PoseTransferPipeline:
         self.post_proc = PostProcessor(self.config)
         self.canvas_mgr = CanvasManager(self.config)
         
-        # Ghost Filter 초기화
+        # [수정] Ghost Filter 초기화 (새로운 Config 구조 반영)
         self.ghost_filter = GhostFilter(GhostFilterConfig(
-            body_score_threshold=self.config.ghost_body_score_threshold,
-            hand_score_threshold=self.config.ghost_hand_score_threshold,
-            wrist_score_threshold=self.config.ghost_wrist_score_threshold,
+            enabled=self.config.ghost_filter_enabled,
             ghost_score_threshold=self.config.ghost_score_threshold,
+            check_anatomy_order=self.config.ghost_check_anatomy,
+            check_image_bounds=self.config.ghost_check_bounds,
+            bounds_margin=self.config.ghost_bounds_margin,
+            wrist_score_threshold=self.config.ghost_wrist_score_threshold,
+            elbow_score_threshold=self.config.ghost_elbow_score_threshold
         ))
         
         self._init_modules()
@@ -245,8 +255,8 @@ class PoseTransferPipeline:
         return kpts, scores, idx, image_size
 
     def _apply_ghost_filter(self, kpts: np.ndarray, scores: np.ndarray, image_size: Tuple[int, int]) -> np.ndarray:
-        if not self.config.ghost_filter_enabled:
-            return scores
+        # PipelineConfig에서 enabled가 True면 필터 적용
+        # (GhostFilter 내부에서도 enabled 체크하지만 이중 확인)
         return self.ghost_filter.filter(kpts, scores, image_size)
 
     def transfer(self, source_image, reference_image, output_image_size=None):
@@ -323,21 +333,15 @@ class PoseTransferPipeline:
         print("-"*50)
         
         # [수정] F_F가 아닌 경우(H_F, H_H, F_H) Source 얼굴 크기에 강제 동기화
-        scale_factor = 1.0
-        
+        scale = 1.0
         if case != AlignmentCase.F_F:
             # 1. 현재 전이된 결과물(Engine 출력)의 얼굴 BBox 계산
-            #    (Engine 내부에서 이미 Global Scale이 적용된 상태임)
             current_trans_face = self.bbox_mgr._kpt_to_face_public(trans_kpts, trans_scores)
             
             # 2. 크기 검증 (0으로 나누기 방지)
             if current_trans_face.size > 1 and src_face.size > 1:
                 # 3. 보정 비율 계산: (목표 Src 크기) / (현재 Trans 크기)
-                #    Src/Ref를 쓰는 게 아니라, 현재 결과물을 Src에 맞춤
                 scale_factor = src_face.size / current_trans_face.size
-                
-                # 안전 장치: 너무 극단적인 스케일링 방지 (0.5배 ~ 2.0배 사이로만 보정)
-                # Engine이 이미 얼추 맞췄을 것이므로 보정치는 1.0 근처여야 함
                 scale_factor = np.clip(scale_factor, 0.5, 2.0)
                 
                 print(f"   Case {case.value}: Adjusting Scale to Match Src Face")
@@ -345,21 +349,17 @@ class PoseTransferPipeline:
                 print(f"   Cur Trans Face Size: {current_trans_face.size:.1f}")
                 print(f"   >>> Adjustment Scale: {scale_factor:.4f}")
                 
-                # 4. 스케일 적용 (0,0 기준 확대 -> Step 8에서 정렬됨)
                 trans_kpts *= scale_factor
+                scale = scale_factor
             else:
                 print("   ⚠️ Face size too small for scaling, skipping.")
         else:
             print(f"   Case {case.value}: Using Global Scale (Shoulder/Body based)")
-
-        # AlignInfo에 기록하기 위해 scale 변수 업데이트
-        scale = scale_factor
-
+        
         print("\n" + "-"*50)
         print("[STEP 8] Aligning (Anchoring)...")
         print("-"*50)
         
-        # [수정] 정렬 로직 (스케일링 된 좌표를 Source 기준점(발 or 얼굴)으로 이동)
         trans_kpts = self.align_mgr.align_coordinates(
             trans_kpts, trans_scores, case, src_person, src_face,
             lambda k, s: self.bbox_mgr._kpt_to_face_public(k, s) 
@@ -374,7 +374,6 @@ class PoseTransferPipeline:
         print("\n" + "-"*50)
         print("[STEP 10] Canvas Expansion...")
         print("-"*50)
-        # 캔버스 확장: Source 이미지 리사이징 없이, 포즈가 튀어나가면 패딩 추가
         final_src_img, final_kpts, final_size = self.canvas_mgr.expand_canvas_to_fit(
             src_img, trans_kpts, trans_scores, head_pad_px=head_pad
         )
@@ -413,19 +412,14 @@ class PoseTransferPipeline:
         )
 
     def extract_and_render(self, image):
-        """
-        이미지에서 포즈 추출 및 렌더링 (범용 Ghost Filter 적용!)
-        """
         if isinstance(image, (str, Path)): img = load_image(image)
         else: img = image
         image_size = img.shape[:2]
         kpts, scores, _, _ = self.extract_pose(img)
         
-        # [NEW] 범용 Ghost Filter 적용
         print("\n🔍 [Ghost Filter] Applying to extracted pose...")
         filtered_scores = self._apply_ghost_filter(kpts, scores, image_size)
         
-        # 필터링된 scores로 JSON 및 렌더링
         json_data = convert_to_openpose_format(kpts[np.newaxis, ...], filtered_scores[np.newaxis, ...], image_size)
         skel_img = self.renderer.render_skeleton_only((image_size[0], image_size[1], 3), kpts, filtered_scores)
         overlay_img = self.renderer.render(img, kpts, filtered_scores)
