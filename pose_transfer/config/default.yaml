@@ -99,9 +99,9 @@ fallback:
 # [7] 렌더링 스타일
 rendering:
   line_thickness: 4
-  face_line_thickness: 4
+  face_line_thickness: 2
   hand_line_thickness: 4
-  point_radius: 4
+  point_radius: 2
   background_color: [0, 0, 0]
   kpt_threshold: 0.1
 
@@ -111,8 +111,8 @@ output:
   save_skeleton_image: true
   save_debug_image: true
   # 캔버스 확장(Padding)을 위해 True 필수
-  auto_crop_enabled: true
-  canvas_padding_ratio: 0.1
+  auto_crop_enabled: false
+  canvas_padding_ratio: 0
   crop_padding_px: 0
   head_padding_ratio: 0.5
 
@@ -148,7 +148,7 @@ face_rendering:
   enabled: true
   parts:
     jawline:
-      enabled: true
+      enabled: false
       color: [255, 255, 255]
     left_eyebrow:
       enabled: true
