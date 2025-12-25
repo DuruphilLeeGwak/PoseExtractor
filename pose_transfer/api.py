@@ -1,6 +1,10 @@
 """
-Pose Transfer API Module (Updated for IO Folder Structure)
-- Priority: Function Arguments > Internal 'io' Folder (Project Root)
+Pose Transfer API Module (v2 - Pozibility 통합 지원)
+
+실행 모드:
+1. Standalone Mode: pose_extractor 단독 실행 → io/ 폴더 사용
+2. Module Mode (외부 경로 주입): 외부에서 경로 직접 전달
+3. Pozibility Mode: modules/pose_extractor로 통합 시 → data/ 폴더 사용
 """
 import sys
 import os
@@ -10,20 +14,97 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Union, Tuple
 
-# 패키지 내부 임포트
 from .pipeline import PipelineConfig, PoseTransferPipeline
 from .utils.io import save_json, save_image, load_image
+
+
+# ====================================================
+# [Path Resolution] 경로 결정 로직
+# ====================================================
+def resolve_data_paths() -> Tuple[Path, Path, Path]:
+    """
+    실행 환경에 따라 input/output 경로 결정
+    
+    Returns:
+        (src_dir, ref_dir, output_dir)
+    """
+    # pose_transfer/ 폴더 위치
+    pose_transfer_dir = Path(__file__).resolve().parent
+    
+    # pose_extractor/ 또는 모듈 루트
+    module_root = pose_transfer_dir.parent
+    
+    # Pozibility 프로젝트 루트 (modules/pose_extractor의 상위의 상위)
+    potential_pozibility_root = module_root.parent.parent
+    pozibility_data = potential_pozibility_root / "data"
+    
+    # [Case 1] Pozibility 통합 모드: data/ 폴더가 존재하면 사용
+    if pozibility_data.exists() and (pozibility_data / "inputs").exists():
+        print("ℹ️  [API] Pozibility Mode: data/ 폴더를 사용합니다.")
+        return (
+            pozibility_data / "inputs" / "src",
+            pozibility_data / "inputs" / "ref",
+            pozibility_data / "preprocess_outputs"
+        )
+    
+    # [Case 2] Standalone 모드: io/ 폴더 사용
+    io_dir = module_root / "io"
+    if io_dir.exists():
+        print("ℹ️  [API] Standalone Mode: io/ 폴더를 사용합니다.")
+        return (
+            io_dir / "inputs" / "src",
+            io_dir / "inputs" / "ref",
+            io_dir / "outputs"
+        )
+    
+    # [Case 3] 폴더 없음 - 기본 io/ 생성
+    print("ℹ️  [API] io/ 폴더가 없어 생성합니다.")
+    io_dir.mkdir(parents=True, exist_ok=True)
+    (io_dir / "inputs" / "src").mkdir(parents=True, exist_ok=True)
+    (io_dir / "inputs" / "ref").mkdir(parents=True, exist_ok=True)
+    (io_dir / "outputs").mkdir(parents=True, exist_ok=True)
+    
+    return (
+        io_dir / "inputs" / "src",
+        io_dir / "inputs" / "ref",
+        io_dir / "outputs"
+    )
+
+
+def find_first_image(directory: Path) -> Optional[Path]:
+    """디렉토리에서 첫 번째 이미지 파일 찾기"""
+    if not directory.exists():
+        return None
+    
+    valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+    files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
+    
+    return files[0] if files else None
+
 
 # ====================================================
 # [API] 외부에서 호출하는 핵심 함수
 # ====================================================
 def execute_pose_transfer(
-    source_path: Union[str, Path] = None,    # [Module Mode] 외부 주입 경로
-    reference_path: Union[str, Path] = None, # [Module Mode] 외부 주입 경로
-    output_root: str = None,                 # [Auto] None이면 모드에 따라 결정됨
+    source_path: Union[str, Path] = None,
+    reference_path: Union[str, Path] = None,
+    output_root: Union[str, Path] = None,
     config_path: str = None,
     explicit_config: Optional[dict] = None
 ) -> Dict[str, str]:
+    """
+    포즈 전이 실행
+    
+    Args:
+        source_path: Source 이미지 경로 (None이면 자동 탐색)
+        reference_path: Reference 이미지 경로 (None이면 자동 탐색)
+        output_root: 출력 디렉토리 (None이면 자동 결정)
+        config_path: 설정 파일 경로
+        explicit_config: 명시적 설정 딕셔너리
+    
+    Returns:
+        결과 파일 경로 딕셔너리
+    """
     
     # 1. 설정 파일 로드
     if config_path is None:
@@ -37,7 +118,7 @@ def execute_pose_transfer(
         with open(config_p, 'r', encoding='utf-8') as f:
             yaml_config = yaml.safe_load(f)
 
-    # 2. 경로 결정 로직 (Standalone vs Module)
+    # 2. 경로 결정
     final_src_path = None
     final_ref_path = None
     final_output_dir = None
@@ -47,51 +128,42 @@ def execute_pose_transfer(
         print("ℹ️  [API] Module Mode: 외부 경로를 사용합니다.")
         final_src_path = Path(source_path)
         final_ref_path = Path(reference_path)
-        # 외부 경로가 들어왔는데 output_root가 없으면 기본 'outputs' 사용
-        final_output_dir = Path(output_root) if output_root else Path("outputs")
         
-    # [Case B] Standalone Mode: 내부 'io' 폴더 사용
+        if output_root is not None:
+            final_output_dir = Path(output_root)
+        else:
+            # 외부 경로 주입인데 output_root가 없으면 자동 결정
+            _, _, auto_output = resolve_data_paths()
+            final_output_dir = auto_output
+    
+    # [Case B] Auto Mode: 경로 자동 탐색
     else:
-        print("ℹ️  [API] Standalone Mode: 내부 'io' 폴더를 탐색합니다.")
+        src_dir, ref_dir, auto_output_dir = resolve_data_paths()
         
-        # [수정됨] api.py(pose_transfer/)의 상위 폴더(PoseExtractor/)를 기준으로 io를 찾습니다.
-        project_root = Path(__file__).resolve().parent.parent
-        io_dir = project_root / "io"  
+        # output_root 결정
+        final_output_dir = Path(output_root) if output_root is not None else auto_output_dir
         
-        src_dir = io_dir / "inputs" / "src"
-        ref_dir = io_dir / "inputs" / "ref"
+        # 이미지 파일 찾기
+        final_src_path = find_first_image(src_dir)
+        final_ref_path = find_first_image(ref_dir)
         
-        # 출력 경로도 io/outputs로 자동 설정
-        final_output_dir = io_dir / "outputs" if output_root is None else Path(output_root)
+        if final_src_path is None:
+            raise FileNotFoundError(
+                f"❌ Source 이미지를 찾을 수 없습니다.\n"
+                f"👉 경로: {src_dir}\n"
+                f"💡 해당 폴더에 이미지 파일을 넣어주세요."
+            )
         
-        # 자동 검색 헬퍼 함수
-        def find_first_image(directory: Path) -> Path:
-            if not directory.exists():
-                raise FileNotFoundError(
-                    f"❌ 테스트용 폴더가 없습니다.\n"
-                    f"👉 경로: {directory}\n"
-                    f"💡 프로젝트 최상위 폴더에 'io/inputs/src' 폴더를 만들고 이미지를 넣어주세요."
-                )
-            
-            valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
-            files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
-            
-            if not files:
-                raise FileNotFoundError(f"❌ '{directory.name}' 폴더가 비어있습니다: {directory}")
-            return files[0]
-
-        try:
-            final_src_path = find_first_image(src_dir)
-            final_ref_path = find_first_image(ref_dir)
-            print(f"    👉 Source: {final_src_path.name}")
-            print(f"    👉 Reference: {final_ref_path.name}")
-            print(f"    👉 Output: {final_output_dir}")
-        except Exception as e:
-            # 더 명확한 에러 메시지 전달
-            print(f"\n[오류 해결 가이드]")
-            print(f"1. 폴더 구조 확인: {io_dir}")
-            print(f"2. 이미지 파일 확인: jpg, png 등")
-            raise RuntimeError(f"테스트 준비 실패: {e}")
+        if final_ref_path is None:
+            raise FileNotFoundError(
+                f"❌ Reference 이미지를 찾을 수 없습니다.\n"
+                f"👉 경로: {ref_dir}\n"
+                f"💡 해당 폴더에 이미지 파일을 넣어주세요."
+            )
+        
+        print(f"    👉 Source: {final_src_path.name}")
+        print(f"    👉 Reference: {final_ref_path.name}")
+        print(f"    👉 Output: {final_output_dir}")
 
     # 3. 파일 존재 확인
     if not final_src_path.exists():
@@ -133,7 +205,7 @@ def execute_pose_transfer(
         
         res_paths = {}
         
-        # 1. 배경 저장 (trans_bg.jpg)
+        # 1. 배경 저장
         path_bg = out_dirs["trans"] / "trans_bg.jpg"
         final_bg = result.modified_source_image if result.modified_source_image is not None else load_image(final_src_path)
         save_image(final_bg, str(path_bg))
@@ -175,6 +247,7 @@ def execute_pose_transfer(
         traceback.print_exc()
         raise RuntimeError(f"Pose transfer failed: {e}")
 
+
 # ====================================================
 # [Internal] 내부 헬퍼 함수들
 # ====================================================
@@ -190,6 +263,7 @@ def _setup_directories(output_root: str, job_id: str):
         d.mkdir(parents=True, exist_ok=True)
     return dirs
 
+
 def _save_analysis(pipeline, image_path: Path, output_dir: Path, prefix: str, save_json_flag, save_skel_flag, save_debug_flag):
     json_data, skel_img, overlay_img = pipeline.extract_and_render(image_path)
     
@@ -199,3 +273,15 @@ def _save_analysis(pipeline, image_path: Path, output_dir: Path, prefix: str, sa
         save_image(skel_img, str(output_dir / f"{prefix}_sk.jpg"))
     if save_debug_flag:
         save_image(overlay_img, str(output_dir / f"{prefix}_rend.jpg"))
+
+
+# ====================================================
+# [Export] 외부 공개 API
+# ====================================================
+__all__ = [
+    'execute_pose_transfer',
+    'resolve_data_paths',
+    'find_first_image',
+    'PipelineConfig',
+    'PoseTransferPipeline'
+]

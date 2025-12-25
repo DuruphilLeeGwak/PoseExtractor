@@ -1,129 +1,241 @@
 """
-Ghost Keypoint Filter v2.1 (Syntax Fix)
-- GhostFilterConfig의 문법 오류(TypeError)를 수정했습니다.
+Ghost Filter v4.2 - 손/발 할루시네이션 완벽 제거 (Final)
+
+변경사항:
+- [Critical] v3.1 구버전에서 v4.2 최신 로직으로 복구
+- [New] 손가락 족보 검사: 손목(Wrist, idx 9/10)이 없으면 손가락(91~132) 자동 삭제
+- [New] 스마트 중첩 방지: 손 근처에 발이 찍히면 발 삭제 (요가 자세 제외)
+- [New] 하단/경계 강제 절삭: 바닥과 벽에 붙은 노이즈 제거
 """
 import numpy as np
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, Dict, Set, List
 from dataclasses import dataclass
 
-# 인덱스 정의
-LOWER_BODY_INDICES = [11, 12, 13, 14, 15, 16] # Hips, Knees, Ankles
-FEET_INDICES = [17, 18, 19, 20, 21, 22]
-LEFT_HAND_INDICES = list(range(91, 112))
-RIGHT_HAND_INDICES = list(range(112, 133))
+from ..extractors.keypoint_constants import (
+    BODY_BONES, FEET_BONES, HAND_BONES,
+    FACE_START_IDX, FACE_END_IDX,
+    LEFT_HAND_START_IDX, LEFT_HAND_END_IDX,
+    RIGHT_HAND_START_IDX, RIGHT_HAND_END_IDX,
+    get_keypoint_index
+)
+
 
 @dataclass
 class GhostFilterConfig:
+    """Ghost Filter 설정"""
     enabled: bool = True
-    ghost_score_threshold: float = 0.5
-    check_anatomy_order: bool = False
-    check_image_bounds: bool = True
+    
+    # [A] 프레임 이탈 체크
+    check_bounds: bool = True
     bounds_margin: float = 0.05
-    wrist_score_threshold: float = 0.3
-    elbow_score_threshold: float = 0.3  # [수정] 문법 오류 수정 (: 0.3 -> : float = 0.3)
+    
+    # [B] 경계값 감지
+    check_boundary_values: bool = True
+    boundary_tolerance: float = 5.0
+    
+    # [C] 예측 가능 키포인트 허용
+    allow_predictable: bool = True
+    predictable_margin: float = 0.20
+    min_confidence_for_prediction: float = 0.3
+    
+    # [D] 클러스터링 체크
+    check_clustering: bool = True
+    min_cluster_spread: float = 20.0
+    
+    # [E] 계층적 연결성 검사 (Consistency Check) [핵심]
+    # 부모(손목/발목)가 없으면 자식(손가락/발)을 삭제
+    check_consistency: bool = True
+    
+    # [F] 하단 강제 절삭
+    hard_bottom_check: bool = True
+    hard_bottom_threshold: float = 0.95
+    
+    # [G] 스마트 손-발 중첩 방지
+    check_hand_foot_overlap: bool = True
+    overlap_radius: float = 150.0
+    hip_confidence_threshold: float = 0.4
+    
+    confidence_threshold: float = 0.1
+
+
+@dataclass
+class FilterResult:
+    """필터링 결과"""
+    filtered_scores: np.ndarray
+    removed_indices: Set[int]
+    removal_reasons: Dict[int, str]
+
 
 class GhostFilter:
+    """통합 Ghost Filter v4.2"""
+    
     def __init__(self, config: Optional[GhostFilterConfig] = None):
         self.config = config or GhostFilterConfig()
-
-    def filter(self, kpts: np.ndarray, scores: np.ndarray, image_size: Optional[Tuple[int, int]] = None) -> np.ndarray:
-        """
-        필터링 메인 함수
-        """
-        # 필터가 꺼져있으면 원본 점수 그대로 반환
+        self._build_adjacency_map()
+        
+        # [핵심] 족보 규칙: 자식 -> 부모 매핑
+        self.hierarchy_rules = {
+            # --- 발 (Feet -> Ankle) ---
+            17: 15, 18: 15, 19: 15, # Left Foot -> LAnkle
+            20: 16, 21: 16, 22: 16, # Right Foot -> RAnkle
+            
+            # --- 손 (Fingers -> Wrist) ---
+            # 왼쪽 손가락 (91~111) -> 왼쪽 손목 (9)
+            **{i: 9 for i in range(91, 112)},
+            
+            # 오른쪽 손가락 (112~132) -> 오른쪽 손목 (10)
+            **{i: 10 for i in range(112, 133)}
+        }
+    
+    def _build_adjacency_map(self):
+        self.adjacency: Dict[int, List[int]] = {}
+        all_bones = BODY_BONES + FEET_BONES
+        for start_name, end_name in all_bones:
+            try:
+                s, e = get_keypoint_index(start_name), get_keypoint_index(end_name)
+                for u, v in [(s, e), (e, s)]:
+                    if u not in self.adjacency: self.adjacency[u] = []
+                    self.adjacency[u].append(v)
+            except: pass
+            
+    def filter_single(
+        self, 
+        keypoints: np.ndarray, 
+        scores: np.ndarray, 
+        image_size: Tuple[int, int]
+    ) -> FilterResult:
         if not self.config.enabled:
-            return scores
-
-        filtered_scores = scores.copy()
-
-        # [1] 하반신 필터링 (다리 꼬임/Ghost Leg)
-        if self._should_remove_lower_body(kpts, scores):
-            filtered_scores = self._zero_indices(filtered_scores, LOWER_BODY_INDICES + FEET_INDICES)
-            print("   🦵 [GhostFilter] Lower body removed based on config.")
-
-        # [2] 손 필터링 (손 꼬임)
-        # 왼손
-        if self._should_remove_hand(scores, side='left'):
-            filtered_scores = self._zero_indices(filtered_scores, LEFT_HAND_INDICES)
-        # 오른손
-        if self._should_remove_hand(scores, side='right'):
-            filtered_scores = self._zero_indices(filtered_scores, RIGHT_HAND_INDICES)
-
-        # [3] 화면 밖 키포인트 제거
-        if image_size and self.config.check_image_bounds:
-            filtered_scores = self._filter_out_of_bounds(kpts, filtered_scores, image_size)
-
-        return filtered_scores
-
-    def _should_remove_lower_body(self, kpts, scores) -> bool:
-        """하반신 제거 여부 판단"""
-        # 1. 점수 기반 체크 (사용자 설정 threshold)
-        # 무릎이나 발목 중 하나라도 설정값보다 높은 게 있으면 -> 유효하다고 판단 (지우지 않음)
-        max_leg_score = max(
-            scores[13], scores[14], # Knees
-            scores[15], scores[16]  # Ankles
-        )
+            return FilterResult(scores.copy(), set(), {})
         
-        # 모든 다리 관절 점수가 설정값 미만이면 -> 노이즈로 보고 제거
-        if max_leg_score < self.config.ghost_score_threshold:
-            return True
-
-        # 2. 해부학적 순서 체크 (사용자가 켰을 때만 작동)
-        if self.config.check_anatomy_order:
-            l_hip_y, r_hip_y = kpts[11][1], kpts[12][1]
-            l_knee_y, r_knee_y = kpts[13][1], kpts[14][1]
-            
-            # 무릎이 골반보다 위에 있으면(Y값이 작으면) 제거
-            # (앉은 자세에서는 끄세요)
-            if (scores[13] > 0.1 and l_knee_y < l_hip_y) or \
-               (scores[14] > 0.1 and r_knee_y < r_hip_y):
-                return True
-
-        return False
-
-    def _should_remove_hand(self, scores, side='left') -> bool:
-        """손 제거 여부 판단"""
-        if side == 'left':
-            wrist_idx, elbow_idx = 9, 7
-        else:
-            wrist_idx, elbow_idx = 10, 8
-            
-        wrist_score = scores[wrist_idx]
-        elbow_score = scores[elbow_idx]
-        
-        # 손목과 팔꿈치 점수가 모두 설정값 미만이면 손 제거
-        # (손만 둥둥 떠있는 꼬임 방지)
-        if wrist_score < self.config.wrist_score_threshold and \
-           elbow_score < self.config.elbow_score_threshold:
-            return True
-            
-        return False
-
-    def _filter_out_of_bounds(self, kpts, scores, image_size):
         h, w = image_size
-        margin = self.config.bounds_margin
-        x_min, x_max = -w * margin, w * (1 + margin)
-        y_min, y_max = -h * margin, h * (1 + margin)
+        filtered_scores = scores.copy()
+        removed_indices = set()
+        removal_reasons = {}
         
-        new_scores = scores.copy()
-        for i in range(len(scores)):
-            if scores[i] > 0:
-                x, y = kpts[i]
-                if not (x_min <= x <= x_max and y_min <= y <= y_max):
-                    new_scores[i] = 0.0
-        return new_scores
+        def remove(idx, reason):
+            if idx not in removed_indices:
+                filtered_scores[idx] = 0.0
+                removed_indices.add(idx)
+                removal_reasons[idx] = reason
 
-    def _zero_indices(self, scores, indices):
-        for idx in indices:
-            if idx < len(scores):
-                scores[idx] = 0.0
-        return scores
+        # =========================================================
+        # [0] 스마트 손-발 중첩 방지 (Hand-Foot Overlap)
+        # =========================================================
+        if self.config.check_hand_foot_overlap:
+            hand_indices = [9, 10] + list(range(91, 113))
+            left_leg_parts = [13, 15] + [17, 18, 19] 
+            right_leg_parts = [14, 16] + [20, 21, 22] 
+            
+            active_hands = []
+            for h_idx in hand_indices:
+                if h_idx < len(scores) and scores[h_idx] > 0.1:
+                    active_hands.append(keypoints[h_idx])
+            
+            if active_hands:
+                active_hands = np.array(active_hands)
+                
+                # Left Leg Check
+                l_hip_valid = scores[11] > self.config.hip_confidence_threshold if 11 < len(scores) else False
+                for idx in left_leg_parts:
+                    if idx < len(scores) and scores[idx] > 0.05:
+                        if l_hip_valid: continue # 골반 있으면 봐줌
+                        if np.min(np.linalg.norm(active_hands - keypoints[idx], axis=1)) < self.config.overlap_radius:
+                            remove(idx, "hand_overlap_ghost(L)")
+
+                # Right Leg Check
+                r_hip_valid = scores[12] > self.config.hip_confidence_threshold if 12 < len(scores) else False
+                for idx in right_leg_parts:
+                    if idx < len(scores) and scores[idx] > 0.05:
+                        if r_hip_valid: continue
+                        if np.min(np.linalg.norm(active_hands - keypoints[idx], axis=1)) < self.config.overlap_radius:
+                            remove(idx, "hand_overlap_ghost(R)")
+
+        # =========================================================
+        # [1] 계층적 연결성 검사 (Consistency Check) - 손가락 포함
+        # =========================================================
+        if self.config.check_consistency:
+            for _ in range(2): 
+                for child, parent in self.hierarchy_rules.items():
+                    if (child < len(filtered_scores) and filtered_scores[child] > 0.01 and 
+                        parent < len(filtered_scores) and filtered_scores[parent] < self.config.confidence_threshold):
+                        
+                        parent_name = "Wrist" if parent in [9, 10] else "Ankle"
+                        remove(child, f"orphan_node({parent_name}_{parent}_missing)")
+
+        # =========================================================
+        # [2] 하단 강제 절삭 (Hard Bottom Cut)
+        # =========================================================
+        if self.config.hard_bottom_check:
+            limit_y = h * self.config.hard_bottom_threshold
+            for idx in range(len(keypoints)):
+                if scores[idx] > 0.01:
+                    if keypoints[idx][1] > limit_y:
+                        remove(idx, f"hard_bottom(y>{limit_y:.0f})")
+
+        # =========================================================
+        # [3] 기존 필터 (경계값, 클러스터링, 프레임 이탈)
+        # =========================================================
+        if self.config.check_boundary_values:
+            tol = self.config.boundary_tolerance
+            for i in range(len(keypoints)):
+                if scores[i] < self.config.confidence_threshold: continue
+                x, y = keypoints[i]
+                if x <= tol or x >= w-tol or y <= tol:
+                    remove(i, f"boundary_val({x:.0f},{y:.0f})")
+
+        if self.config.check_clustering:
+            for start, end, name in [(91, 111, "LHand"), (112, 132, "RHand")]:
+                points = [keypoints[i] for i in range(start, end+1) if scores[i] > 0.1]
+                indices = [i for i in range(start, end+1) if scores[i] > 0.1]
+                if len(points) > 5:
+                    pts = np.array(points)
+                    spread = np.sqrt(np.std(pts[:,0])**2 + np.std(pts[:,1])**2)
+                    if spread < self.config.min_cluster_spread:
+                        for idx in indices: remove(idx, f"clustered_{name}")
+
+        if self.config.check_bounds:
+            margin_w = w * self.config.bounds_margin
+            margin_h = h * self.config.bounds_margin
+            for i in range(len(keypoints)):
+                if i in removed_indices or scores[i] < self.config.confidence_threshold: continue
+                x, y = keypoints[i]
+                if (margin_w < x < w-margin_w and margin_h < y < h-margin_h): continue
+                
+                is_predictable = False
+                if self.config.allow_predictable and i in self.adjacency:
+                    for adj in self.adjacency[i]:
+                        if adj < len(scores) and scores[adj] > self.config.min_confidence_for_prediction:
+                            if adj not in removed_indices:
+                                is_predictable = True
+                                break
+                if not is_predictable:
+                    remove(i, f"out_of_bounds({x:.0f},{y:.0f})")
+                        
+        return FilterResult(filtered_scores, removed_indices, removal_reasons)
+
+    def compute_intersection(self, src_scores, ref_scores, threshold):
+        return (src_scores > threshold) & (ref_scores > threshold)
+    
+    def apply_intersection_mask(self, kpts, scores, mask):
+        s = scores.copy()
+        s[~mask] = 0.0
+        return kpts, s
 
 # 편의 함수
-def filter_ghost_keypoints(kpts, scores, image_size=None, config=None):
-    if config is None:
-        # Config가 없으면 기본값 사용 (모두 허용하는 방향)
-        config = GhostFilterConfig(enabled=False)
-    
-    filter_ = GhostFilter(config)
-    return filter_.filter(kpts, scores, image_size)
+def create_ghost_filter(**kwargs):
+    config = GhostFilterConfig(**kwargs)
+    return GhostFilter(config)
+
+def filter_keypoints(
+    keypoints: np.ndarray,
+    scores: np.ndarray,
+    image_size: Tuple[int, int],
+    bounds_margin: float = 0.05,
+    predictable_margin: float = 0.15
+) -> np.ndarray:
+    ghost_filter = create_ghost_filter(
+        bounds_margin=bounds_margin,
+        predictable_margin=predictable_margin
+    )
+    result = ghost_filter.filter_single(keypoints, scores, image_size)
+    return result.filtered_scores
