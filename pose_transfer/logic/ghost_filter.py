@@ -1,10 +1,11 @@
 """
-Ghost Filter v4.4 - 완전한 하반신 족보 (Full Leg Hierarchy)
+Ghost Filter v4.6 - 무관용 원칙 (Zero Tolerance)
 
 변경사항:
-- [Critical] Src 이미지의 '골반 없는 유령 다리' 해결
-- [Fix] 족보 규칙(hierarchy_rules)에 '무릎->골반', '발목->무릎' 관계 추가
-- 효과: 골반(Hip)이 0점이면 무릎(Knee), 발목(Ankle), 발(Foot)이 연쇄적으로 모두 삭제됨
+- [Revert] v4.5의 '골반/관절 보호(Tolerance)' 로직 전면 폐기 (유령 부활 원인 제거)
+- [Critical] 하단/경계에 닿은 모든 키포인트(골반 포함) 즉시 삭제
+- [Chain] 부모(골반)가 삭제되면 자식(무릎/발)도 즉시 사망하는 '연쇄 삭제' 강화
+- [Overlap] 손-발 중첩 감지 활성화
 """
 import numpy as np
 from typing import Tuple, Optional, Dict, Set, List
@@ -32,10 +33,10 @@ class GhostFilterConfig:
     check_boundary_values: bool = True
     boundary_tolerance: float = 5.0
     
-    # [C] 예측 가능 키포인트 허용
+    # [C] 예측 가능 키포인트 허용 (최소한의 마진만 허용)
     allow_predictable: bool = True
-    predictable_margin: float = 0.20
-    min_confidence_for_prediction: float = 0.3
+    predictable_margin: float = 0.10  # [축소] 0.20 -> 0.10 (더 엄격하게)
+    min_confidence_for_prediction: float = 0.5  # [상향] 0.3 -> 0.5 (확실한 놈만 살림)
     
     # [D] 클러스터링 체크
     check_clustering: bool = True
@@ -65,29 +66,27 @@ class FilterResult:
 
 
 class GhostFilter:
-    """통합 Ghost Filter v4.4"""
+    """통합 Ghost Filter v4.6"""
     
     def __init__(self, config: Optional[GhostFilterConfig] = None):
         self.config = config or GhostFilterConfig()
         self._build_adjacency_map()
         
-        # [핵심 수정] 완전한 족보 규칙 (자식 -> 부모)
+        # 족보 규칙 (자식 -> 부모)
         self.hierarchy_rules = {
-            # --- 1. 발가락 -> 발목 ---
+            # Feet -> Ankle
             17: 15, 18: 15, 19: 15, 
             20: 16, 21: 16, 22: 16,
             
-            # --- 2. 손가락 -> 손목 ---
+            # Fingers -> Wrist
             **{i: 9 for i in range(91, 112)},
             **{i: 10 for i in range(112, 133)},
             
-            # --- 3. [NEW] 발목 -> 무릎 ---
-            15: 13, # LAnkle -> LKnee
-            16: 14, # RAnkle -> RKnee
+            # Ankle -> Knee
+            15: 13, 16: 14, 
             
-            # --- 4. [NEW] 무릎 -> 골반 ---
-            13: 11, # LKnee -> LHip
-            14: 12  # RKnee -> RHip
+            # Knee -> Hip (핵심 고리)
+            13: 11, 14: 12  
         }
     
     def _build_adjacency_map(self):
@@ -121,24 +120,32 @@ class GhostFilter:
                 removed_indices.add(idx)
                 removal_reasons[idx] = reason
 
-        # [Step 1] 하단 강제 절삭
+        # =========================================================
+        # [Step 1] 하단 강제 절삭 (예외 없음)
+        # =========================================================
         if self.config.hard_bottom_check:
             limit_y = h * self.config.hard_bottom_threshold
+            # 모든 키포인트 검사 (골반 포함!)
             for idx in range(len(keypoints)):
                 if scores[idx] > 0.01:
                     if keypoints[idx][1] > limit_y:
                         remove(idx, f"hard_bottom(y>{limit_y:.0f})")
 
-        # [Step 2] 경계값 감지
+        # =========================================================
+        # [Step 2] 경계값 감지 (예외 없음)
+        # =========================================================
         if self.config.check_boundary_values:
             tol = self.config.boundary_tolerance
             for i in range(len(keypoints)):
                 if scores[i] < self.config.confidence_threshold: continue
                 x, y = keypoints[i]
+                # 상하좌우 모든 경계 체크
                 if x <= tol or x >= w-tol or y <= tol:
                     remove(i, f"boundary_val({x:.0f},{y:.0f})")
 
+        # =========================================================
         # [Step 3] 클러스터링 체크
+        # =========================================================
         if self.config.check_clustering:
             for start, end, name in [(91, 111, "LHand"), (112, 132, "RHand")]:
                 points = [keypoints[i] for i in range(start, end+1) if scores[i] > 0.1]
@@ -149,7 +156,9 @@ class GhostFilter:
                     if spread < self.config.min_cluster_spread:
                         for idx in indices: remove(idx, f"clustered_{name}")
 
+        # =========================================================
         # [Step 4] 스마트 손-발 중첩 방지
+        # =========================================================
         if self.config.check_hand_foot_overlap:
             hand_indices = [9, 10] + list(range(91, 113))
             left_leg_parts = [13, 15] + [17, 18, 19] 
@@ -163,38 +172,40 @@ class GhostFilter:
             if active_hands:
                 active_hands = np.array(active_hands)
                 
-                l_hip_valid = scores[11] > self.config.hip_confidence_threshold if 11 < len(scores) else False
+                # Hip 점수가 0점이면 이미 '죽은' 것이므로 valid=False
+                l_hip_valid = (filtered_scores[11] > self.config.hip_confidence_threshold) if 11 < len(scores) else False
                 for idx in left_leg_parts:
                     if idx not in removed_indices and idx < len(scores) and scores[idx] > 0.05:
                         if l_hip_valid: continue
                         if np.min(np.linalg.norm(active_hands - keypoints[idx], axis=1)) < self.config.overlap_radius:
                             remove(idx, "hand_overlap_ghost(L)")
 
-                r_hip_valid = scores[12] > self.config.hip_confidence_threshold if 12 < len(scores) else False
+                r_hip_valid = (filtered_scores[12] > self.config.hip_confidence_threshold) if 12 < len(scores) else False
                 for idx in right_leg_parts:
                     if idx not in removed_indices and idx < len(scores) and scores[idx] > 0.05:
                         if r_hip_valid: continue
                         if np.min(np.linalg.norm(active_hands - keypoints[idx], axis=1)) < self.config.overlap_radius:
                             remove(idx, "hand_overlap_ghost(R)")
 
-        # [Step 5] 계층적 연결성 검사 (The Chain Reaction)
-        # 이제 무릎->골반 규칙이 추가되어, 골반이 없으면 무릎도 삭제됩니다.
+        # =========================================================
+        # [Step 5] 계층적 연결성 검사 (Chain Kill)
+        # =========================================================
         if self.config.check_consistency:
-            for _ in range(3): # 연쇄 작용(Hip->Knee->Ankle->Foot)을 위해 3회 반복
+            for _ in range(3):
                 for child, parent in self.hierarchy_rules.items():
                     if child < len(filtered_scores) and filtered_scores[child] > 0.01:
-                        # 부모가 죽었으면 자식도 죽음
-                        if (parent < len(filtered_scores) and filtered_scores[parent] < self.config.confidence_threshold):
-                            
-                            p_name = "Joint"
-                            if parent in [11, 12]: p_name = "Hip"
-                            elif parent in [13, 14]: p_name = "Knee"
-                            elif parent in [15, 16]: p_name = "Ankle"
-                            elif parent in [9, 10]: p_name = "Wrist"
-                            
-                            remove(child, f"orphan_node({p_name}_{parent}_dead)")
+                        # 부모가 원래 없거나(score<threshold) OR 방금 삭제되었으면(filtered_scores==0)
+                        parent_dead = False
+                        if parent < len(filtered_scores):
+                            if filtered_scores[parent] < self.config.confidence_threshold: parent_dead = True
+                        
+                        if parent_dead:
+                            p_name = str(parent)
+                            remove(child, f"orphan_node(parent_{p_name}_dead)")
 
-        # [Step 6] 프레임 이탈 체크
+        # =========================================================
+        # [Step 6] 프레임 이탈 체크 (엄격 모드)
+        # =========================================================
         if self.config.check_bounds:
             margin_w = w * self.config.bounds_margin
             margin_h = h * self.config.bounds_margin
@@ -206,10 +217,12 @@ class GhostFilter:
                 is_predictable = False
                 if self.config.allow_predictable and i in self.adjacency:
                     for adj in self.adjacency[i]:
+                        # 인접 관절이 '살아있어야만' 인정
                         if adj < len(scores) and scores[adj] > self.config.min_confidence_for_prediction:
-                            if adj not in removed_indices:
+                            if adj not in removed_indices: # [중요] 삭제된 관절은 예측 근거가 될 수 없음
                                 is_predictable = True
                                 break
+                
                 if not is_predictable:
                     remove(i, f"out_of_bounds({x:.0f},{y:.0f})")
                         
