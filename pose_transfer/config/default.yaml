@@ -2,16 +2,16 @@
 # Pose Transfer Configuration v13 (User Manual Control)
 # =============================================================================
 
-# [0] 입력 모드 설정
-input_mode:
-  type: "internal"
-  internal:
-    root_dir: "inputs"
-    src_dir: "src"      
-    ref_dir: "ref"      
-  external:
-    source_path: "/var/data/users/user_123.jpg"
-    reference_path: "/var/data/poses/pose_dance.jpg"
+# # [0] 입력 모드 설정
+# input_mode:
+#   type: "internal"
+#   internal:
+#     root_dir: "inputs"
+#     src_dir: "src"      
+#     ref_dir: "ref"      
+#   external:
+#     source_path: "/var/data/users/user_123.jpg"
+#     reference_path: "/var/data/poses/pose_dance.jpg"
 
 # [1] 모델 설정
 model:

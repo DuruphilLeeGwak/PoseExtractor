@@ -1,7 +1,6 @@
 """
-Pose Transfer API Module (Final v3)
-- Saves trans_bg.jpg (modified source)
-- Uses modified source for overlay rendering
+Pose Transfer API Module (Updated for IO Folder Structure)
+- Priority: Function Arguments > Internal 'io' Folder (Project Root)
 """
 import sys
 import os
@@ -16,101 +15,109 @@ from .pipeline import PipelineConfig, PoseTransferPipeline
 from .utils.io import save_json, save_image, load_image
 
 # ====================================================
-# [Helper] 경로 결정 로직
+# [API] 외부에서 호출하는 핵심 함수
 # ====================================================
-def resolve_input_paths(cli_args, yaml_config) -> Tuple[Path, Path]:
-    if cli_args.source and cli_args.reference:
-        print("ℹ️  [Input] Using CLI arguments.")
-        return Path(cli_args.source), Path(cli_args.reference)
+def execute_pose_transfer(
+    source_path: Union[str, Path] = None,    # [Module Mode] 외부 주입 경로
+    reference_path: Union[str, Path] = None, # [Module Mode] 외부 주입 경로
+    output_root: str = None,                 # [Auto] None이면 모드에 따라 결정됨
+    config_path: str = None,
+    explicit_config: Optional[dict] = None
+) -> Dict[str, str]:
+    
+    # 1. 설정 파일 로드
+    if config_path is None:
+        base_dir = Path(__file__).resolve().parent
+        config_path = base_dir / "config" / "default.yaml"
+    
+    config_p = Path(config_path)
+    yaml_config = explicit_config or {}
+    
+    if not yaml_config and config_p.exists():
+        with open(config_p, 'r', encoding='utf-8') as f:
+            yaml_config = yaml.safe_load(f)
 
-    input_cfg = yaml_config.get('input_mode', {})
-    mode = input_cfg.get('type', 'internal')
-
-    if mode == 'external':
-        src = input_cfg.get('external', {}).get('source_path', '')
-        ref = input_cfg.get('external', {}).get('reference_path', '')
-        print(f"ℹ️  [Input] Using YAML External Mode.")
-        return Path(src), Path(ref)
+    # 2. 경로 결정 로직 (Standalone vs Module)
+    final_src_path = None
+    final_ref_path = None
+    final_output_dir = None
+    
+    # [Case A] Module Mode: 외부에서 경로를 주입받음
+    if source_path is not None and reference_path is not None:
+        print("ℹ️  [API] Module Mode: 외부 경로를 사용합니다.")
+        final_src_path = Path(source_path)
+        final_ref_path = Path(reference_path)
+        # 외부 경로가 들어왔는데 output_root가 없으면 기본 'outputs' 사용
+        final_output_dir = Path(output_root) if output_root else Path("outputs")
+        
+    # [Case B] Standalone Mode: 내부 'io' 폴더 사용
     else:
-        # Internal Mode
-        internal_cfg = input_cfg.get('internal', {})
-        root = internal_cfg.get('root_dir', 'inputs')
-        src_dir_name = internal_cfg.get('src_dir', 'src')
-        ref_dir_name = internal_cfg.get('ref_dir', 'ref')
+        print("ℹ️  [API] Standalone Mode: 내부 'io' 폴더를 탐색합니다.")
         
-        project_root = Path(__file__).parent.parent
-        inputs_root = project_root / root
+        # [수정됨] api.py(pose_transfer/)의 상위 폴더(PoseExtractor/)를 기준으로 io를 찾습니다.
+        project_root = Path(__file__).resolve().parent.parent
+        io_dir = project_root / "io"  
         
-        src_dir_path = inputs_root / src_dir_name
-        ref_dir_path = inputs_root / ref_dir_name
+        src_dir = io_dir / "inputs" / "src"
+        ref_dir = io_dir / "inputs" / "ref"
         
-        print(f"ℹ️  [Input] Internal Mode: Scanning folders...")
-
-        def find_first_image(directory: Path, label: str) -> Path:
+        # 출력 경로도 io/outputs로 자동 설정
+        final_output_dir = io_dir / "outputs" if output_root is None else Path(output_root)
+        
+        # 자동 검색 헬퍼 함수
+        def find_first_image(directory: Path) -> Path:
             if not directory.exists():
-                raise FileNotFoundError(f"❌ '{label}' directory not found: {directory}")
+                raise FileNotFoundError(
+                    f"❌ 테스트용 폴더가 없습니다.\n"
+                    f"👉 경로: {directory}\n"
+                    f"💡 프로젝트 최상위 폴더에 'io/inputs/src' 폴더를 만들고 이미지를 넣어주세요."
+                )
             
             valid_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
             files = [p for p in directory.iterdir() if p.is_file() and p.suffix.lower() in valid_exts]
             
             if not files:
-                raise FileNotFoundError(f"❌ No images found in '{label}' directory: {directory}")
-            
+                raise FileNotFoundError(f"❌ '{directory.name}' 폴더가 비어있습니다: {directory}")
             return files[0]
 
-        src_p = find_first_image(src_dir_path, "src")
-        ref_p = find_first_image(ref_dir_path, "ref")
-        
-        print(f"    👉 Source: {src_p.name}")
-        print(f"    👉 Reference: {ref_p.name}")
+        try:
+            final_src_path = find_first_image(src_dir)
+            final_ref_path = find_first_image(ref_dir)
+            print(f"    👉 Source: {final_src_path.name}")
+            print(f"    👉 Reference: {final_ref_path.name}")
+            print(f"    👉 Output: {final_output_dir}")
+        except Exception as e:
+            # 더 명확한 에러 메시지 전달
+            print(f"\n[오류 해결 가이드]")
+            print(f"1. 폴더 구조 확인: {io_dir}")
+            print(f"2. 이미지 파일 확인: jpg, png 등")
+            raise RuntimeError(f"테스트 준비 실패: {e}")
 
-        return src_p, ref_p
+    # 3. 파일 존재 확인
+    if not final_src_path.exists():
+        raise FileNotFoundError(f"Source file not found: {final_src_path}")
+    if not final_ref_path.exists():
+        raise FileNotFoundError(f"Reference file not found: {final_ref_path}")
 
-# ====================================================
-# [API] 외부에서 호출하는 핵심 함수
-# ====================================================
-def execute_pose_transfer(
-    source_path: Union[str, Path],
-    reference_path: Union[str, Path],
-    output_root: str = "outputs",
-    config_path: str = "pose_transfer/config/default.yaml",
-    explicit_config: Optional[dict] = None
-) -> Dict[str, str]:
-    
-    src_p = Path(source_path)
-    ref_p = Path(reference_path)
-    
-    if not src_p.exists():
-        raise FileNotFoundError(f"Source file not found: {src_p}")
-    if not ref_p.exists():
-        raise FileNotFoundError(f"Reference file not found: {ref_p}")
-
-    # 설정 로드
-    yaml_config = explicit_config or {}
-    if not yaml_config and Path(config_path).exists():
-        with open(config_path, 'r', encoding='utf-8') as f:
-            yaml_config = yaml.safe_load(f)
-            
-    if Path(config_path).exists():
-        pipeline_config = PipelineConfig.from_yaml(str(config_path))
+    # 4. 파이프라인 설정
+    if config_p.exists():
+        pipeline_config = PipelineConfig.from_yaml(str(config_p))
     else:
         pipeline_config = PipelineConfig()
 
-    # 출력 옵션 확인
+    # 출력 옵션 로드
     output_cfg = yaml_config.get('output', {})
     do_save_json = output_cfg.get('save_json', True)
     do_save_skel = output_cfg.get('save_skeleton_image', True)
     do_save_debug = output_cfg.get('save_debug_image', False)
 
-    system_cfg = yaml_config.get('system', {})
-    enable_archiving = system_cfg.get('enable_archiving', False)
-    retain_inputs = system_cfg.get('retain_inputs', False)
-
+    # 작업 ID 생성
     date_str = datetime.now().strftime("%Y%m%d")
     time_str = datetime.now().strftime("%H%M%S")
-    job_id = f"{date_str}_{time_str}_{src_p.stem}_to_{ref_p.stem}"
+    job_id = f"{date_str}_{time_str}_{final_src_path.stem}_to_{final_ref_path.stem}"
     
-    out_dirs = _setup_directories(output_root, job_id)
+    # 출력 디렉토리 생성
+    out_dirs = _setup_directories(str(final_output_dir), job_id)
 
     print(f"\n🚀 [Start Job] {job_id}")
 
@@ -118,56 +125,48 @@ def execute_pose_transfer(
         pipeline = PoseTransferPipeline(pipeline_config, yaml_config=yaml_config)
         
         print("📊 Analyzing Inputs...")
-        _save_analysis(pipeline, src_p, out_dirs["src"], "src", do_save_json, do_save_skel, do_save_debug)
-        _save_analysis(pipeline, ref_p, out_dirs["ref"], "ref", do_save_json, do_save_skel, do_save_debug)
+        _save_analysis(pipeline, final_src_path, out_dirs["src"], "src", do_save_json, do_save_skel, do_save_debug)
+        _save_analysis(pipeline, final_ref_path, out_dirs["ref"], "ref", do_save_json, do_save_skel, do_save_debug)
         
         print("✨ Running Transfer...")
-        result = pipeline.transfer(src_p, ref_p)
+        result = pipeline.transfer(final_src_path, final_ref_path)
         
         res_paths = {}
         
-        # [NEW] 확장된 배경 이미지 저장 (trans_bg.jpg)
+        # 1. 배경 저장 (trans_bg.jpg)
         path_bg = out_dirs["trans"] / "trans_bg.jpg"
-        # result.modified_source_image가 있으면 저장, 없으면 원본 저장
-        final_bg = result.modified_source_image if result.modified_source_image is not None else load_image(src_p)
+        final_bg = result.modified_source_image if result.modified_source_image is not None else load_image(final_src_path)
         save_image(final_bg, str(path_bg))
         res_paths['background'] = str(path_bg)
 
-        # 1. JSON 저장
+        # 2. JSON 저장
         if do_save_json:
             path_json = out_dirs["trans"] / "trans_kp.json"
             save_json(result.to_json(), str(path_json))
             res_paths['json'] = str(path_json)
         
-        # 2. Skeleton 저장
+        # 3. Skeleton 저장
         if do_save_skel:
             path_skel = out_dirs["trans"] / "trans_sk.jpg"
             save_image(result.skeleton_image, str(path_skel))
             res_paths['skeleton'] = str(path_skel)
         
-        # 3. Overlay (Debug) 저장
+        # 4. Overlay 저장
         if do_save_debug:
             path_overlay = out_dirs["trans"] / "trans_rend.jpg"
-            # [중요] 확장된 배경(final_bg) 위에 그려야 좌표가 맞음
             overlay = pipeline.renderer.render(final_bg, result.transferred_keypoints, result.transferred_scores)
             save_image(overlay, str(path_overlay))
             res_paths['overlay'] = str(path_overlay)
         
-        # 디버그 Bbox 이미지 저장
+        # Debug BBox 저장
         if result.src_debug_image is not None:
-            path_debug_src = out_dirs["src"] / "src_debug_bbox.jpg"
-            save_image(result.src_debug_image, str(path_debug_src))
-            
+            save_image(result.src_debug_image, str(out_dirs["src"] / "src_debug_bbox.jpg"))
         if result.ref_debug_image is not None:
-            path_debug_ref = out_dirs["ref"] / "ref_debug_bbox.jpg"
-            save_image(result.ref_debug_image, str(path_debug_ref))
+            save_image(result.ref_debug_image, str(out_dirs["ref"] / "ref_debug_bbox.jpg"))
 
         res_paths['job_dir'] = str(out_dirs['root'])
         
-        print(f"✅ Finished Job")
-        
-        _cleanup_inputs(src_p, ref_p, enable_archiving, retain_inputs)
-        
+        print(f"✅ Finished Job: {out_dirs['root']}")
         return res_paths
 
     except Exception as e:
@@ -200,28 +199,3 @@ def _save_analysis(pipeline, image_path: Path, output_dir: Path, prefix: str, sa
         save_image(skel_img, str(output_dir / f"{prefix}_sk.jpg"))
     if save_debug_flag:
         save_image(overlay_img, str(output_dir / f"{prefix}_rend.jpg"))
-
-def _cleanup_inputs(src_path: Path, ref_path: Path, enable_archiving: bool, retain_inputs: bool, archive_root: str = "archive"):
-    if retain_inputs:
-        print("🛡️  Inputs retained (System setting: retain_inputs=True)")
-        return
-
-    if enable_archiving:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        archive_dir = Path(archive_root)
-        (archive_dir / "src").mkdir(parents=True, exist_ok=True)
-        (archive_dir / "ref").mkdir(parents=True, exist_ok=True)
-        
-        dest_src = archive_dir / "src" / f"{timestamp}_{src_path.name}"
-        dest_ref = archive_dir / "ref" / f"{timestamp}_{ref_path.name}"
-        
-        shutil.move(str(src_path), str(dest_src))
-        shutil.move(str(ref_path), str(dest_ref))
-        print(f"📦 Archived inputs to {archive_dir}")
-    else:
-        try:
-            if src_path.exists(): os.remove(str(src_path))
-            if ref_path.exists(): os.remove(str(ref_path))
-            print("🗑️  Cleaned up input files (Volatile)")
-        except Exception as e:
-            print(f"⚠️ Failed to delete inputs: {e}")
