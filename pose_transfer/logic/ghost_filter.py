@@ -324,9 +324,17 @@ class GhostFilter:
         return FilterResult(filtered_scores, removed_indices, removal_reasons)
 
     def compute_intersection(self, src_scores, ref_scores, threshold):
-        return (src_scores > threshold) & (ref_scores > threshold)
+        """
+        ❌ 기존: src AND ref 교집합 (src에 없으면 제외)
+        ✅ 변경: ref 기준 (ref에 있으면 포함)
+        """
+        # ref에 있는 키포인트를 모두 포함 (src 여부 무관)
+        return ref_scores > threshold
     
     def apply_intersection_mask(self, kpts, scores, mask):
+        """
+        ref 기준 마스크 적용
+        """
         s = scores.copy()
         s[~mask] = 0.0
         return kpts, s

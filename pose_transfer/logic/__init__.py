@@ -21,6 +21,9 @@ from .ghost_filter import (
     filter_keypoints
 )
 
+# [v3.2] Keypoint Generator - 누락 키포인트 생성
+from .keypoint_generator import KeypointGenerator
+
 __all__ = [
     # Bbox
     'BboxManager', 
@@ -41,5 +44,7 @@ __all__ = [
     'GhostFilterConfig',
     'FilterResult',
     'create_ghost_filter',
-    'filter_keypoints'
+    'filter_keypoints',
+    # Keypoint Generator v3.2
+    'KeypointGenerator',
 ]

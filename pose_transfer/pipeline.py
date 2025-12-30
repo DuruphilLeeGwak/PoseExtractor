@@ -487,22 +487,22 @@ class PoseTransferPipeline:
         else:
             print(f"   ✅ Ref: 이탈 없음")
         
-        # [STEP 3] Src ∩ Ref 교집합 계산
-        print("\n[STEP 3] Ghost Filter - Src ∩ Ref 교집합 계산...")
+        # [STEP 3] Ref 기준 마스크 계산 (교집합 아님!)
+        print("\n[STEP 3] Ghost Filter - Ref 기준 키포인트 선택...")
         intersection_mask = self.ghost_filter.compute_intersection(
             src_filtered_scores, ref_filtered_scores, self.config.ghost_confidence_threshold
         )
-        print(f"   최종 매칭된 Keypoints: {np.sum(intersection_mask)}개")
+        print(f"   Ref 기준 선택된 Keypoints: {np.sum(intersection_mask)}개")
         
-        # 발 키포인트 교집합 상태 확인
+        # 발 키포인트 ref 기준 상태 확인
         feet_indices = [15, 16, 17, 18, 19, 20, 21, 22]
-        print(f"\n   🦶 발 키포인트 교집합 상태:")
+        print(f"\n   🦶 발 키포인트 Ref 기준 상태:")
         for idx in feet_indices:
             src_score = src_filtered_scores[idx]
             ref_score = ref_filtered_scores[idx]
-            in_intersection = intersection_mask[idx]
-            status = "✅" if in_intersection else "❌"
-            print(f"      {status} idx={idx}: src={src_score:.3f}, ref={ref_score:.3f}, intersection={in_intersection}")
+            in_mask = intersection_mask[idx]
+            status = "✅" if in_mask else "❌"
+            print(f"      {status} idx={idx}: src={src_score:.3f}, ref={ref_score:.3f}, ref_based={in_mask}")
         
         # [STEP 4] 정렬 방식 결정 (단순화)
         print("\n[STEP 4] Determining alignment strategy...")
@@ -538,8 +538,8 @@ class PoseTransferPipeline:
             should_transfer_lower
         )
         
-        # [STEP 8] 교집합 마스크 적용
-        print("\n[STEP 8] Ghost Filter - 교집합 마스크 적용...")
+        # [STEP 8] Ref 기준 마스크 적용
+        print("\n[STEP 8] Ghost Filter - Ref 기준 마스크 적용...")
         _, trans_scores = self.ghost_filter.apply_intersection_mask(trans_kpts, trans_scores, intersection_mask)
         
         # [STEP 9] Scaling

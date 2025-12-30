@@ -6,14 +6,16 @@ class HandTransfer:
     def transfer(self, t_kpts, t_scores, s_kpts, s_scores, scale, log):
         """손 전이: Source 손 형태를 유지하되 전이된 손목 위치에 배치"""
         print("\n" + "="*60)
-        print("🖐️ HandTransfer - Using SOURCE hands")
+        print("🖐️ [DEBUG] HandTransfer.transfer() - Using SOURCE hands")
         print("="*60)
+        print(f"   global_scale: {scale:.3f}")
         
         for is_left in [True, False]:
             side = "LEFT" if is_left else "RIGHT"
             w_name = 'left_wrist' if is_left else 'right_wrist'
             w_idx = BODY_KEYPOINTS[w_name]
             
+            # 손목이 전이되지 않았으면 손도 스킵
             if t_scores[w_idx] == 0:
                 print(f"\n   [{side}] trans wrist score=0, SKIP")
                 continue
@@ -26,6 +28,7 @@ class HandTransfer:
             print(f"      src_wrist: ({src_wrist[0]:.1f}, {src_wrist[1]:.1f})")
             print(f"      trans_wrist: ({trans_wrist[0]:.1f}, {trans_wrist[1]:.1f})")
             
+            # src 손 크기 계산
             middle_tip_idx = start + 12
             src_hand_len = 0
             if s_scores[middle_tip_idx] > 0.2:
@@ -35,15 +38,25 @@ class HandTransfer:
             transferred_count = 0
             for i in range(21):
                 idx = start + i
+                # SOURCE 손 사용!
                 if s_scores[idx] > 0.2:
+                    # src 손목 기준 상대 좌표
                     rel = s_kpts[idx] - src_wrist
+                    # trans 손목에 배치 (크기 그대로 유지)
                     t_kpts[idx] = trans_wrist + rel
                     t_scores[idx] = s_scores[idx]
                     transferred_count += 1
             
-            print(f"      transferred: {transferred_count}/21 keypoints from SOURCE")
+            print(f"      transferred: {transferred_count}/21 keypoints")
             
-            if t_scores[middle_tip_idx] > 0 and src_hand_len > 0:
+            # 전이 후 손 크기 확인
+            if t_scores[middle_tip_idx] > 0 and ref_hand_len > 0:
                 trans_hand_len = calculate_distance(t_kpts[w_idx], t_kpts[middle_tip_idx])
                 print(f"      trans_hand_length: {trans_hand_len:.1f}px")
-                print(f"      size ratio: {trans_hand_len/src_hand_len:.3f} (should be ~1.0)")
+                print(f"      actual_ratio (trans/ref): {trans_hand_len/ref_hand_len:.3f}")
+                print(f"      expected_ratio (global_scale): {scale:.3f}")
+                
+                if abs(trans_hand_len/ref_hand_len - scale) > 0.01:
+                    print(f"      ✅ Scale applied correctly")
+                else:
+                    print(f"      ⚠️ Check scale application")

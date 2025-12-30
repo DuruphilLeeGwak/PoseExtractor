@@ -110,10 +110,8 @@ class PoseTransferEngine:
         print("-"*50)
         
         # [Body: Upper]
-        torso_ratio = self._calculate_torso_ratio(source_keypoints, source_scores, reference_keypoints, reference_scores)
         self.body_logic.transfer_shoulders(
-            trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints,
-            torso_ratio=torso_ratio, processed=processed, log=transfer_log, r_scores=reference_scores
+            trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, processed, transfer_log
         )
         self.body_logic.transfer_torso(
             trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, global_scale, processed, transfer_log
@@ -166,8 +164,7 @@ class PoseTransferEngine:
 
         # [Hands]
         if self.config.use_hands:
-            print("\n✋ Hands Transfer (scaled)...")
-            self._transfer_hands(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, global_scale)
+            self.hand_logic.transfer(trans_kpts, trans_scores, reference_keypoints, reference_scores, global_scale, transfer_log)
 
         print("\n" + "="*70)
         print("🔍 [DEBUG] PoseTransferEngine.transfer() END")
@@ -175,101 +172,6 @@ class PoseTransferEngine:
 
         return TransferResult(trans_kpts, trans_scores, corrected_lengths, {}, transfer_log)
     
-
-
-    def _transfer_hands(self, trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores, global_scale):
-        """손 전이: src 우선, src 없으면 ref 사용"""
-        print("\n" + "="*60)
-        print("🖐️ _transfer_hands() START")
-        print("="*60)
-        print(f"   global_scale: {global_scale:.3f}")
-        
-        LW, RW = 9, 10
-        
-        hands = [
-            (LW, 91, 112, "Left"),
-            (RW, 112, 133, "Right")
-        ]
-        
-        for wrist_idx, start, end, side in hands:
-            print(f"\n   [{side}] Checking wrist...")
-            print(f"      wrist_idx={wrist_idx}")
-            print(f"      trans_wrist_score={trans_scores[wrist_idx]:.3f}")
-            
-            if trans_scores[wrist_idx] < 0.1:
-                print(f"      ❌ trans wrist score < 0.1, SKIP")
-                continue
-            
-            trans_wrist = trans_kpts[wrist_idx]
-            
-            # 전략: src 손 우선, 없으면 ref 손 사용
-            src_hand_count = sum(1 for i in range(start, min(end, len(src_scores))) if src_scores[i] > 0.2)
-            ref_hand_count = sum(1 for i in range(start, min(end, len(ref_scores))) if ref_scores[i] > 0.2)
-            
-            print(f"      src_hand_count={src_hand_count}/21")
-            print(f"      ref_hand_count={ref_hand_count}/21")
-            
-            if src_hand_count > 5:
-                # Src 손 사용
-                src_wrist = src_kpts[wrist_idx]
-                transferred = 0
-                for idx in range(start, end):
-                    if idx < len(src_scores) and src_scores[idx] > 0.2:
-                        rel = src_kpts[idx] - src_wrist
-                        trans_kpts[idx] = trans_wrist + rel
-                        trans_scores[idx] = src_scores[idx]
-                        transferred += 1
-                print(f"      ✅ Used SOURCE: {transferred}/21 keypoints")
-            
-            elif ref_hand_count > 5:
-                # Ref 손 사용 (global_scale 적용)
-                print(f"      → Using REFERENCE (src_hand_count={src_hand_count} <= 5)")
-                ref_wrist = ref_kpts[wrist_idx]
-                transferred = 0
-                for idx in range(start, end):
-                    if idx < len(ref_scores) and ref_scores[idx] > 0.2:
-                        rel = ref_kpts[idx] - ref_wrist
-                        scaled_rel = rel * global_scale
-                        trans_kpts[idx] = trans_wrist + scaled_rel
-                        trans_scores[idx] = ref_scores[idx] * 0.9
-                        transferred += 1
-                print(f"      ✅ Used REFERENCE (scaled): {transferred}/21 keypoints")
-            
-            else:
-                print(f"      ⚠️ No valid hand in both src and ref (src={src_hand_count}, ref={ref_hand_count})")
-
-    def _calculate_torso_ratio(self, src_kpts, src_scores, ref_kpts, ref_scores):
-        """몸통 길이 기반 비율 (시점 독립적)"""
-        l_sh, r_sh = BODY_KEYPOINTS['left_shoulder'], BODY_KEYPOINTS['right_shoulder']
-        l_hip, r_hip = BODY_KEYPOINTS['left_hip'], BODY_KEYPOINTS['right_hip']
-        
-        # Src torso length
-        if (src_scores[l_sh] > 0.3 and src_scores[r_sh] > 0.3 and
-            src_scores[l_hip] > 0.3 and src_scores[r_hip] > 0.3):
-            src_neck = (src_kpts[l_sh] + src_kpts[r_sh]) / 2
-            src_root = (src_kpts[l_hip] + src_kpts[r_hip]) / 2
-            src_torso = calculate_distance(src_neck, src_root)
-        else:
-            return 1.0
-        
-        # Ref torso length
-        if (ref_scores[l_sh] > 0.3 and ref_scores[r_sh] > 0.3 and
-            ref_scores[l_hip] > 0.3 and ref_scores[r_hip] > 0.3):
-            ref_neck = (ref_kpts[l_sh] + ref_kpts[r_sh]) / 2
-            ref_root = (ref_kpts[l_hip] + ref_kpts[r_hip]) / 2
-            ref_torso = calculate_distance(ref_neck, ref_root)
-        else:
-            return 1.0
-        
-        if ref_torso < 1e-6:
-            return 1.0
-        
-        ratio = src_torso / ref_torso
-        # Clamp to prevent extreme shoulder narrowing
-        clamped = float(np.clip(ratio, 0.85, 1.25))
-        print(f"   📏 Torso Ratio: src={src_torso:.1f}, ref={ref_torso:.1f} → {ratio:.3f} (clamped={clamped:.3f})")
-        return clamped
-
     def _calculate_global_scale(self, src_props, ref_kpts, ref_scores):
         src_w = src_props.shoulder_width
         l_sh, r_sh = BODY_KEYPOINTS['left_shoulder'], BODY_KEYPOINTS['right_shoulder']
