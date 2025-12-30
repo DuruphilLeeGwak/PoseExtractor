@@ -1,11 +1,14 @@
 """
-Logic Module - 정렬, BBox, 후처리, Ghost Filter 등
+Logic Module - 정렬, BBox, 후처리, Ghost Filter 등 (Refactored v2.0)
+
+변경사항:
+- AlignmentCase, BodyType Enum 제거 (단순화)
 """
 from .bbox_manager import (
     BboxManager, BboxInfo, DebugBboxData, 
     COLOR_KPT_BBOX, COLOR_YOLO_BBOX, COLOR_HYBRID_PERSON, COLOR_HYBRID_FACE
 )
-from .align_manager import AlignManager, AlignmentCase, BodyType
+from .align_manager import AlignManager
 from .post_processor import PostProcessor
 from .canvas_manager import CanvasManager
 
@@ -29,8 +32,6 @@ __all__ = [
     'COLOR_HYBRID_FACE',
     # Align
     'AlignManager', 
-    'AlignmentCase', 
-    'BodyType',
     # Post
     'PostProcessor',
     # Canvas

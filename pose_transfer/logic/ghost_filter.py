@@ -70,8 +70,8 @@ class GhostFilterConfig:
     # [E] 계층적 연결성 검사 (Consistency Check)
     check_consistency: bool = True
     
-    # [F] 하단 강제 절삭
-    hard_bottom_check: bool = True
+    # [F] 하단 강제 절삭 (발 키포인트 보존 위해 비활성화)
+    hard_bottom_check: bool = False  # ⚠️ True로 설정 시 이미지 하단 키포인트 무조건 제거
     hard_bottom_threshold: float = 0.95
     
     # [G] 스마트 손-발 중첩 방지
@@ -161,11 +161,14 @@ class GhostFilter:
         # =========================================================
         if self.config.check_boundary_values:
             tol = self.config.boundary_tolerance
+            feet_indices = [15, 16, 17, 18, 19, 20, 21, 22]  # 발목+발끝
             for i in range(len(keypoints)):
                 if scores[i] < self.config.confidence_threshold: continue
                 x, y = keypoints[i]
                 # 상하좌우 모든 경계 체크
                 if x <= tol or x >= w-tol or y <= tol:
+                    if i in feet_indices:
+                        print(f"   [GhostFilter] 🦶 Foot keypoint {i} at boundary: ({x:.1f}, {y:.1f}) - REMOVED by boundary check")
                     remove(i, f"boundary_val({x:.0f},{y:.0f})")
 
         # =========================================================
@@ -280,6 +283,7 @@ class GhostFilter:
         # [Step 5] 계층적 연결성 검사 (Chain Kill)
         # =========================================================
         if self.config.check_consistency:
+            feet_indices = [15, 16, 17, 18, 19, 20, 21, 22]
             for _ in range(3):
                 for child, parent in self.hierarchy_rules.items():
                     if child < len(filtered_scores) and filtered_scores[child] > 0.01:
@@ -290,6 +294,8 @@ class GhostFilter:
                         
                         if parent_dead:
                             p_name = str(parent)
+                            if child in feet_indices or parent in feet_indices:
+                                print(f"   [GhostFilter] 🦶 Foot chain kill: child={child} removed (parent={parent} dead)")
                             remove(child, f"orphan_node(parent_{p_name}_dead)")
 
         # =========================================================

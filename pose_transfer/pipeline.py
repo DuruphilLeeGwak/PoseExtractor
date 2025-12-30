@@ -1,10 +1,10 @@
 """
-포즈 전이 파이프라인 v18 (Log Clean-up & Margin Fix)
+포즈 전이 파이프라인 v19 (Refactored Alignment)
 
 변경사항:
-1. 불필요한 Lower Body Raw Score 로그 제거
-2. Ghost Filter v3.1 통합 (Margin 설정 적용)
-3. 프레임 경계 5% 영역 이탈 시 즉시 절삭 로직 강화
+1. AlignManager 단순화 (Body Type 판별 로직 제거)
+2. Case Enum 제거, Boolean 기반 정렬 방식 적용
+3. GhostFilter가 키포인트 유효성 검증 전담
 """
 import cv2
 import numpy as np
@@ -25,7 +25,7 @@ from .utils import load_config, convert_to_openpose_format, load_image
 # Logic Modules
 from .logic import (
     BboxManager, AlignManager, PostProcessor, CanvasManager,
-    AlignmentCase, BodyType, DebugBboxData, BboxInfo,
+    DebugBboxData, BboxInfo,
     COLOR_KPT_BBOX, COLOR_YOLO_BBOX, COLOR_HYBRID_PERSON, COLOR_HYBRID_FACE
 )
 
@@ -209,15 +209,14 @@ class PipelineConfig:
 
 @dataclass
 class AlignmentInfo:
-    """정렬 정보"""
-    case: AlignmentCase
-    src_body_type: BodyType
-    ref_body_type: BodyType
+    """정렬 정보 (단순화)"""
+    should_transfer_lower: bool  # 하반신 전이 여부
+    align_by_feet: bool  # 발 정렬 사용 여부
     src_person_bbox: Any
     src_face_bbox: Any
     ref_face_bbox: Any
     face_scale_ratio: float
-    alignment_method: str
+    alignment_method: str  # "feet" or "face"
     yolo_log: Dict[str, bool]
 
 
@@ -381,14 +380,22 @@ class PoseTransferPipeline:
         trans_kpts: np.ndarray,
         trans_scores: np.ndarray,
         src_face: Any,
-        case: AlignmentCase,
+        align_by_feet: bool,
     ) -> Tuple[np.ndarray, float]:
-        """Src 얼굴 크기에 맞춰 Trans 스케일을 동기화.
-
+        """
+        Source 얼굴 크기에 맞춰 전이된 키포인트 스케일 동기화
+        
+        Args:
+            trans_kpts: 전이된 키포인트
+            trans_scores: 키포인트 신뢰도
+            src_face: Source 얼굴 bbox
+            align_by_feet: 발 정렬 사용 여부
+        
         정책:
-        - F_F: 발(바닥) 정렬 안정성을 위해 "얼굴 관련 키포인트만" Pivot 기준으로 스케일링
-        - 그 외: 기존 동작 유지(전체 키포인트를 동일 배율로 스케일링)
-
+        - align_by_feet=True (발 정렬): 얼굴 관련 키포인트만 Pivot 기준 스케일링
+          (바닥 정렬 안정성을 위해 하체는 그대로 유지)
+        - align_by_feet=False (얼굴 정렬): 전체 키포인트 동일 배율 스케일링
+        
         Returns:
             (scaled_trans_kpts, scale_factor)
         """
@@ -405,8 +412,8 @@ class PoseTransferPipeline:
 
         scaled = trans_kpts.copy()
 
-        # F_F에서는 얼굴만 스케일링 (바디/발 정렬 영향 최소화)
-        if case == AlignmentCase.F_F:
+        # 발 정렬 모드: 얼굴만 스케일링 (바디/발 정렬 영향 최소화)
+        if align_by_feet:
             # 얼굴 관련 인덱스: body(0~4) + face(23~90)
             face_indices = list(range(0, 5)) + list(range(23, 91))
 
@@ -426,7 +433,7 @@ class PoseTransferPipeline:
 
             return scaled, scale_factor
 
-        # 기존 동작: 전체 스켈레톤 스케일링
+        # 얼굴 정렬 모드: 전체 스켈레톤 스케일링
         scaled *= scale_factor
         return scaled, scale_factor
 
@@ -458,6 +465,14 @@ class PoseTransferPipeline:
         
         if src_filter_result.removed_indices:
             print(f"   🔍 Src 이탈(삭제됨): {len(src_filter_result.removed_indices)}개")
+            # 발 키포인트 확인 (15-22: ankles, toes, heels)
+            feet_indices = [15, 16, 17, 18, 19, 20, 21, 22]
+            removed_feet = [idx for idx in src_filter_result.removed_indices if idx in feet_indices]
+            if removed_feet:
+                print(f"      🦶 발 키포인트 삭제됨: {removed_feet}")
+                for idx in removed_feet:
+                    reason = src_filter_result.removal_reasons.get(idx, "unknown")
+                    print(f"         idx={idx}: {reason}")
         else:
             print(f"   ✅ Src: 이탈 없음")
             
@@ -479,12 +494,22 @@ class PoseTransferPipeline:
         )
         print(f"   최종 매칭된 Keypoints: {np.sum(intersection_mask)}개")
         
-        # [STEP 4] Body Type 판별
-        print("\n[STEP 4] Determining Body Type...")
-        src_type, ref_type, case = self.align_mgr.determine_case(
-            src_kpts, src_filtered_scores, ref_kpts, ref_filtered_scores
+        # 발 키포인트 교집합 상태 확인
+        feet_indices = [15, 16, 17, 18, 19, 20, 21, 22]
+        print(f"\n   🦶 발 키포인트 교집합 상태:")
+        for idx in feet_indices:
+            src_score = src_filtered_scores[idx]
+            ref_score = ref_filtered_scores[idx]
+            in_intersection = intersection_mask[idx]
+            status = "✅" if in_intersection else "❌"
+            print(f"      {status} idx={idx}: src={src_score:.3f}, ref={ref_score:.3f}, intersection={in_intersection}")
+        
+        # [STEP 4] 정렬 방식 결정 (단순화)
+        print("\n[STEP 4] Determining alignment strategy...")
+        should_transfer_lower, align_by_feet = self.align_mgr.should_align_by_feet(
+            src_filtered_scores, ref_filtered_scores
         )
-        print(f"   Result: Case {case.value} ({src_type.value} → {ref_type.value})")
+        print(f"   Result: transfer_lower={should_transfer_lower}, align_by_feet={align_by_feet}")
         
         # [STEP 5] Bbox 계산
         src_person, src_face, src_debug = self.bbox_mgr.get_bboxes(src_img, src_kpts, src_filtered_scores)
@@ -503,23 +528,26 @@ class PoseTransferPipeline:
         result = self.transfer_engine.transfer(
             src_kpts, src_filtered_scores, ref_kpts, ref_filtered_scores,
             source_image_size=(src_h, src_w), reference_image_size=(ref_h, ref_w),
-            alignment_case=case.value
+            should_transfer_lower_body=should_transfer_lower
         )
         trans_kpts, trans_scores = result.keypoints, result.scores
         
         # [STEP 7] Post-processing
-        trans_kpts, trans_scores = self.post_proc.process_by_case(trans_kpts, trans_scores, case, src_filtered_scores)
+        trans_kpts, trans_scores = self.post_proc.process(
+            trans_kpts, trans_scores, src_filtered_scores, ref_filtered_scores,
+            should_transfer_lower
+        )
         
         # [STEP 8] 교집합 마스크 적용
         print("\n[STEP 8] Ghost Filter - 교집합 마스크 적용...")
         _, trans_scores = self.ghost_filter.apply_intersection_mask(trans_kpts, trans_scores, intersection_mask)
         
         # [STEP 9] Scaling
-        trans_kpts, scale = self._sync_scale_to_source_face(trans_kpts, trans_scores, src_face, case)
+        trans_kpts, scale = self._sync_scale_to_source_face(trans_kpts, trans_scores, src_face, align_by_feet)
         
         # [STEP 10] Aligning
         trans_kpts = self.align_mgr.align_coordinates(
-            trans_kpts, trans_scores, case, src_person, src_face,
+            trans_kpts, trans_scores, align_by_feet, src_person, src_face,
             lambda k, s: self.bbox_mgr._kpt_to_face_public(k, s)
         )
         
@@ -544,7 +572,15 @@ class PoseTransferPipeline:
         final_h, final_w = final_size
         
         # [STEP 13] 최종 프레임 이탈 체크
+        # ⚠️ Chain Kill 비활성화: Transfer 완료 후에는 부모-자식 관계 체크하지 않음
+        # (교집합 마스크로 인해 부모가 score=0일 수 있음)
+        original_check_consistency = self.ghost_filter.config.check_consistency
+        self.ghost_filter.config.check_consistency = False
+        
         final_filtered_scores, final_filter_result = self._apply_ghost_filter_single(final_kpts, trans_scores, final_size)
+        
+        # Config 복원
+        self.ghost_filter.config.check_consistency = original_check_consistency
         
         # [RENDER] Skeleton
         skeleton_image = self.renderer.render_skeleton_only((final_h, final_w, 3), final_kpts, final_filtered_scores)
@@ -558,9 +594,13 @@ class PoseTransferPipeline:
         }
         
         align_info = AlignmentInfo(
-            case=case, src_body_type=src_type, ref_body_type=ref_type,
-            src_person_bbox=src_person, src_face_bbox=src_face, ref_face_bbox=ref_face,
-            face_scale_ratio=scale, alignment_method="feet" if case == AlignmentCase.F_F else "face",
+            should_transfer_lower=should_transfer_lower,
+            align_by_feet=align_by_feet,
+            src_person_bbox=src_person, 
+            src_face_bbox=src_face, 
+            ref_face_bbox=ref_face,
+            face_scale_ratio=scale, 
+            alignment_method="feet" if align_by_feet else "face",
             yolo_log={'person': src_debug.yolo_person is not None}
         )
         

@@ -1,6 +1,9 @@
 """
-Pose Transfer Engine Module (v12 - Case-aware Lower Body Control)
-Case naming: F_F, F_H, H_F, H_H (Full/Half × src/ref)
+Pose Transfer Engine Module (v13 - Simplified Boolean Control)
+
+변경사항:
+- Case Enum 제거 (F_F, F_H, H_F, H_H → Boolean 기반)
+- should_transfer_lower_body: 하반신 전이 여부만 제어
 """
 import numpy as np
 from typing import Dict, Tuple, Optional
@@ -35,25 +38,22 @@ class PoseTransferEngine:
         source_image_size: Optional[Tuple[int, int]] = None,
         reference_image_size: Optional[Tuple[int, int]] = None,
         target_image_size: Optional[Tuple[int, int]] = None,
-        alignment_case: Optional[str] = None,
+        should_transfer_lower_body: bool = True,  # 단순화된 Boolean 플래그
     ) -> TransferResult:
         """
         포즈 전이 메인 로직
         
         Args:
-            alignment_case: 'F_F', 'F_H', 'H_F', 'H_H' 중 하나
-                - F_F: Full → Full (전신→전신, 하반신 전이 O)
-                - F_H: Full → Half (전신→상반신, 하반신 전이 X)
-                - H_F: Half → Full (상반신→전신, SRC 하반신 없음)
-                - H_H: Half → Half (상반신→상반신, 하반신 전이 X)
+            should_transfer_lower_body: 하반신 전이 여부
+                - True: Reference에 발이 있어서 하반신 전이 가능
+                - False: Reference가 상반신만 있어서 하반신 전이 불가
         """
         
         print("\n" + "="*70)
         print("🔍 [DEBUG] PoseTransferEngine.transfer() START")
         print("="*70)
         
-        if alignment_case:
-            print(f"\n📋 Alignment Case: {alignment_case}")
+        print(f"\n📋 Transfer Mode: should_transfer_lower_body={should_transfer_lower_body}")
         
         # 1. 이미지 크기 추정
         if source_image_size is None:
@@ -79,31 +79,13 @@ class PoseTransferEngine:
                 print(f"                          src_pos={src_pos}, ref_pos={ref_pos}")
 
         # =====================================================================
-        # 3. 하반신 전이 여부 결정 (Case 기반 - 핵심!)
+        # 3. 하반신 전이 여부 (단순화된 Boolean 제어)
         # =====================================================================
-        # REF가 상반신(Half)인 경우 → 하반신 전이 스킵
-        # F_H: Full → Half (REF가 상반신)
-        # H_H: Half → Half (REF가 상반신)
-        if alignment_case in ['F_H', 'H_H']:
-            ref_lower_valid = False
-            print(f"\n⏭️ [Skip] Lower Body (REF is HALF, Case {alignment_case})")
-        else:
-            # F_F, H_F는 REF가 전신이므로 기존 로직으로 검증
-            ref_lower_valid = True
-            if reference_image_size:
-                ref_lower_valid = self._check_lower_body_valid(reference_keypoints, reference_scores, reference_image_size[0])
-            
-            ref_knee_score = min(
-                reference_scores[BODY_KEYPOINTS['left_knee']], 
-                reference_scores[BODY_KEYPOINTS['right_knee']]
-            )
-            print(f"   ref_knee_score (min): {ref_knee_score:.3f}")
-            
-            if ref_knee_score < 0.1:
-                ref_lower_valid = False
-                print(f"   ❌ ref_lower_valid = False (knee score < 0.1)")
+        print(f"\n🦵 should_transfer_lower_body = {should_transfer_lower_body}")
         
-        print(f"\n🦵 ref_lower_valid = {ref_lower_valid}")
+        if not should_transfer_lower_body:
+            print(f"   ⏭️ [Skip] Lower Body transfer (Reference has no valid feet)")
+
 
         # 4. 데이터 추출
         source_proportions = self.bone_calculator.calculate(source_keypoints, source_scores)
@@ -138,9 +120,9 @@ class PoseTransferEngine:
             trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, global_scale, processed, transfer_log, is_lower=False
         )
         
-        # [Body: Lower] - Case 기반 제어
-        if ref_lower_valid:
-            print("\n   🦵 [Transfer] Generating Lower Body (REF is FULL)")
+        # [Body: Lower] - Boolean 기반 제어
+        if should_transfer_lower_body:
+            print("\n   🦵 [Transfer] Generating Lower Body (REF has valid feet)")
             self.body_logic.transfer_chain(
                 trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, global_scale, processed, transfer_log, is_lower=True
             )
@@ -189,38 +171,6 @@ class PoseTransferEngine:
         print("="*70 + "\n")
 
         return TransferResult(trans_kpts, trans_scores, corrected_lengths, {}, transfer_log)
-
-    def _check_lower_body_valid(self, kpts, scores, img_h):
-        print(f"\n   🔍 [DEBUG] _check_lower_body_valid(img_h={img_h})")
-        
-        indices = [BODY_KEYPOINTS['left_knee'], BODY_KEYPOINTS['right_knee']]
-        max_score = max([scores[i] for i in indices])
-        
-        print(f"      knee indices: {indices}")
-        print(f"      knee scores: {[scores[i] for i in indices]}")
-        print(f"      max_score: {max_score:.3f}")
-        print(f"      threshold: {self.config.lower_body_confidence_threshold}")
-        
-        if max_score < self.config.lower_body_confidence_threshold:
-            print(f"      ❌ INVALID: max_score < threshold")
-            return False
-        
-        margin = img_h * self.config.lower_body_margin_ratio
-        limit = img_h - margin
-        l_y = kpts[BODY_KEYPOINTS['left_knee']][1]
-        r_y = kpts[BODY_KEYPOINTS['right_knee']][1]
-        
-        print(f"      margin_ratio: {self.config.lower_body_margin_ratio}")
-        print(f"      limit (img_h - margin): {limit:.1f}")
-        print(f"      left_knee_y: {l_y:.1f}, right_knee_y: {r_y:.1f}")
-        
-        if (l_y > limit and scores[BODY_KEYPOINTS['left_knee']] > 0.1) or \
-           (r_y > limit and scores[BODY_KEYPOINTS['right_knee']] > 0.1):
-            print(f"      ❌ INVALID: knee too close to bottom (Ghost Leg)")
-            return False
-        
-        print(f"      ✅ VALID")
-        return True
     
     def _calculate_global_scale(self, src_props, ref_kpts, ref_scores):
         src_w = src_props.shoulder_width
