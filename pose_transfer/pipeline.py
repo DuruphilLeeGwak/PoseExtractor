@@ -97,6 +97,16 @@ class PipelineConfig:
     ghost_boundary_tolerance: float = 3.0     # 경계 허용 오차 (px)
     ghost_check_clustering: bool = True       # 클러스터링 체크 on/off
     ghost_min_cluster_spread: float = 20.0    # 최소 퍼짐 정도 (px)
+
+    # [v4.6] Hand Occlusion/Hallucination Suppression (기하 기반)
+    ghost_check_hand_occlusion: bool = True
+    ghost_hand_finger_min_confidence: float = 0.1
+    ghost_hand_min_finger_points: int = 6
+    ghost_hand_wrist_radius_ratio: float = 0.8
+    ghost_hand_wrist_min_radius_px: float = 60.0
+    ghost_hand_min_near_ratio: float = 0.8
+    ghost_hand_far_outlier_ratio: float = 1.6
+    ghost_hand_max_far_points: int = 1
     
     # Bbox Margin
     person_bbox_margin: float = 0.0
@@ -175,6 +185,15 @@ class PipelineConfig:
             ghost_boundary_tolerance=ghost.get('boundary_tolerance', 3.0),
             ghost_check_clustering=ghost.get('check_clustering', True),
             ghost_min_cluster_spread=ghost.get('min_cluster_spread', 20.0),
+
+            ghost_check_hand_occlusion=ghost.get('check_hand_occlusion', ghost.get('check_hand_presence', True)),
+            ghost_hand_finger_min_confidence=ghost.get('hand_finger_min_confidence', 0.1),
+            ghost_hand_min_finger_points=ghost.get('hand_min_finger_points', ghost.get('hand_min_strong_points', 6)),
+            ghost_hand_wrist_radius_ratio=ghost.get('hand_wrist_radius_ratio', 0.8),
+            ghost_hand_wrist_min_radius_px=ghost.get('hand_wrist_min_radius_px', 60.0),
+            ghost_hand_min_near_ratio=ghost.get('hand_min_near_ratio', 0.8),
+            ghost_hand_far_outlier_ratio=ghost.get('hand_far_outlier_ratio', 1.6),
+            ghost_hand_max_far_points=ghost.get('hand_max_far_points', 1),
             
             # Bbox
             person_bbox_margin=bbox.get('person_margin', 0.0),
@@ -250,7 +269,17 @@ class PoseTransferPipeline:
             predictable_margin=self.config.ghost_predictable_margin,
             confidence_threshold=self.config.ghost_confidence_threshold,
             check_boundary_values=self.config.ghost_check_boundary_values,
-            check_clustering=self.config.ghost_check_clustering
+            check_clustering=self.config.ghost_check_clustering,
+            check_hand_occlusion=self.config.ghost_check_hand_occlusion,
+            # legacy alias for safety
+            check_hand_presence=self.config.ghost_check_hand_occlusion,
+            hand_finger_min_confidence=self.config.ghost_hand_finger_min_confidence,
+            hand_min_finger_points=self.config.ghost_hand_min_finger_points,
+            hand_wrist_radius_ratio=self.config.ghost_hand_wrist_radius_ratio,
+            hand_wrist_min_radius_px=self.config.ghost_hand_wrist_min_radius_px,
+            hand_min_near_ratio=self.config.ghost_hand_min_near_ratio,
+            hand_far_outlier_ratio=self.config.ghost_hand_far_outlier_ratio,
+            hand_max_far_points=self.config.ghost_hand_max_far_points,
         )
         self.ghost_filter.config.boundary_tolerance = self.config.ghost_boundary_tolerance
         self.ghost_filter.config.min_cluster_spread = self.config.ghost_min_cluster_spread
@@ -347,6 +376,60 @@ class PoseTransferPipeline:
         result = self.ghost_filter.filter_single(kpts, scores, image_size)
         return result.filtered_scores, result
 
+    def _sync_scale_to_source_face(
+        self,
+        trans_kpts: np.ndarray,
+        trans_scores: np.ndarray,
+        src_face: Any,
+        case: AlignmentCase,
+    ) -> Tuple[np.ndarray, float]:
+        """Src 얼굴 크기에 맞춰 Trans 스케일을 동기화.
+
+        정책:
+        - F_F: 발(바닥) 정렬 안정성을 위해 "얼굴 관련 키포인트만" Pivot 기준으로 스케일링
+        - 그 외: 기존 동작 유지(전체 키포인트를 동일 배율로 스케일링)
+
+        Returns:
+            (scaled_trans_kpts, scale_factor)
+        """
+        if not getattr(self.config, 'face_scale_enabled', True):
+            return trans_kpts, 1.0
+
+        current_trans_face = self.bbox_mgr._kpt_to_face_public(trans_kpts, trans_scores)
+        if current_trans_face.size <= 1 or src_face.size <= 1:
+            return trans_kpts, 1.0
+
+        scale_factor = float(np.clip(src_face.size / current_trans_face.size, 0.5, 2.0))
+        if abs(scale_factor - 1.0) < 1e-6:
+            return trans_kpts, 1.0
+
+        scaled = trans_kpts.copy()
+
+        # F_F에서는 얼굴만 스케일링 (바디/발 정렬 영향 최소화)
+        if case == AlignmentCase.F_F:
+            # 얼굴 관련 인덱스: body(0~4) + face(23~90)
+            face_indices = list(range(0, 5)) + list(range(23, 91))
+
+            # Pivot: 어깨(5,6) -> 목(Neck) / 없으면 얼굴 중심
+            LS, RS = 5, 6
+            if (
+                LS < len(trans_scores) and RS < len(trans_scores)
+                and trans_scores[LS] > 0.1 and trans_scores[RS] > 0.1
+            ):
+                pivot = (trans_kpts[LS] + trans_kpts[RS]) / 2.0
+            else:
+                pivot = np.array(current_trans_face.center, dtype=np.float32)
+
+            for idx in face_indices:
+                if idx < len(trans_scores) and trans_scores[idx] > 0.1:
+                    scaled[idx] = pivot + (scaled[idx] - pivot) * scale_factor
+
+            return scaled, scale_factor
+
+        # 기존 동작: 전체 스켈레톤 스케일링
+        scaled *= scale_factor
+        return scaled, scale_factor
+
     def transfer(self, source_image, reference_image, output_image_size=None):
         """포즈 전이 메인 메서드"""
         print("\n" + "#"*70)
@@ -432,13 +515,7 @@ class PoseTransferPipeline:
         _, trans_scores = self.ghost_filter.apply_intersection_mask(trans_kpts, trans_scores, intersection_mask)
         
         # [STEP 9] Scaling
-        scale = 1.0
-        if case != AlignmentCase.F_F:
-            current_trans_face = self.bbox_mgr._kpt_to_face_public(trans_kpts, trans_scores)
-            if current_trans_face.size > 1 and src_face.size > 1:
-                scale_factor = np.clip(src_face.size / current_trans_face.size, 0.5, 2.0)
-                trans_kpts *= scale_factor
-                scale = scale_factor
+        trans_kpts, scale = self._sync_scale_to_source_face(trans_kpts, trans_scores, src_face, case)
         
         # [STEP 10] Aligning
         trans_kpts = self.align_mgr.align_coordinates(
@@ -453,6 +530,17 @@ class PoseTransferPipeline:
         final_src_img, final_kpts, final_size = self.canvas_mgr.expand_canvas_to_fit(
             src_img, trans_kpts, trans_scores, head_pad_px=head_pad
         )
+        
+        # [STEP 12.5] Auto Crop (Optional)
+        if self.config.auto_crop_enabled:
+            print("\n[STEP 12.5] Auto Crop - keypoints bounds 기준 크롭...")
+            final_src_img, final_kpts, final_size = self.canvas_mgr.crop_to_keypoints(
+                final_src_img,
+                final_kpts,
+                trans_scores,
+                head_pad_px=head_pad,
+            )
+        
         final_h, final_w = final_size
         
         # [STEP 13] 최종 프레임 이탈 체크

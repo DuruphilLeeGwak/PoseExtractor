@@ -41,6 +41,31 @@ class GhostFilterConfig:
     # [D] 클러스터링 체크
     check_clustering: bool = True
     min_cluster_spread: float = 20.0
+
+    # [D-2] 손 폐색/환각(예측) 억제
+    # 목적: 손이 가려졌는데도 손가락을 '예측'으로 그리는 문제를 줄이되,
+    #       손이 작게 보이는 경우(멀리 있는 손)까지 과하게 제거하지 않도록
+    #       "손목 주변에 손가락이 모여있는지"(기하)로 판단합니다.
+    #
+    # - 손가락(91~132)만 제거 대상이며 손목(9/10)은 유지합니다.
+    # - elbow/wrist가 유효할 때 forearm 길이를 기준으로 반경을 잡습니다.
+    check_hand_occlusion: bool = True
+    # (legacy alias) 기존 파이프라인 파라미터 호환용
+    check_hand_presence: bool = True
+
+    hand_finger_min_confidence: float = 0.1
+    hand_min_finger_points: int = 6
+
+    # 손목 주변 "정상 반경": max(min_radius_px, forearm * radius_ratio)
+    hand_wrist_radius_ratio: float = 0.8
+    hand_wrist_min_radius_px: float = 60.0
+
+    # 정상으로 인정되는 "근접 비율": 근접점/활성점 >= min_near_ratio
+    hand_min_near_ratio: float = 0.8
+
+    # 멀리 튄 점(outlier)이 많으면 환각으로 판단
+    hand_far_outlier_ratio: float = 1.6
+    hand_max_far_points: int = 1
     
     # [E] 계층적 연결성 검사 (Consistency Check)
     check_consistency: bool = True
@@ -155,6 +180,70 @@ class GhostFilter:
                     spread = np.sqrt(np.std(pts[:,0])**2 + np.std(pts[:,1])**2)
                     if spread < self.config.min_cluster_spread:
                         for idx in indices: remove(idx, f"clustered_{name}")
+
+        # =========================================================
+        # [Step 3.5] 손 폐색/환각 억제 (기하 기반)
+        # - 작은 손(멀리 있음)은 전체 스케일이 작아도 손목 주변에 점들이 모이는 특성이 있으므로
+        #   "근접 비율"을 사용해 과도한 제거를 방지
+        # - 손이 가려져 환각이 생기면 점들이 손목에서 멀리 튀거나(outlier) 방향성이 깨지는 경향
+        # =========================================================
+        if self.config.check_hand_occlusion or self.config.check_hand_presence:
+            thr = float(self.config.hand_finger_min_confidence)
+            min_pts = int(self.config.hand_min_finger_points)
+            radius_ratio = float(self.config.hand_wrist_radius_ratio)
+            min_radius = float(self.config.hand_wrist_min_radius_px)
+            min_near_ratio = float(self.config.hand_min_near_ratio)
+            far_ratio = float(self.config.hand_far_outlier_ratio)
+            max_far = int(self.config.hand_max_far_points)
+
+            # body indices: left elbow=7, right elbow=8, left wrist=9, right wrist=10
+            sides = [
+                ("LHand", 7, 9, 91, 111),
+                ("RHand", 8, 10, 112, 132),
+            ]
+            for name, elbow_idx, wrist_idx, start, end in sides:
+                if wrist_idx >= len(keypoints) or wrist_idx >= len(filtered_scores):
+                    continue
+                # wrist must be alive enough to anchor distances
+                if filtered_scores[wrist_idx] < 0.3:
+                    continue
+                wrist = keypoints[wrist_idx]
+
+                # elbow optional but improves scale (forearm length)
+                if elbow_idx < len(filtered_scores) and filtered_scores[elbow_idx] >= 0.3:
+                    elbow = keypoints[elbow_idx]
+                    forearm = float(np.linalg.norm(wrist - elbow))
+                else:
+                    forearm = 0.0
+
+                # Determine expected radius around wrist
+                base_radius = max(min_radius, forearm * radius_ratio) if forearm > 1.0 else min_radius
+                far_radius = max(base_radius * 1.5, forearm * far_ratio) if forearm > 1.0 else base_radius * 1.5
+
+                active_idxs = []
+                near_count = 0
+                far_count = 0
+
+                for idx in range(start, end + 1):
+                    if idx >= len(filtered_scores) or idx in removed_indices:
+                        continue
+                    c = filtered_scores[idx]
+                    if c < thr:
+                        continue
+                    active_idxs.append(idx)
+                    d = float(np.linalg.norm(keypoints[idx] - wrist))
+                    if d <= base_radius:
+                        near_count += 1
+                    if d >= far_radius:
+                        far_count += 1
+
+                if len(active_idxs) < min_pts:
+                    continue
+
+                near_ratio = near_count / max(1, len(active_idxs))
+                if near_ratio < min_near_ratio or far_count > max_far:
+                    for idx in active_idxs:
+                        remove(idx, f"occluded_{name}(near={near_ratio:.2f},far={far_count})")
 
         # =========================================================
         # [Step 4] 스마트 손-발 중첩 방지

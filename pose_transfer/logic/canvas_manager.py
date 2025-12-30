@@ -9,6 +9,64 @@ class CanvasManager:
     def __init__(self, config):
         self.config = config
 
+    def crop_to_keypoints(
+        self,
+        image: np.ndarray,
+        keypoints: np.ndarray,
+        scores: np.ndarray,
+        head_pad_px: float = 0.0,
+    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int]]:
+        """유효 키포인트 영역을 기준으로 이미지를 크롭하고 키포인트를 이동.
+
+        목적:
+        - Src 배경/정렬이 끝난 상태에서, half 포즈 등으로 인해 남는 모호한 영역을 제거
+        - crop_padding_px / canvas_padding_ratio / head_pad_px 규칙을 expand_canvas_to_fit()과 동일하게 적용
+
+        Returns:
+            (cropped_image, shifted_keypoints, (new_h, new_w))
+        """
+        h, w = image.shape[:2]
+
+        valid_mask = scores > 0.01
+        if not np.any(valid_mask):
+            return image, keypoints, (h, w)
+
+        valid_kpts = keypoints[valid_mask]
+        min_x, min_y = np.min(valid_kpts, axis=0)
+        max_x, max_y = np.max(valid_kpts, axis=0)
+
+        fixed_pad = float(getattr(self.config, 'crop_padding_px', 0))
+        ratio = float(getattr(self.config, 'canvas_padding_ratio', 0.0))
+        ratio_pad_w = int(w * ratio)
+        ratio_pad_h = int(h * ratio)
+
+        req_x1 = int(np.floor(min_x - fixed_pad - ratio_pad_w))
+        req_y1 = int(np.floor(min_y - fixed_pad - ratio_pad_h - head_pad_px))
+        req_x2 = int(np.ceil(max_x + fixed_pad + ratio_pad_w))
+        req_y2 = int(np.ceil(max_y + fixed_pad + ratio_pad_h))
+
+        x1 = max(0, req_x1)
+        y1 = max(0, req_y1)
+        x2 = min(w, req_x2)
+        y2 = min(h, req_y2)
+
+        # 유효하지 않은 크롭이면 스킵
+        if x2 - x1 < 2 or y2 - y1 < 2:
+            return image, keypoints, (h, w)
+
+        # 크롭이 의미 없으면 스킵
+        if x1 == 0 and y1 == 0 and x2 == w and y2 == h:
+            return image, keypoints, (h, w)
+
+        cropped = image[y1:y2, x1:x2]
+
+        shifted = keypoints.copy()
+        shifted[:, 0] -= x1
+        shifted[:, 1] -= y1
+
+        new_h, new_w = cropped.shape[:2]
+        return cropped, shifted, (new_h, new_w)
+
     def expand_canvas_to_fit(
         self, 
         source_image: np.ndarray, 

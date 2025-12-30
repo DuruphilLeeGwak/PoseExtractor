@@ -83,11 +83,31 @@ ghost_filter:
   # 이 패턴을 감지하여 전체 무효
   #
   check_clustering: true           # 클러스터링 체크 on/off
-  min_cluster_spread: 20.0         # 최소 퍼짐 정도 (px)
+  min_cluster_spread: 5.0         # 최소 퍼짐 정도 (px)
                                    # 손 키포인트들의 표준편차가 이보다 작으면 무효
                                    # 예: 20.0 → 손 키포인트가 20px 이내에 뭉쳐있으면 무효
                                    # 값을 높이면 더 엄격, 낮추면 더 관대
   cluster_distance_threshold: 5.0  # (현재 미사용, 예비)
+
+  # ───────────────────────────────────────────────────────────────
+  # [D-2] 손 존재성(품질) 체크
+  # ───────────────────────────────────────────────────────────────
+  # 손이 가려졌는데도 손가락을 '예측'으로 생성하는 경우,
+  # 손가락(91~132)만 제거합니다. (손목 9/10은 유지)
+  # 작은 손(멀리 있음)은 "손목 주변에 점이 모이는지"로 판단해 과도한 제거를 방지합니다.
+  check_hand_occlusion: true
+  hand_finger_min_confidence: 0.1
+  hand_min_finger_points: 6
+  hand_wrist_radius_ratio: 0.8
+  hand_wrist_min_radius_px: 60
+  hand_min_near_ratio: 0.8
+  hand_far_outlier_ratio: 1.6
+  hand_max_far_points: 1
+
+  # (호환/레거시) 아래 키들은 더 이상 사용하지 않습니다.
+  # check_hand_presence: true
+  # hand_strong_threshold: 2.0
+  # hand_min_strong_points: 6
   
   # ───────────────────────────────────────────────────────────────
   # [E] 하단 영역 클러스터링 체크 (Ghost Leg 감지)
