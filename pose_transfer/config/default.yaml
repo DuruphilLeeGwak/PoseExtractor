@@ -197,6 +197,7 @@ cross_filter:
   # Body 모델에는 손목까지만 있고 손가락(91-133)은 없음
   # 손목이 없는데 손가락들이 suspicious 범위에 있으면 할루시네이션으로 판단하여 제거
   hand_hallucination_check: true   # 손목 없으면 의심 범위 손가락도 제거
+  hand_dw_min_confidence: 2.0      # 손가락 DWPose 최소 신뢰도 (손가락 전용, 포켓/뒤로 숨은 손 방지)
   
   # Foot 할루시네이션 방지
   # 발목이 있어도 발가락들이 낮은 신뢰도면 할루시네이션일 수 있음

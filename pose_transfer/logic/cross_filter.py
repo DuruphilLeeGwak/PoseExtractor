@@ -152,9 +152,19 @@ class CrossFilterConfig:
     # ========== Hand 할루시네이션 방지 ==========
     hand_hallucination_check: bool = True
     """
-    손목 없는데 손가락만 있는 할루시네이션 제거
-    - Body 모델은 손목(wrist)까지만 있고 손가락(91-133)은 없음
-    - 손목이 승인 안 되었는데 손가락이 suspicious 범위에 있으면 제거
+    손목 Body가 없을 때 손가락 할루시네이션 제거
+    - Body 모델에는 wrist까지만 있고 손가락(91-133)은 없음
+    - wrist가 없는데 손가락들이 suspicious 범위면 할루시네이션으로 판단
+    - wrist 없으면 suspicious 범위 손가락도 제거
+    """
+    
+    hand_dw_min_confidence: float = 2.0
+    """
+    손가락 DWPose 최소 신뢰도
+    - 손가락(91-133)에만 적용되는 더 높은 임계값
+    - 일반 dw_suspicious_threshold(2.0)보다 높게 설정
+    - 손가락은 할루시네이션이 많아 더 엄격하게 필터링
+    - 포켓 안, 등 뒤로 숨은 손 방지
     """
     
     # ========== Foot 할루시네이션 방지 ==========
@@ -495,6 +505,8 @@ class CrossFilter:
                 dw_conf = dw_scores[wb_idx]
                 
                 # Safety check: suspicious 범위(0.05~2.0) 제거
+                # Body가 "있다"고 했어도 DWPose가 위치를 확신하지 못하면(< 2.0) 제거
+                # (낮은 DWPose confidence = 부정확한 위치 추론)
                 if dw_conf > dw_suspicious:
                     filtered_keypoints[wb_idx] = dw_keypoints[wb_idx]
                     filtered_scores[wb_idx] = dw_scores[wb_idx]
@@ -527,16 +539,31 @@ class CrossFilter:
         
         if self.config.enable_hand_dependency:
             for side, (wrist_idx, finger_range) in self.hand_dependencies.items():
-                # ===== 케이스 1: 손목 승인 O → 손가락 승인 =====
+                # ===== 케이스 1: 손목 승인 O → 손가락 승인 (Body wrist 기반 적응형 threshold) =====
                 if wrist_idx in approved_indices:
-                    # 손목이 진짜라면, DWPose 손가락 승인 (단, suspicious 범위는 제외)
+                    # Body wrist confidence 가져오기
+                    body_wrist_idx = 9 if side == 'left' else 10
+                    body_wrist_conf = body_scores[body_wrist_idx] if body_scores is not None else 0.5
+                    
+                    # Body wrist confidence에 따라 손가락 threshold 조정
+                    # - Body wrist 낮음 (<0.5) → 손가락 잘 안 보임 → threshold 낮춤 (1.8)
+                    # - Body wrist 중간 (0.5~0.8) → 일반 threshold (2.0)
+                    # - Body wrist 매우 높음 (>0.8) → 포켓/가려진 손 의심 → threshold 높임 (3.5)
+                    if body_wrist_conf < 0.5:
+                        finger_threshold = 1.8  # 잘 안 보이는 정상 손 보호
+                    elif body_wrist_conf > 0.8:
+                        finger_threshold = 3.5  # 포켓 속/가려진 할루시네이션 제거
+                    else:
+                        finger_threshold = self.config.hand_dw_min_confidence  # 일반 (2.0)
+                    
+                    # 손목이 진짜라면, DWPose 손가락 승인 (적응형 임계값)
                     for finger_idx in finger_range:
-                        # 이미 0-2단계에서 고신뢰도로 승인되었으면 스킵
+                        # 이미 고신뢰도로 승인되었으면 스킵
                         if finger_idx in approved_indices:
                             continue
                         score = dw_scores[finger_idx]
-                        # suspicious 범위 제거: 2.0 초과만 승인
-                        if score > dw_suspicious:
+                        # 적응형 임계값 사용
+                        if score > finger_threshold:
                             filtered_keypoints[finger_idx] = dw_keypoints[finger_idx]
                             filtered_scores[finger_idx] = dw_scores[finger_idx]
                             approved_indices.add(finger_idx)

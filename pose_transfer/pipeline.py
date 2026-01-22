@@ -113,9 +113,10 @@ class PipelineConfig:
     cross_dw_suspicious_threshold: float = 2.0  # 의심 키포인트 범위 (0.05~2.0)
     cross_clean_mode_body_threshold: float = 0.2  # Clean mode일 때 body 임계값 (완화)
     cross_hand_hallucination_check: bool = True  # 손목 없으면 의심 손가락 제거
+    cross_hand_dw_min_confidence: float = 2.0  # 손가락 DWPose 최소 신뢰도 (손가락 전용)
     cross_foot_hallucination_check: bool = True  # 발목 Body 낮으면 발가락 제거
     cross_foot_body_confidence_threshold: float = 0.25  # 발 할루시네이션 판정용
-    cross_foot_dw_min_confidence: float = 3.0  # 발가락 DWPose 최소 신뢰도 (발가락 전용)
+    cross_foot_dw_min_confidence: float = 2.5  # 발가락 DWPose 최소 신뢰도 (발가락 전용)
 
     # [v4.6] Hand Occlusion/Hallucination Suppression (기하 기반)
     ghost_check_hand_occlusion: bool = True
@@ -225,9 +226,10 @@ class PipelineConfig:
             cross_dw_suspicious_threshold=cross.get('dw_suspicious_threshold', 2.0),
             cross_clean_mode_body_threshold=cross.get('clean_mode_body_threshold', 0.2),
             cross_hand_hallucination_check=cross.get('hand_hallucination_check', True),
+            cross_hand_dw_min_confidence=cross.get('hand_dw_min_confidence', 2.0),
             cross_foot_hallucination_check=cross.get('foot_hallucination_check', True),
             cross_foot_body_confidence_threshold=cross.get('foot_body_confidence_threshold', 0.25),
-            cross_foot_dw_min_confidence=cross.get('foot_dw_min_confidence', 3.0),
+            cross_foot_dw_min_confidence=cross.get('foot_dw_min_confidence', 2.5),
 
             ghost_check_hand_occlusion=ghost.get('check_hand_occlusion', ghost.get('check_hand_presence', True)),
             ghost_hand_finger_min_confidence=ghost.get('hand_finger_min_confidence', 0.1),
@@ -383,6 +385,7 @@ class PoseTransferPipeline:
                     dw_suspicious_threshold=self.config.cross_dw_suspicious_threshold,
                     clean_mode_body_threshold=self.config.cross_clean_mode_body_threshold,
                     hand_hallucination_check=self.config.cross_hand_hallucination_check,
+                    hand_dw_min_confidence=self.config.cross_hand_dw_min_confidence,
                     foot_hallucination_check=self.config.cross_foot_hallucination_check,
                     foot_body_confidence_threshold=self.config.cross_foot_body_confidence_threshold,
                     foot_dw_min_confidence=self.config.cross_foot_dw_min_confidence
