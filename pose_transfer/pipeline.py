@@ -38,6 +38,9 @@ from .logic.ghost_filter import (
     filter_keypoints
 )
 
+# [v4.0] Cross Filter - Body + DWPose 결합
+# (실제 import는 _init_modules()에서 lazy loading)
+
 
 @dataclass
 class PipelineConfig:
@@ -73,7 +76,7 @@ class PipelineConfig:
     face_line_thickness: int = 2
     hand_line_thickness: int = 2
     point_radius: int = 4
-    kpt_threshold: float = 0.3
+    kpt_threshold: float = 0
     
     # Output / Crop
     auto_crop_enabled: bool = True
@@ -97,6 +100,22 @@ class PipelineConfig:
     ghost_boundary_tolerance: float = 3.0     # 경계 허용 오차 (px)
     ghost_check_clustering: bool = True       # 클러스터링 체크 on/off
     ghost_min_cluster_spread: float = 20.0    # 최소 퍼짐 정도 (px)
+    
+    # [v4.0] Cross Filter - Body + DWPose 교차 필터링
+    cross_filter_enabled: bool = False        # Ghost Filter와 배타적
+    cross_body_confidence_threshold: float = 0.25  # Body 검출 임계값 (knee 보존용)
+    cross_enable_hand_dependency: bool = True
+    cross_enable_foot_dependency: bool = True
+    cross_enable_face_dependency: bool = True
+    cross_dw_min_confidence: float = 0.05
+    cross_dw_high_confidence_threshold: float = 8.0  # DWPose 고신뢰도 보호
+    cross_dw_full_body_confidence_threshold: float = 6.0  # DWPose 전신 확신 모드
+    cross_dw_suspicious_threshold: float = 2.0  # 의심 키포인트 범위 (0.05~2.0)
+    cross_clean_mode_body_threshold: float = 0.2  # Clean mode일 때 body 임계값 (완화)
+    cross_hand_hallucination_check: bool = True  # 손목 없으면 의심 손가락 제거
+    cross_foot_hallucination_check: bool = True  # 발목 Body 낮으면 발가락 제거
+    cross_foot_body_confidence_threshold: float = 0.25  # 발 할루시네이션 판정용
+    cross_foot_dw_min_confidence: float = 3.0  # 발가락 DWPose 최소 신뢰도 (발가락 전용)
 
     # [v4.6] Hand Occlusion/Hallucination Suppression (기하 기반)
     ghost_check_hand_occlusion: bool = True
@@ -107,6 +126,13 @@ class PipelineConfig:
     ghost_hand_min_near_ratio: float = 0.8
     ghost_hand_far_outlier_ratio: float = 1.6
     ghost_hand_max_far_points: int = 1
+
+    # GhostFilter debug
+    ghost_debug_hand_removals: bool = False
+    ghost_debug_hand_print_limit: int = 80
+    ghost_debug_hand_summary_only: bool = False
+    ghost_debug_hand_include_wrists: bool = True
+    ghost_debug_hand_print_to_console: bool = True
     
     # Bbox Margin
     person_bbox_margin: float = 0.0
@@ -128,6 +154,7 @@ class PipelineConfig:
         debug = config.get('debug', {})
         bbox = config.get('bbox', {})
         ghost = config.get('ghost_filter', {})
+        cross = config.get('cross_filter', {})
         
         return cls(
             # Model
@@ -185,6 +212,22 @@ class PipelineConfig:
             ghost_boundary_tolerance=ghost.get('boundary_tolerance', 3.0),
             ghost_check_clustering=ghost.get('check_clustering', True),
             ghost_min_cluster_spread=ghost.get('min_cluster_spread', 20.0),
+            
+            # [v4.0] Cross Filter
+            cross_filter_enabled=cross.get('enabled', False),
+            cross_body_confidence_threshold=cross.get('body_confidence_threshold', 0.25),
+            cross_enable_hand_dependency=cross.get('enable_hand_dependency', True),
+            cross_enable_foot_dependency=cross.get('enable_foot_dependency', True),
+            cross_enable_face_dependency=cross.get('enable_face_dependency', True),
+            cross_dw_min_confidence=cross.get('dw_min_confidence', 0.05),
+            cross_dw_high_confidence_threshold=cross.get('dw_high_confidence_threshold', 8.0),
+            cross_dw_full_body_confidence_threshold=cross.get('dw_full_body_confidence_threshold', 6.0),
+            cross_dw_suspicious_threshold=cross.get('dw_suspicious_threshold', 2.0),
+            cross_clean_mode_body_threshold=cross.get('clean_mode_body_threshold', 0.2),
+            cross_hand_hallucination_check=cross.get('hand_hallucination_check', True),
+            cross_foot_hallucination_check=cross.get('foot_hallucination_check', True),
+            cross_foot_body_confidence_threshold=cross.get('foot_body_confidence_threshold', 0.25),
+            cross_foot_dw_min_confidence=cross.get('foot_dw_min_confidence', 3.0),
 
             ghost_check_hand_occlusion=ghost.get('check_hand_occlusion', ghost.get('check_hand_presence', True)),
             ghost_hand_finger_min_confidence=ghost.get('hand_finger_min_confidence', 0.1),
@@ -194,6 +237,12 @@ class PipelineConfig:
             ghost_hand_min_near_ratio=ghost.get('hand_min_near_ratio', 0.8),
             ghost_hand_far_outlier_ratio=ghost.get('hand_far_outlier_ratio', 1.6),
             ghost_hand_max_far_points=ghost.get('hand_max_far_points', 1),
+
+            ghost_debug_hand_removals=ghost.get('debug_hand_removals', False),
+            ghost_debug_hand_print_limit=ghost.get('debug_hand_print_limit', 80),
+            ghost_debug_hand_summary_only=ghost.get('debug_hand_summary_only', False),
+            ghost_debug_hand_include_wrists=ghost.get('debug_hand_include_wrists', True),
+            ghost_debug_hand_print_to_console=ghost.get('debug_hand_print_to_console', True),
             
             # Bbox
             person_bbox_margin=bbox.get('person_margin', 0.0),
@@ -279,6 +328,11 @@ class PoseTransferPipeline:
             hand_min_near_ratio=self.config.ghost_hand_min_near_ratio,
             hand_far_outlier_ratio=self.config.ghost_hand_far_outlier_ratio,
             hand_max_far_points=self.config.ghost_hand_max_far_points,
+            debug_hand_removals=self.config.ghost_debug_hand_removals,
+            debug_hand_print_limit=self.config.ghost_debug_hand_print_limit,
+            debug_hand_summary_only=self.config.ghost_debug_hand_summary_only,
+            debug_hand_include_wrists=self.config.ghost_debug_hand_include_wrists,
+            debug_hand_print_to_console=self.config.ghost_debug_hand_print_to_console,
         )
         self.ghost_filter.config.boundary_tolerance = self.config.ghost_boundary_tolerance
         self.ghost_filter.config.min_cluster_spread = self.config.ghost_min_cluster_spread
@@ -301,6 +355,48 @@ class PoseTransferPipeline:
             to_openpose=self.config.to_openpose,
             force_new=True
         )
+        
+        # [v4.0] Body extractor (17 keypoints, Cross-Filter용)
+        self.body_extractor = None
+        if self.config.cross_filter_enabled:
+            from .extractors import BodyExtractor
+            self.body_extractor = BodyExtractor(
+                mode='balanced',
+                backend='onnxruntime',
+                device='cpu'
+            )
+            print(f"✅ Body Extractor 초기화 완료 (Cross-Filter 모드)")
+        
+        # [v4.0] Cross Filter (Body + DWPose 결합)
+        self.cross_filter = None
+        if self.config.cross_filter_enabled:
+            from .logic import CrossFilter, CrossFilterConfig
+            self.cross_filter = CrossFilter(
+                config=CrossFilterConfig(
+                    body_confidence_threshold=self.config.cross_body_confidence_threshold,
+                    enable_hand_dependency=self.config.cross_enable_hand_dependency,
+                    enable_foot_dependency=self.config.cross_enable_foot_dependency,
+                    enable_face_dependency=self.config.cross_enable_face_dependency,
+                    dw_min_confidence=self.config.cross_dw_min_confidence,
+                    dw_high_confidence_threshold=self.config.cross_dw_high_confidence_threshold,
+                    dw_full_body_confidence_threshold=self.config.cross_dw_full_body_confidence_threshold,
+                    dw_suspicious_threshold=self.config.cross_dw_suspicious_threshold,
+                    clean_mode_body_threshold=self.config.cross_clean_mode_body_threshold,
+                    hand_hallucination_check=self.config.cross_hand_hallucination_check,
+                    foot_hallucination_check=self.config.cross_foot_hallucination_check,
+                    foot_body_confidence_threshold=self.config.cross_foot_body_confidence_threshold,
+                    foot_dw_min_confidence=self.config.cross_foot_dw_min_confidence
+                )
+            )
+            print(f"✅ Cross Filter 초기화 완료")
+            print(f"   - Body Confidence Threshold: {self.config.cross_body_confidence_threshold}")
+            print(f"   - Foot Body Threshold: {self.config.cross_foot_body_confidence_threshold}")
+            print(f"   - DWPose High Confidence Threshold: {self.config.cross_dw_high_confidence_threshold}")
+            print(f"   - DWPose Full Body Confidence Threshold: {self.config.cross_dw_full_body_confidence_threshold}")
+            print(f"   - Clean Mode Suspicious Threshold: {self.config.cross_dw_suspicious_threshold}")
+            print(f"   - Hand Dependency: {self.config.cross_enable_hand_dependency}")
+            print(f"   - Foot Dependency: {self.config.cross_enable_foot_dependency}")
+            print(f"   - Face Dependency: {self.config.cross_enable_face_dependency}")
         
         self.person_filter = PersonFilter(
             area_weight=self.config.area_weight,
@@ -339,7 +435,7 @@ class PoseTransferPipeline:
         image: Union[np.ndarray, str, Path], 
         filter_person: bool = True
     ) -> Tuple[np.ndarray, np.ndarray, int, Tuple[int, int]]:
-        """포즈 추출"""
+        """포즈 추출 (DWPose Wholebody 133 keypoints)"""
         if isinstance(image, (str, Path)):
             img = load_image(image)
         else:
@@ -357,6 +453,33 @@ class PoseTransferPipeline:
             )
         else:
             kpts, scores, idx = all_kpts[0], all_scores[0], 0
+        
+        # [v4.0] Cross-Filter: Body + DWPose 결합
+        if self.config.cross_filter_enabled and self.body_extractor and self.cross_filter:
+            # Body 17 keypoints 추출
+            body_kpts_all, body_scores_all = self.body_extractor.extract(img)
+            if len(body_kpts_all) > 0:
+                # DWPose와 동일한 person 선택
+                if filter_person and self.config.filter_enabled and len(body_kpts_all) > 1:
+                    body_kpts = body_kpts_all[idx] if idx < len(body_kpts_all) else body_kpts_all[0]
+                    body_scores = body_scores_all[idx] if idx < len(body_scores_all) else body_scores_all[0]
+                else:
+                    body_kpts = body_kpts_all[0]
+                    body_scores = body_scores_all[0]
+                
+                # CrossFilter 적용: Body가 승인한 부위만 DWPose 사용
+                filtered_kpts, filtered_scores, approved_indices = self.cross_filter.filter(
+                    body_keypoints=body_kpts,
+                    body_scores=body_scores,
+                    dw_keypoints=kpts,
+                    dw_scores=scores
+                )
+                
+                # 필터링된 결과로 교체
+                kpts = filtered_kpts
+                scores = filtered_scores
+                
+                print(f"✅ Cross-Filter 적용: {len(approved_indices)}/133 keypoints 승인")
         
         if self.config.hand_refinement_enabled:
             kpts, scores, _ = self.hand_refiner.refine_both_hands(
@@ -518,9 +641,17 @@ class PoseTransferPipeline:
         src_debug_img = None
         ref_debug_img = None
         if self.config.debug_bbox_visualization:
-            src_ov = self.renderer.render(src_img, src_kpts, src_filtered_scores)
+            src_ov = self.renderer.render(
+                src_img, src_kpts, src_filtered_scores,
+                occluded_indices=src_filter_result.occluded_indices,
+                out_of_frame_indices=src_filter_result.out_of_frame_indices
+            )
             src_debug_img = self.bbox_mgr.draw_debug(src_ov, src_debug)
-            ref_ov = self.renderer.render(ref_img, ref_kpts, ref_filtered_scores)
+            ref_ov = self.renderer.render(
+                ref_img, ref_kpts, ref_filtered_scores,
+                occluded_indices=ref_filter_result.occluded_indices,
+                out_of_frame_indices=ref_filter_result.out_of_frame_indices
+            )
             ref_debug_img = self.bbox_mgr.draw_debug(ref_ov, ref_debug)
         
         # [STEP 6] 포즈 전이
@@ -583,13 +714,25 @@ class PoseTransferPipeline:
         self.ghost_filter.config.check_consistency = original_check_consistency
         
         # [RENDER] Skeleton
-        skeleton_image = self.renderer.render_skeleton_only((final_h, final_w, 3), final_kpts, final_filtered_scores)
+        skeleton_image = self.renderer.render_skeleton_only(
+            (final_h, final_w, 3), 
+            final_kpts, 
+            final_filtered_scores,
+            occluded_indices=final_filter_result.occluded_indices,
+            out_of_frame_indices=final_filter_result.out_of_frame_indices
+        )
         
         # Result Packaging
         ghost_filter_info = {
             'src_removed': src_filter_result.removed_indices,
             'ref_removed': ref_filter_result.removed_indices,
             'final_removed': final_filter_result.removed_indices,
+            'src_occluded': src_filter_result.occluded_indices,
+            'ref_occluded': ref_filter_result.occluded_indices,
+            'final_occluded': final_filter_result.occluded_indices,
+            'src_out_of_frame': src_filter_result.out_of_frame_indices,
+            'ref_out_of_frame': ref_filter_result.out_of_frame_indices,
+            'final_out_of_frame': final_filter_result.out_of_frame_indices,
             'final_valid_count': int(np.sum(final_filtered_scores > 0))
         }
         
@@ -639,7 +782,17 @@ class PoseTransferPipeline:
             print(f"   Ghost Filter: {len(filter_result.removed_indices)}개 Keypoints 절삭됨")
         
         json_data = convert_to_openpose_format(kpts[np.newaxis, ...], filtered_scores[np.newaxis, ...], image_size)
-        skel_img = self.renderer.render_skeleton_only((image_size[0], image_size[1], 3), kpts, filtered_scores)
-        overlay_img = self.renderer.render(img, kpts, filtered_scores)
+        skel_img = self.renderer.render_skeleton_only(
+            (image_size[0], image_size[1], 3), 
+            kpts, 
+            filtered_scores,
+            occluded_indices=filter_result.occluded_indices,
+            out_of_frame_indices=filter_result.out_of_frame_indices
+        )
+        overlay_img = self.renderer.render(
+            img, kpts, filtered_scores,
+            occluded_indices=filter_result.occluded_indices,
+            out_of_frame_indices=filter_result.out_of_frame_indices
+        )
         
         return json_data, skel_img, overlay_img

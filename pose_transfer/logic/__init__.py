@@ -20,9 +20,13 @@ from .ghost_filter import (
     create_ghost_filter,
     filter_keypoints
 )
+from .cross_filter import CrossFilter, CrossFilterConfig
 
 # [v3.2] Keypoint Generator - 누락 키포인트 생성
 from .keypoint_generator import KeypointGenerator
+
+# [v4.0] Cross Filter - Body + DWPose 교차 필터링
+from .cross_filter import CrossFilter, CrossFilterConfig
 
 __all__ = [
     # Bbox
@@ -44,6 +48,9 @@ __all__ = [
     'GhostFilterConfig',
     'FilterResult',
     'create_ghost_filter',
+    # Cross Filter v4.0
+    'CrossFilter',
+    'CrossFilterConfig',
     'filter_keypoints',
     # Keypoint Generator v3.2
     'KeypointGenerator',

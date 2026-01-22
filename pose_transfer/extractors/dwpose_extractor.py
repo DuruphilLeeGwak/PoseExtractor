@@ -120,9 +120,28 @@ class DWPoseExtractor:
         keypoints = np.array(keypoints)
         scores = np.array(scores)
         
-        # 좌표를 이미지 범위 내로 클리핑 (경계 밖으로 나간 키포인트 보정)
-        keypoints[..., 0] = np.clip(keypoints[..., 0], 0, img_w - 1)  # x 좌표
-        keypoints[..., 1] = np.clip(keypoints[..., 1], 0, img_h - 1)  # y 좌표
+        # 🔍 디버그: rtmlib에서 반환된 원본 좌표 확인 (클리핑 전)
+        if len(keypoints) > 0:
+            person_0 = keypoints[0]
+            # LHand 손가락 좌표 샘플 확인
+            debug_indices = [9, 96, 97, 100, 17, 18, 20, 21, 22]  # 손목, 손가락, 발가락
+            print(f"\n   🔍 [DWPose 원본 좌표] 이미지 크기: {img_w}x{img_h}")
+            for idx in debug_indices:
+                if idx < len(person_0):
+                    x, y = person_0[idx]
+                    score = scores[0][idx] if idx < len(scores[0]) else 0.0
+                    status = ""
+                    if y >= img_h - 10:
+                        status = f" ⚠️ 경계근처(y>={img_h-10})"
+                    elif y > img_h:
+                        status = f" ✅ 프레임밖(y>{img_h})"
+                    print(f"   [DWPose] idx={idx:3d} xy=({x:7.1f},{y:7.1f}) score={score:.3f}{status}")
+        
+        # ⚠️ 좌표 클리핑 제거: Ghost Filter에서 프레임 이탈 감지를 위해 원본 좌표 유지
+        # 프레임 밖 키포인트(-100, 3500 등)를 그대로 전달하여
+        # Ghost Filter가 out_of_frame_indices로 마킹할 수 있도록 함
+        # keypoints[..., 0] = np.clip(keypoints[..., 0], 0, img_w - 1)  # 제거됨
+        # keypoints[..., 1] = np.clip(keypoints[..., 1], 0, img_h - 1)  # 제거됨
         
         return keypoints, scores
     

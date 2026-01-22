@@ -16,6 +16,7 @@ from typing import Dict, Optional, Union, Tuple
 
 from .pipeline import PipelineConfig, PoseTransferPipeline
 from .utils.io import save_json, save_image, load_image
+from .logic.debug_generator import generate_debug_info
 
 
 # ====================================================
@@ -182,6 +183,7 @@ def execute_pose_transfer(
     do_save_json = output_cfg.get('save_json', True)
     do_save_skel = output_cfg.get('save_skeleton_image', True)
     do_save_debug = output_cfg.get('save_debug_image', False)
+    do_save_debug_txt = output_cfg.get('save_debug_txt', True)  # 디버그 정보 생성 옵션
 
     # 작업 ID 생성
     date_str = datetime.now().strftime("%Y%m%d")
@@ -199,6 +201,32 @@ def execute_pose_transfer(
         print("📊 Analyzing Inputs...")
         _save_analysis(pipeline, final_src_path, out_dirs["src"], "src", do_save_json, do_save_skel, do_save_debug)
         _save_analysis(pipeline, final_ref_path, out_dirs["ref"], "ref", do_save_json, do_save_skel, do_save_debug)
+        
+        # 디버그 정보 생성 (src와 ref에 대해)
+        if do_save_debug_txt:
+            print("📝 Generating Debug Info...")
+            try:
+                src_debug_path = generate_debug_info(
+                    final_src_path, 
+                    out_dirs["src"],
+                    dw_extractor=pipeline.extractor,
+                    body_extractor=None,  # 내부에서 생성
+                    config=yaml_config
+                )
+                if src_debug_path:
+                    print(f"   ✅ Source debug: {Path(src_debug_path).name}")
+                
+                ref_debug_path = generate_debug_info(
+                    final_ref_path,
+                    out_dirs["ref"],
+                    dw_extractor=pipeline.extractor,
+                    body_extractor=None,
+                    config=yaml_config
+                )
+                if ref_debug_path:
+                    print(f"   ✅ Reference debug: {Path(ref_debug_path).name}")
+            except Exception as e:
+                print(f"   ⚠️ Debug 생성 중 오류 (무시): {e}")
         
         print("✨ Running Transfer...")
         result = pipeline.transfer(final_src_path, final_ref_path)

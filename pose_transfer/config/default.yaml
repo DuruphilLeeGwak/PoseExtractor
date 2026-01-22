@@ -46,16 +46,17 @@ ghost_filter:
   # ───────────────────────────────────────────────────────────────
   # 기본 설정
   # ───────────────────────────────────────────────────────────────
-  enabled: true                    # Ghost Filter 전체 on/off
+  enabled: false                   # Ghost Filter 비활성화 (Cross-Filter 사용 중)
   confidence_threshold: 0.1        # 키포인트 존재 판단 임계값
   
   # ───────────────────────────────────────────────────────────────
   # [A] 프레임 이탈 체크
   # ───────────────────────────────────────────────────────────────
-  check_bounds: false              # 프레임 이탈 체크 on/off
-                                   # ⚠️ false로 설정하면 프레임 밖 keypoint도 허용
-                                   # 발이 이미지 경계에 있을 때 유용
-  bounds_margin: 0.01              # 프레임 경계 마진 (check_bounds=true일 때만 사용)
+  check_bounds: true               # ✅ 활성화: 프레임 밖 키포인트를 -2 레이어로 마킹
+                                   # 제거하지 않고 out_of_frame_indices에 추가
+                                   # 렌더링 시: 포인트(원)와 연결된 라인도 그리지 않음
+  bounds_margin: 0.05              # 프레임 경계로부터 여유 공간 (5% = 144px @ 2880px)
+                                   # 프레임 밖 150px까지 감지하여 더 넓은 범위 커버
   
   # ───────────────────────────────────────────────────────────────
   # [B] 경계값 감지 (DWPose 감지 실패 패턴)
@@ -63,11 +64,11 @@ ghost_filter:
   # DWPose가 감지 실패 시 좌표를 (0, y), (x, 0), (w-1, y), (x, h-1)에 찍음
   # 이 패턴을 감지하여 제거
   #
-  check_boundary_values: true      # 경계값 감지 on/off
-  boundary_tolerance: 1.0          # 경계에서 몇 px 이내를 무효로 판단
-                                   # 예: 1.0 → x가 0~1 또는 w-2~w-1 범위면 무효
-                                   # ⚠️ 발 키포인트를 살리려면 낮춰야 함!
-                                   # 기존 3.0 → 1.0으로 감소 (정확히 경계값만 제거)
+  check_boundary_values: true      # 더미 좌표 감지 on/off
+  boundary_tolerance: 10.0         # 경계에서 몇 px 이내를 더미로 판단
+                                   # 10.0 = 경계 10px 이내는 더미로 간주
+                                   # DWPose가 프레임 밖을 2-5px 안쪽에 찍는 경향
+                                   # ✅ 30->10 축소: 하단 정상 발 보존
   
   # ───────────────────────────────────────────────────────────────
   # [C] 예측 가능 키포인트 허용
@@ -96,16 +97,124 @@ ghost_filter:
   # [D-2] 손 존재성(품질) 체크
   # ───────────────────────────────────────────────────────────────
   # 손이 가려졌는데도 손가락을 '예측'으로 생성하는 경우,
-  # 손가락(91~132)만 제거합니다. (손목 9/10은 유지)
+  # 손가락(91~132)을 제거하지 않고 -1 레이어(occluded)로 마킹합니다.
   # 작은 손(멀리 있음)은 "손목 주변에 점이 모이는지"로 판단해 과도한 제거를 방지합니다.
   check_hand_occlusion: true
   hand_finger_min_confidence: 0.1
   hand_min_finger_points: 6
   hand_wrist_radius_ratio: 0.8
   hand_wrist_min_radius_px: 60
-  hand_min_near_ratio: 0.8
+  # 손 occlusion 판정 (환각 억제 우선):
+  # - near_ratio(손목 주변 반경 내 점 비율)가 이 값보다 낮으면 손가락을 -1 레이어로 마킹
+  # - 이 값은 "정상 손을 얼마나 살릴지" vs "환각 손을 얼마나 마킹할지"의 트레이드오프입니다.
+  hand_min_near_ratio: 0.5
   hand_far_outlier_ratio: 1.6
   hand_max_far_points: 1
+  # 추측(hallucination) 탐지:
+  # - 평균 confidence가 이 값보다 낮으면 추측으로 판단하여 -1 레이어로 마킹
+  # ✅ 3.0->2.0 완화: 정상 손도 3.0 미만일 수 있음
+  hand_min_avg_confidence: 2.0
+  # - 손가락들의 손목으로부터 거리 표준편차가 이 값보다 작으면 비정상적으로 균일하다고 판단
+  # ✅ 50.0->30.0 완화: 작은 손(멀리 있는 손)은 dist_std가 작을 수 있음
+  hand_min_distance_std: 30.0
+  
+  # ───────────────────────────────────────────────────────────────
+  # [D-3] 발 폐색/환각 억제 (Step 3.5 - 발 전용 기준)
+  # ───────────────────────────────────────────────────────────────
+  # 발은 3개 키포인트만 있고 좁은 영역에 모여있는 게 정상이므로
+  # 손(hand)과 다른 기준을 적용합니다.
+  #
+  # foot_min_distance_std: 발 키포인트 간 거리 표준편차 최소값
+  #   - 손: 30.0 (넓게 펼쳐져야 정상)
+  #   - 발: 10.0 (좁은 영역이 정상)
+  #   - 원리: 발가락 3개(BigToe, SmallToe, Heel)는 원래 60-70px 반경에 모임
+  #
+  # foot_min_avg_confidence: 발 키포인트 평균 신뢰도 최소값
+  #   - 손: 2.0 (멀리 있어도 낮은 신뢰도 허용)
+  #   - 발: 4.0 (높은 신뢰도 요구, DWPose가 확실하게 감지한 경우만)
+  #   - 원리: 발은 전신 사진에서 항상 고신뢰도(6.0+)로 감지됨
+  # ───────────────────────────────────────────────────────────────
+  foot_min_distance_std: 10.0     # 발은 좁은 영역 (기본값: 10.0, 손: 30.0)
+  foot_min_avg_confidence: 4.0    # 발은 높은 신뢰도 (기본값: 4.0, 손: 2.0)
+  
+  # ───────────────────────────────────────────────────────────────
+  # [E] 계층적 연결성 검사 (Chain Kill)
+  # ───────────────────────────────────────────────────────────────
+  check_consistency: true          # 부모 키포인트 제거 시 자식도 제거
+
+# =============================================================================
+# [6] 교차 필터링 (Cross-Filtering) v4.0
+# =============================================================================
+# Body 모델의 "존재 유무" + DWPose의 "정밀 좌표" 결합
+# 부모-자식 종속 필터링으로 DWPose 환각 제거 + 디테일 보존
+#
+# 핵심 전략: "몸통이 보증하면, 디테일은 DWPose 것을 쓴다"
+#
+# 역할 분리:
+#   - Body 모델 (감시자): "여기에 팔이 있는가?" (존재 여부만 판단)
+#   - DWPose (아티스트): "손가락 마디는 어디에?" (정밀 묘사 담당)
+#
+# 예시:
+#   1. Body 모델이 "왼손목 있음" → DWPose 왼손 21개 전부 승인
+#   2. Body 모델이 "무릎 없음" → DWPose 무릎 좌표 무시 (환각 제거)
+# =============================================================================
+cross_filter:
+  enabled: true                    # 교차 필터링 활성화 (Ghost Filter와 배타적)
+  
+  # Body 모델 신뢰도 임계값 (존재 판단)
+  # 이 값보다 높은 신뢰도를 가진 Body 키포인트만 "진짜 존재"로 인정
+  # ⚠️ 너무 낮으면 오검출, 너무 높으면 과도한 제거
+  body_confidence_threshold: 0.25  # 0.25~0.8 권장 (기본: 0.3, knee 보존용)
+  
+  # 부모-자식 종속 규칙
+  enable_hand_dependency: true     # 손목 없으면 손가락도 없음
+  enable_foot_dependency: true     # 발목 없으면 발가락도 없음
+  enable_face_dependency: true     # 코/목 없으면 얼굴도 없음
+  
+  # DWPose 자체 신뢰도 안전 체크
+  # Body가 승인해도 DWPose 신뢰도가 너무 낮으면 제외
+  dw_min_confidence: 0.05          # 0.05~0.1 권장
+  
+  # DWPose 고신뢰도 보호 (우회 통과)
+  # DWPose confidence가 이 값보다 높으면 Body 검증 없이 무조건 승인
+  # Body가 오검출하거나 보지 못한 경우에도 DWPose가 확신하면 보존
+  # ⚠️ 너무 낮으면 할루시네이션 위험, 너무 높으면 디테일 손실
+  dw_high_confidence_threshold: 8.0  # 7.0~10.0 권장 (기본: 8.0, 비활성화: 999.0)
+  
+  # DWPose 전신 확신 모드 (Body 검증 완전 우회)
+  # DWPose의 Body 17개 키포인트가 모두 이 값 이상이면 Cross-Filter 전체 우회
+  # 전신이 명확한 이미지에서 과도한 필터링 방지
+  # ⚠️ 너무 낮으면 할루시네이션 위험, 너무 높으면 우회 효과 없음
+  dw_full_body_confidence_threshold: 6.0  # 5.0~8.0 권장 (기본: 6.0, 비활성화: 999.0)
+  
+  # Clean Mode 설정 (의심 키포인트가 없을 때)
+  # 133개 키포인트 중 suspicious 범위에 있는 것이 0개면 Clean Mode 활성화
+  # Clean Mode에서는 body_confidence_threshold를 완화하여 전신 이미지를 더 잘 통과시킴
+  dw_suspicious_threshold: 2.0     # 이 이하는 의심 키포인트로 판단 (0.05~2.0)
+  clean_mode_body_threshold: 0.2   # Clean mode일 때 body 임계값 (0.3보다 낮게 완화)
+  
+  # Hand 할루시네이션 방지
+  # Body 모델에는 손목까지만 있고 손가락(91-133)은 없음
+  # 손목이 없는데 손가락들이 suspicious 범위에 있으면 할루시네이션으로 판단하여 제거
+  hand_hallucination_check: true   # 손목 없으면 의심 범위 손가락도 제거
+  
+  # Foot 할루시네이션 방지
+  # 발목이 있어도 발가락들이 낮은 신뢰도면 할루시네이션일 수 있음
+  # 발목 Body confidence가 낮거나 발가락이 낮은 DWPose confidence면 제거
+  foot_hallucination_check: true   # 발목 Body 낮으면 발가락도 제거
+  foot_body_confidence_threshold: 0.25  # 발목 Body 임계값 (일반과 동일)
+  foot_dw_min_confidence: 2.5      # 발가락 DWPose 최소 신뢰도 (발가락 전용, 할루시네이션 방지)
+
+# =============================================================================
+# [7] 디버깅
+# =============================================================================
+  # true로 켜면, GhostFilter가 손(91~132, 9/10 포함)을 제거할 때마다
+  # idx/좌표/원인(reason)을 콘솔에 출력하고, 프레임별 요약도 출력합니다.
+  debug_hand_removals: true
+  debug_hand_print_limit: 80
+  debug_hand_summary_only: true
+  debug_hand_print_to_console: true
+  debug_hand_include_wrists: true
 
   # (호환/레거시) 아래 키들은 더 이상 사용하지 않습니다.
   # check_hand_presence: true
@@ -172,6 +281,7 @@ output:
   save_json: true
   save_skeleton_image: true
   save_debug_image: true
+  save_debug_txt: true              # ✅ Cross-Filter 디버그 정보 (_debug.txt) 생성
   auto_crop_enabled: false
   canvas_padding_ratio: 0
   crop_padding_px: 0
@@ -188,6 +298,16 @@ debug:
   visualize_keypoint_bbox: true
   visualize_yolo_bbox: true
   visualize_hybrid_bbox: true
+
+# [11-2] 디버깅 스크립트 실행 제어 (수동 실행 스크립트용)
+# 아래 값으로 손 관련 디버깅 스크립트들이 "실행 자체"를 건너뛰게 할 수 있습니다.
+# - 전체 끄기: debug_tools.enabled: false
+# - 일부만 끄기: 해당 항목만 false
+debug_tools:
+  enabled: true
+  hand_near_ratio_visualization: true   # scripts/visualize_hand_near_ratio.py
+  hand_refiner_debug: true              # scripts/debug_hand_refiner.py
+  hand_clipping_debug: true             # scripts/debug_hand_clipping_20260104_223045.py
 
 # [12] 정렬 설정
 alignment:

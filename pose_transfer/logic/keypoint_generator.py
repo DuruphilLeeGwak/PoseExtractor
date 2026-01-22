@@ -91,8 +91,9 @@ class KeypointGenerator:
             enhanced_kpts, enhanced_scores, missing_indices, ref_scores, scale_ratio
         )
         
-        # 3단계: Hand keypoints - 손목 기준으로 생성 (스케일 적용)
-        generated_count += self._generate_hand_keypoints(
+        # 3단계: Hand keypoints - 국소 스케일 적용
+        print("\n   🖐️ 손 키포인트 생성 (국소 비율 기반)...")
+        generated_count += self._generate_hand_keypoints_with_local_scale(
             enhanced_kpts, enhanced_scores, missing_indices, ref_kpts, ref_scores, scale_ratio
         )
         
@@ -113,8 +114,10 @@ class KeypointGenerator:
         ref_scores: np.ndarray
     ) -> float:
         """
-        ref 대비 src의 크기 비율 계산
+        ref 대비 src의 크기 비율 계산 (전체 body 기준)
         우선순위: 어깨 너비 > 골반 너비 > 1.0(기본값)
+        
+        ⚠️ 주의: 이 스케일은 손/발 같은 국소 부위에는 부적합할 수 있음
         """
         left_shoulder = BODY_KEYPOINTS['left_shoulder']
         right_shoulder = BODY_KEYPOINTS['right_shoulder']
@@ -148,6 +151,98 @@ class KeypointGenerator:
         # 기본값
         print(f"      ⚠️ 스케일 기준점 없음, 기본값 1.0 사용")
         return 1.0
+    
+    def _calculate_local_scale_for_hand(
+        self,
+        src_kpts: np.ndarray,
+        src_scores: np.ndarray,
+        ref_kpts: np.ndarray,
+        ref_scores: np.ndarray,
+        is_left: bool,
+        body_scale: float
+    ) -> float:
+        """
+        손에 특화된 국소 스케일 계산
+        
+        전략:
+        1. src 대칭 손(있는 쪽)의 body 대비 비율 계산
+        2. ref 손(생성할 쪽)의 body 대비 비율 계산
+        3. 두 비율을 조합하여 최종 스케일 도출
+        
+        Args:
+            is_left: True면 왼손, False면 오른손
+            body_scale: 전체 body 스케일 (fallback)
+        
+        Returns:
+            해당 손에 특화된 스케일
+        """
+        # 손목과 어깨 인덱스
+        if is_left:
+            wrist_idx = BODY_KEYPOINTS['left_wrist']
+            shoulder_idx = BODY_KEYPOINTS['left_shoulder']
+            opposite_wrist = BODY_KEYPOINTS['right_wrist']
+            opposite_shoulder = BODY_KEYPOINTS['right_shoulder']
+            hand_start = LEFT_HAND_START_IDX
+            opposite_hand_start = RIGHT_HAND_START_IDX
+        else:
+            wrist_idx = BODY_KEYPOINTS['right_wrist']
+            shoulder_idx = BODY_KEYPOINTS['right_shoulder']
+            opposite_wrist = BODY_KEYPOINTS['left_wrist']
+            opposite_shoulder = BODY_KEYPOINTS['left_shoulder']
+            hand_start = RIGHT_HAND_START_IDX
+            opposite_hand_start = LEFT_HAND_START_IDX
+        
+        # src 대칭 손(반대쪽)이 있는지 확인
+        src_opposite_hand_count = sum(1 for i in range(opposite_hand_start, opposite_hand_start + 21) 
+                                     if i < len(src_scores) and src_scores[i] > self.threshold)
+        
+        if src_opposite_hand_count > 5 and src_scores[opposite_wrist] > self.threshold and src_scores[opposite_shoulder] > self.threshold:
+            # src 대칭 손이 있음 - 그 비율 사용
+            # src 대칭 손의 평균 크기 (손목 → 손가락들)
+            src_opposite_hand_vectors = []
+            for i in range(opposite_hand_start, opposite_hand_start + 21):
+                if i < len(src_scores) and src_scores[i] > self.threshold:
+                    vec = src_kpts[i] - src_kpts[opposite_wrist]
+                    src_opposite_hand_vectors.append(np.linalg.norm(vec))
+            
+            if len(src_opposite_hand_vectors) > 0:
+                src_hand_avg_length = np.mean(src_opposite_hand_vectors)
+                # src 팔 길이 (어깨 → 손목)
+                src_arm_length = np.linalg.norm(src_kpts[opposite_wrist] - src_kpts[opposite_shoulder])
+                
+                if src_arm_length > 1e-6:
+                    # src 손/팔 비율
+                    src_hand_arm_ratio = src_hand_avg_length / src_arm_length
+                    
+                    # ref도 동일하게 계산
+                    if ref_scores[wrist_idx] > self.threshold and ref_scores[shoulder_idx] > self.threshold:
+                        ref_arm_length = np.linalg.norm(ref_kpts[wrist_idx] - ref_kpts[shoulder_idx])
+                        
+                        # ref 손 생성 목표 크기 = ref_arm × src_hand_arm_ratio × body_scale
+                        target_hand_length = ref_arm_length * src_hand_arm_ratio * body_scale
+                        
+                        # ref 손의 원래 평균 크기
+                        ref_hand_vectors = []
+                        for i in range(hand_start, hand_start + 21):
+                            if i < len(ref_scores) and ref_scores[i] > self.threshold:
+                                vec = ref_kpts[i] - ref_kpts[wrist_idx]
+                                ref_hand_vectors.append(np.linalg.norm(vec))
+                        
+                        if len(ref_hand_vectors) > 0:
+                            ref_hand_avg_length = np.mean(ref_hand_vectors)
+                            if ref_hand_avg_length > 1e-6:
+                                local_scale = target_hand_length / ref_hand_avg_length
+                                side = "왼손" if is_left else "오른손"
+                                print(f"      🖐️ {side} 국소 스케일: {local_scale:.3f}")
+                                print(f"         src 손/팔 비율: {src_hand_arm_ratio:.3f}")
+                                print(f"         ref 팔 길이: {ref_arm_length:.1f}px")
+                                print(f"         목표 손 크기: {target_hand_length:.1f}px")
+                                print(f"         ref 손 원본: {ref_hand_avg_length:.1f}px")
+                                return local_scale
+        
+        # fallback: body scale 사용
+        print(f"      ⚠️ 대칭 손 없음, body_scale={body_scale:.3f} 사용")
+        return body_scale
     
     def _generate_anatomical(
         self, 
@@ -279,6 +374,48 @@ class KeypointGenerator:
             scores[right_idx] = scores[left_idx] * 0.8
             generated += 1
             print(f"      ✨ {right_name} 생성 (대칭: {left_name} 미러링)")
+        
+        return generated
+    
+    def _generate_hand_keypoints_with_local_scale(
+        self,
+        kpts: np.ndarray,
+        scores: np.ndarray,
+        missing_indices: np.ndarray,
+        ref_kpts: np.ndarray,
+        ref_scores: np.ndarray,
+        body_scale: float
+    ) -> int:
+        """손 키포인트 생성 (국소 비율 기반)"""
+        generated = 0
+        
+        # 왼손
+        left_wrist_idx = BODY_KEYPOINTS['left_wrist']
+        if scores[left_wrist_idx] > self.threshold:
+            left_hand_missing = [idx for idx in range(LEFT_HAND_START_IDX, LEFT_HAND_END_IDX + 1) 
+                                if idx in missing_indices]
+            if len(left_hand_missing) > 0:
+                local_scale = self._calculate_local_scale_for_hand(
+                    kpts, scores, ref_kpts, ref_scores, is_left=True, body_scale=body_scale
+                )
+                generated += self._generate_hand_from_wrist(
+                    kpts, scores, missing_indices, ref_kpts, ref_scores,
+                    left_wrist_idx, LEFT_HAND_START_IDX, LEFT_HAND_END_IDX, "왼손", local_scale
+                )
+        
+        # 오른손
+        right_wrist_idx = BODY_KEYPOINTS['right_wrist']
+        if scores[right_wrist_idx] > self.threshold:
+            right_hand_missing = [idx for idx in range(RIGHT_HAND_START_IDX, RIGHT_HAND_END_IDX + 1) 
+                                 if idx in missing_indices]
+            if len(right_hand_missing) > 0:
+                local_scale = self._calculate_local_scale_for_hand(
+                    kpts, scores, ref_kpts, ref_scores, is_left=False, body_scale=body_scale
+                )
+                generated += self._generate_hand_from_wrist(
+                    kpts, scores, missing_indices, ref_kpts, ref_scores,
+                    right_wrist_idx, RIGHT_HAND_START_IDX, RIGHT_HAND_END_IDX, "오른손", local_scale
+                )
         
         return generated
     

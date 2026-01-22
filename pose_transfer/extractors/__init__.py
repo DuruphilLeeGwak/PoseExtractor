@@ -6,6 +6,8 @@ from .dwpose_extractor import (
     RTMLIB_AVAILABLE
 )
 
+from .body_extractor import BodyExtractor
+
 from .person_filter import (
     PersonFilter,
     PersonScore,
@@ -43,6 +45,8 @@ __all__ = [
     'extract_pose',
     'draw_pose',
     'RTMLIB_AVAILABLE',
+    # Body Extractor
+    'BodyExtractor',
     # Person Filter
     'PersonFilter',
     'PersonScore',
