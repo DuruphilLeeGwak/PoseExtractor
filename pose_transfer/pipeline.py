@@ -404,6 +404,8 @@ class PoseTransferPipeline:
         self,
         trans_kpts: np.ndarray,
         trans_scores: np.ndarray,
+        src_kpts: np.ndarray,
+        src_scores: np.ndarray,
         src_face: Any,
         align_by_feet: bool,
     ) -> Tuple[np.ndarray, float]:
@@ -431,7 +433,25 @@ class PoseTransferPipeline:
         if current_trans_face.size <= 1 or src_face.size <= 1:
             return trans_kpts, 1.0
 
-        scale_factor = float(np.clip(src_face.size / current_trans_face.size, 0.5, 2.0))
+        # src 비율 유지: (face/shoulder) 비율을 trans에 맞춤
+        LS, RS = 5, 6
+        src_shoulder_width = (
+            np.linalg.norm(src_kpts[RS] - src_kpts[LS])
+            if (src_scores[LS] > 0.1 and src_scores[RS] > 0.1)
+            else 0.0
+        )
+        trans_shoulder_width = (
+            np.linalg.norm(trans_kpts[RS] - trans_kpts[LS])
+            if (trans_scores[LS] > 0.1 and trans_scores[RS] > 0.1)
+            else 0.0
+        )
+
+        if src_shoulder_width > 1e-6 and trans_shoulder_width > 1e-6:
+            src_ratio = src_face.size / src_shoulder_width
+            trans_ratio = current_trans_face.size / trans_shoulder_width
+            scale_factor = float(np.clip(src_ratio / trans_ratio, 0.5, 2.0))
+        else:
+            scale_factor = float(np.clip(src_face.size / current_trans_face.size, 0.5, 2.0))
         if abs(scale_factor - 1.0) < 1e-6:
             return trans_kpts, 1.0
 
@@ -524,7 +544,9 @@ class PoseTransferPipeline:
         )
         
         # [STEP 6] Scaling
-        trans_kpts, scale = self._sync_scale_to_source_face(trans_kpts, trans_scores, src_face, align_by_feet)
+        trans_kpts, scale = self._sync_scale_to_source_face(
+            trans_kpts, trans_scores, src_kpts, src_scores, src_face, align_by_feet
+        )
         
         # [STEP 10] Aligning
         trans_kpts = self.align_mgr.align_coordinates(
