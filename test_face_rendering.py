@@ -2,6 +2,9 @@
 Face Rendering 설정 테스트 스크립트
 - face_rendering.enabled=true일 때와 false일 때를 비교
 """
+import os
+# OpenMP 중복 로딩 에러 방지 (onnxruntime/rtmlib 충돌 회피)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import sys
 from pathlib import Path
 import yaml

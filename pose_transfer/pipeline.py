@@ -442,13 +442,10 @@ class PoseTransferPipeline:
             # 얼굴 관련 인덱스: body(0~4) + face(23~90)
             face_indices = list(range(0, 5)) + list(range(23, 91))
 
-            # Pivot: 어깨(5,6) -> 목(Neck) / 없으면 얼굴 중심
-            LS, RS = 5, 6
-            if (
-                LS < len(trans_scores) and RS < len(trans_scores)
-                and trans_scores[LS] > 0.1 and trans_scores[RS] > 0.1
-            ):
-                pivot = (trans_kpts[LS] + trans_kpts[RS]) / 2.0
+            # Pivot: 코를 기준으로 스케일링 (목 길이 보존)
+            NOSE = 0
+            if NOSE < len(trans_scores) and trans_scores[NOSE] > 0.1:
+                pivot = trans_kpts[NOSE].astype(np.float32)
             else:
                 pivot = np.array(current_trans_face.center, dtype=np.float32)
 

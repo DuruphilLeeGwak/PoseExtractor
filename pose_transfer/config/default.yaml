@@ -172,10 +172,10 @@ bbox:
 # [13] 얼굴 렌더링 (부위별 제어)
 # =============================================================================
 face_rendering:
-  enabled: false
+  enabled: true
   parts:
     jawline:
-      enabled: false
+      enabled: true
       color: [255, 255, 255]
     left_eyebrow:
       enabled: true

@@ -14,6 +14,9 @@ from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Union, Tuple
 
+# OpenMP 중복 로딩 에러 방지 (onnxruntime/rtmlib 충돌 회피)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 from .pipeline import PipelineConfig, PoseTransferPipeline
 from .utils.io import save_json, save_image, load_image
 from .logic.debug_generator import generate_debug_info

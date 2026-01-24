@@ -15,9 +15,13 @@ Pose Transfer CLI Entry Point
    → data/outputs/ 에 결과 저장
 """
 import sys
+import os
 import yaml
 import argparse
 from pathlib import Path
+
+# OpenMP 중복 로딩 에러 방지 (onnxruntime/rtmlib 충돌 회피)
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from pose_transfer.api import execute_pose_transfer
 
