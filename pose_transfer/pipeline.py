@@ -354,7 +354,9 @@ class PoseTransferPipeline:
             img = image
         
         image_size = img.shape[:2]
+        print("   [extract_pose] DWPose extract start")
         all_kpts, all_scores = self.extractor.extract(img)
+        print(f"   [extract_pose] DWPose extract done: persons={len(all_kpts)}")
         
         if len(all_kpts) == 0:
             return np.zeros((133, 2)), np.zeros(133), -1, image_size
@@ -368,8 +370,10 @@ class PoseTransferPipeline:
         
         # [v4.0] Cross-Filter: Body + DWPose 결합
         if self.config.cross_filter_enabled and self.body_extractor and self.cross_filter:
+            print("   [extract_pose] Body extractor start")
             # Body 17 keypoints 추출
             body_kpts_all, body_scores_all = self.body_extractor.extract(img)
+            print(f"   [extract_pose] Body extractor done: persons={len(body_kpts_all)}")
             if len(body_kpts_all) > 0:
                 # DWPose와 동일한 person 선택
                 if filter_person and self.config.filter_enabled and len(body_kpts_all) > 1:
@@ -394,9 +398,11 @@ class PoseTransferPipeline:
                 print(f"✅ Cross-Filter 적용: {len(approved_indices)}/133 keypoints 승인")
         
         if self.config.hand_refinement_enabled:
+            print("   [extract_pose] Hand refinement start")
             kpts, scores, _ = self.hand_refiner.refine_both_hands(
                 img, kpts, scores, self.extractor
             )
+            print("   [extract_pose] Hand refinement done")
         
         return kpts, scores, idx, image_size
 

@@ -116,11 +116,32 @@ class PoseTransferEngine:
         )
         self.body_logic.transfer_torso(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, hand_scale_ratio, processed, transfer_log)
         self.body_logic.transfer_chain(trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log, is_lower=False)
+        # Fine-tune upper limb ratios before hand transfer
+        self.body_logic.fine_tune_upper_ratio(
+            trans_kpts, trans_scores,
+            source_keypoints, source_scores,
+            reference_keypoints, reference_scores,
+            processed, transfer_log
+        )
         
         # Lower Body
         if ref_lower_valid:
             self.body_logic.transfer_chain(trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log, is_lower=True)
-            self.body_logic.transfer_feet(trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log)
+            self.body_logic.transfer_feet(
+                trans_kpts, trans_scores,
+                source_keypoints, source_scores,
+                corrected_lengths,
+                reference_keypoints, reference_scores,
+                hand_scale_ratio,
+                processed, transfer_log
+            )
+            # Fine-tune lower limb ratios after feet transfer
+            self.body_logic.fine_tune_lower_ratio(
+                trans_kpts, trans_scores,
+                source_keypoints, source_scores,
+                reference_keypoints, reference_scores,
+                processed, transfer_log
+            )
 
         # ══════════════════════════════════════════════════════════════
         # STEP 1.5: Fill Missing Keypoints from Reference
@@ -158,7 +179,13 @@ class PoseTransferEngine:
         # ══════════════════════════════════════════════════════════════
         if self.config.use_hands:
             print("\n✋ Hand Transfer...")
-            self._transfer_hands(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, hand_scale_ratio)
+            self._transfer_hands(
+                trans_kpts, trans_scores,
+                source_keypoints, source_scores,
+                reference_keypoints, reference_scores,
+                hand_scale_ratio,
+                transfer_log=transfer_log
+            )
 
         print("\n" + "="*70)
         print("✅ Transfer Complete")
@@ -736,7 +763,7 @@ class PoseTransferEngine:
         self._transfer_body_face(trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores)
         self._transfer_face_landmarks(trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores)
 
-    def _transfer_hands(self, trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores, hand_scale_ratio):
+    def _transfer_hands(self, trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores, hand_scale_ratio, transfer_log=None):
         """
         손 전이: REF 구조 우선 + SRC 크기 비율 반영
         
@@ -750,22 +777,80 @@ class PoseTransferEngine:
         print("👋 _transfer_hands() - REF pose + SRC size")
         print("="*60)
         print(f"   hand_scale_ratio (ref→src): {hand_scale_ratio:.3f}")
+
+        if transfer_log is not None:
+            transfer_log['hand_scale_ratio'] = float(hand_scale_ratio)
+            transfer_log.setdefault('hand_debug', [])
         
         LW, RW = 9, 10
         # Left(91-111), Right(112-132)
-        
+
+        def _hand_mean(kpts, scores, wrist_idx, start, end, thr=0.2):
+            if wrist_idx >= len(scores) or scores[wrist_idx] <= thr:
+                return None, 0
+            wrist = kpts[wrist_idx]
+            dists = []
+            for idx in range(start, end):
+                if idx < len(scores) and scores[idx] > thr:
+                    dists.append(np.linalg.norm(kpts[idx] - wrist))
+            if len(dists) == 0:
+                return None, 0
+            return float(np.mean(dists)), len(dists)
+
+        def _torso_length(kpts, scores, thr=0.2):
+            l_sh, r_sh = BODY_KEYPOINTS['left_shoulder'], BODY_KEYPOINTS['right_shoulder']
+            l_hip, r_hip = BODY_KEYPOINTS['left_hip'], BODY_KEYPOINTS['right_hip']
+            if (scores[l_sh] > thr and scores[r_sh] > thr and scores[l_hip] > thr and scores[r_hip] > thr):
+                neck = (kpts[l_sh] + kpts[r_sh]) / 2.0
+                root = (kpts[l_hip] + kpts[r_hip]) / 2.0
+                return float(np.linalg.norm(neck - root))
+            return None
+
         hands = [
             (LW, 91, 112, "Left"),
             (RW, 112, 133, "Right")
         ]
+
+        # Precompute src/ref hand means for both sides
+        src_means = {}
+        ref_means = {}
+        for wrist_idx, start, end, side in hands:
+            src_mean, src_cnt = _hand_mean(src_kpts, src_scores, wrist_idx, start, end)
+            ref_mean, ref_cnt = _hand_mean(ref_kpts, ref_scores, wrist_idx, start, end)
+            src_means[side] = (src_mean, src_cnt)
+            ref_means[side] = (ref_mean, ref_cnt)
+
+        # Src base: max of available hand sizes
+        src_base_candidates = [m for m, c in src_means.values() if m is not None and c > 5]
+        src_base = float(max(src_base_candidates)) if len(src_base_candidates) > 0 else None
+
+        # Ref hand/torso ratios
+        ref_torso = _torso_length(ref_kpts, ref_scores)
+        ref_ratios = {}
+        for side, (ref_mean, ref_cnt) in ref_means.items():
+            if ref_mean is not None and ref_cnt > 5 and ref_torso is not None and ref_torso > 1e-6:
+                ref_ratios[side] = float(ref_mean / ref_torso)
+        ref_ratio_max = max(ref_ratios.values()) if len(ref_ratios) > 0 else None
         
         for wrist_idx, start, end, side in hands:
             print(f"\n   [{side}] Checking wrist...")
             print(f"      wrist_idx={wrist_idx}")
             print(f"      trans_wrist_score={trans_scores[wrist_idx]:.3f}")
+
+            hand_debug = {
+                'side': side,
+                'wrist_idx': int(wrist_idx),
+                'trans_wrist_score': float(trans_scores[wrist_idx])
+            }
             
             if trans_scores[wrist_idx] < 0.1:
                 print(f"      ❌ trans wrist score < 0.1, SKIP")
+                hand_debug.update({
+                    'status': 'skip',
+                    'reason': 'trans_wrist_score<0.1'
+                })
+                if transfer_log is not None:
+                    transfer_log['hand_debug'].append(hand_debug)
                 continue
             
             trans_wrist = trans_kpts[wrist_idx]
@@ -776,6 +861,8 @@ class PoseTransferEngine:
             
             print(f"      src_hand_count={src_hand_count}/21")
             print(f"      ref_hand_count={ref_hand_count}/21")
+            hand_debug['src_hand_count'] = int(src_hand_count)
+            hand_debug['ref_hand_count'] = int(ref_hand_count)
             
             if ref_hand_count > 5:
                 # REF 손 구조 사용 + SRC 크기 비율 반영
@@ -783,7 +870,22 @@ class PoseTransferEngine:
                 scale = hand_scale_ratio
                 scale_source = f"hand_scale_ratio={hand_scale_ratio:.3f}"
 
-                if src_hand_count > 5:
+                # New strategy: ref hand/torso ratio normalized to src max hand size
+                ref_mean, ref_cnt = ref_means.get(side, (None, 0))
+                if src_base is not None and ref_mean is not None and ref_cnt > 5 and ref_ratio_max is not None and ref_ratio_max > 1e-6:
+                    ref_ratio = ref_ratios.get(side, None)
+                    if ref_ratio is not None and ref_ratio > 0:
+                        target_hand_size = src_base * (ref_ratio / ref_ratio_max)
+                        scale = float(target_hand_size / ref_mean)
+                        scale_source = "ref hand/torso ratio normalized to src max"
+                        hand_debug['src_hand_base'] = float(src_base)
+                        hand_debug['ref_torso_len'] = float(ref_torso) if ref_torso is not None else None
+                        hand_debug['ref_hand_ratio'] = float(ref_ratio)
+                        hand_debug['ref_hand_ratio_max'] = float(ref_ratio_max)
+                        hand_debug['target_hand_size'] = float(target_hand_size)
+
+                # Fallback: mean(src/ref hand size)
+                if scale_source.startswith("hand_scale_ratio") and src_hand_count > 5:
                     src_wrist = src_kpts[wrist_idx]
                     src_dists = []
                     ref_dists = []
@@ -795,8 +897,13 @@ class PoseTransferEngine:
                             src_dists.append(np.linalg.norm(src_kpts[idx] - src_wrist))
                             ref_dists.append(np.linalg.norm(ref_kpts[idx] - ref_wrist))
                     if len(ref_dists) >= 3 and np.mean(ref_dists) > 1e-6:
-                        scale = float(np.mean(src_dists) / np.mean(ref_dists))
+                        src_mean = float(np.mean(src_dists)) if len(src_dists) > 0 else 0.0
+                        ref_mean = float(np.mean(ref_dists))
+                        scale = float(src_mean / ref_mean)
                         scale_source = "mean(src/ref hand size)"
+                        hand_debug['src_hand_mean_dist'] = src_mean
+                        hand_debug['ref_hand_mean_dist'] = ref_mean
+                        hand_debug['pairwise_count'] = int(min(len(src_dists), len(ref_dists)))
 
                 print(f"      → Using REFERENCE (pose) + SRC size ({scale_source}, scale={scale:.3f})")
                 print(f"      ref_wrist={ref_wrist}")
@@ -814,6 +921,14 @@ class PoseTransferEngine:
                             print(f"         idx={idx}: rel_length={np.linalg.norm(rel):.1f}, scaled_length={np.linalg.norm(scaled_rel):.1f}")
                 print(f"      ✅ Used REFERENCE (scaled by {scale:.3f}): {transferred}/21 keypoints")
 
+                hand_debug.update({
+                    'status': 'ok',
+                    'strategy': 'reference',
+                    'scale': float(scale),
+                    'scale_source': scale_source,
+                    'transferred': int(transferred)
+                })
+
             elif src_hand_count > 5:
                 # REF 손이 없으면 SRC 사용 (fallback)
                 src_wrist = src_kpts[wrist_idx]
@@ -825,9 +940,23 @@ class PoseTransferEngine:
                         trans_scores[idx] = src_scores[idx]
                         transferred += 1
                 print(f"      ✅ Used SOURCE (fallback): {transferred}/21 keypoints")
+                hand_debug.update({
+                    'status': 'ok',
+                    'strategy': 'source_fallback',
+                    'scale': 1.0,
+                    'scale_source': 'source_relative',
+                    'transferred': int(transferred)
+                })
 
             else:
                 print(f"      ⚠️ No valid hand in both src and ref (src={src_hand_count}, ref={ref_hand_count})")
+                hand_debug.update({
+                    'status': 'skip',
+                    'reason': 'no_valid_hand'
+                })
+
+            if transfer_log is not None:
+                transfer_log['hand_debug'].append(hand_debug)
 
     def _check_lower_body_valid(self, kpts, scores, img_h):
         # ... (기존 로직 유지)
