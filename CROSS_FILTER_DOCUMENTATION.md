@@ -8,6 +8,7 @@
 
 ## 목차
 
+0. [왜 Cross-Filter인가?](#0-왜-cross-filter인가)
 1. [개요](#1-개요)
 2. [시스템 아키텍처](#2-시스템-아키텍처)
 3. [문제 발견 및 해결 과정](#3-문제-발견-및-해결-과정)
@@ -15,6 +16,221 @@
 5. [최종 구성 및 설정](#5-최종-구성-및-설정)
 6. [테스트 결과 및 검증](#6-테스트-결과-및-검증)
 7. [향후 개선 방향](#7-향후-개선-방향)
+
+---
+
+## 0. 왜 Cross-Filter인가?
+
+### 0.1 Ghost Filter의 한계
+
+**초기 접근: Ghost Filter**
+
+프로젝트 초기에는 **Ghost Filter**를 사용하여 할루시네이션을 제거하려고 했습니다.
+
+**Ghost Filter의 원리**:
+```python
+# 프레임 이탈 체크
+if x < margin or x > width - margin or y < margin or y > height - margin:
+    score = 0  # 프레임 밖 → 제거
+
+# 경계값 감지
+if x == 0 or y == 0 or x == width-1 or y == height-1:
+    score = 0  # 정확히 경계선 → 제거
+    
+# 클러스터링 체크
+if all_points_clustered_in_one_location():
+    score = 0  # 한 점에 뭉침 → 제거
+```
+
+**Ghost Filter의 문제점**:
+
+1. **증상만 치료, 원인은 해결 못함**:
+   ```
+   질문: "8.jpg에서 손이 포켓 안에 있는데 손가락이 그려지는 이유는?"
+   답변: Ghost Filter는 "프레임 밖인지"만 체크
+         → 포켓 안 손(프레임 안)은 통과시킴 ❌
+   ```
+
+2. **정상 키포인트도 오판**:
+   ```
+   질문: "반신 사진에서 정상적으로 프레임 밖에 있는 발도 제거되나요?"
+   답변: Ghost Filter는 "프레임 밖 = 할루시네이션"으로 가정
+         → 실제 프레임 밖 발도 제거됨 ❌
+   ```
+
+3. **DWPose만 사용하는 근본적 한계**:
+   ```
+   질문: "DWPose confidence가 높은데도 할루시네이션인 경우가 있나요?"
+   답변: 있습니다!
+         - 8.jpg 손가락: confidence 3.8~5.2 (고신뢰)
+         - 9.jpg 손가락: confidence 4.8~5.4 (고신뢰)
+         → Confidence만으로는 할루시네이션 판별 불가 ❌
+   ```
+
+4. **Threshold 조정의 딜레마**:
+   ```
+   질문: "margin을 넓히면 할루시네이션이 더 제거되나요?"
+   답변: margin 5% → 10% → 20%로 늘리면?
+         - 할루시네이션 제거율 증가 ✓
+         - 정상 키포인트도 과도하게 제거 ❌
+         - 전신 사진에서도 발/손이 사라짐 ❌
+   ```
+
+**실제 대화 예시**:
+```
+사용자: "Ghost Filter로 8.jpg 포켓 손 할루시네이션을 제거할 수 있나요?"
+답변: "Ghost Filter는 프레임 이탈만 체크합니다.
+      포켓 안 손은 프레임 안에 있으므로 통과됩니다.
+      DWPose가 confidence 5.0+ 고신뢰도로 추론한 것을
+      '프레임 안'이라는 이유만으로는 걸러낼 수 없습니다."
+
+사용자: "그럼 어떻게 해야 하나요?"
+답변: "다른 모델의 도움이 필요합니다.
+      Body 모델이 '손이 없다'고 판단하면
+      → DWPose 손가락도 제거하는 방식이 필요합니다."
+```
+
+---
+
+### 0.2 Cross-Filter의 탄생
+
+**핵심 통찰**:
+> Ghost Filter의 실패는 "DWPose 단독 사용"이 문제  
+> 해결책: **다른 모델과 교차 검증 (Cross-Validation)**
+
+**Body 모델 도입 이유**:
+
+1. **할 수 있는 것**: "있다/없다" 판별
+   ```
+   Body(YOLO-Pose 17 keypoints):
+   - 손목: confidence 0.833 → "손목 있음" ✓
+   - 발목: confidence 0.252 → "발목 희미함" ⚠️
+   - 무릎: confidence 0.078 → "무릎 없음" ❌
+   ```
+
+2. **할 수 없는 것**: 정확한 위치 추론
+   ```
+   Body는 17개만 감지:
+   - 손가락 21개 × 2: 없음
+   - 발가락 3개 × 2: 없음
+   - 얼굴 68개: 없음
+   → 디테일은 DWPose가 담당
+   ```
+
+3. **할루시네이션에 강함**:
+   ```
+   질문: "Body도 할루시네이션이 있나요?"
+   답변: DWPose보다 훨씬 적습니다!
+   
+   8.jpg 포켓 손 예시:
+   - DWPose 손가락: confidence 5.0+ (있다고 착각!)
+   - Body 손목: confidence 0.833 (손목만 보임)
+   
+   → Body는 "손목은 있지만 손은 안 보임"을 구별 ✓
+   ```
+
+**Cross-Filter 설계 원칙**:
+
+```python
+# 역할 분담
+Body: "Validator" (검증자)
+  → "있다" or "없다" 판단만 담당
+  → 할루시네이션에 강함 (보수적 판단)
+
+DWPose: "Artist" (예술가)
+  → 정확한 위치, 디테일 담당
+  → 할루시네이션 위험 있음 (공격적 추론)
+
+# Cross-Validation 로직
+if Body.says("없음"):
+    DWPose.result = REJECT  # Body가 막음
+elif Body.says("있음"):
+    if DWPose.confidence > threshold:
+        DWPose.result = ACCEPT  # Body가 보증
+    else:
+        DWPose.result = REJECT  # 위치 불확실
+```
+
+**실제 대화에서 나온 해결**:
+
+```
+사용자: "8.jpg 포켓 손을 어떻게 제거하죠?"
+답변: "Body 손목이 0.833 고신뢰인데
+      손가락도 고신뢰(5.0+)라면?
+      → 이건 할루시네이션 패턴입니다!
+      
+      Adaptive Threshold 적용:
+      - Body wrist < 0.5: 손 희미함 → threshold 낮춤 (1.8)
+      - Body wrist > 0.8: 손목만 명확 → threshold 높임 (3.5)
+      
+      8.jpg: Body wrist=0.833 → threshold=3.5
+      → 일부 손가락(conf < 3.5) 제거됨 ✓"
+
+사용자: "14.jpg 왼쪽 골반이 안 그려지는데 이미지엔 보이는데요?"
+답변: "Body: left_hip conf=0.378 (있다고 판단)
+      DWPose: left_hip conf=1.823 (suspicious 범위)
+      
+      → DWPose confidence < 2.0 = 위치 불확실
+      → Body가 '있다'고 해도 DWPose가 '어디'를 모르면 제거
+      
+      실제 렌더링해보니 정확한 위치가 아니었습니다.
+      → 안 그리는 게 맞습니다 ✓"
+```
+
+---
+
+### 0.3 Ghost Filter 제거 결정
+
+**Cross-Filter 도입 후 검증**:
+
+1. **22장 테스트 이미지 검증**:
+   - 할루시네이션 제거율: 80%+
+   - 정상 키포인트 보존율: 95%+
+   - Ghost Filter 없이도 충분한 성능 ✓
+
+2. **중복 필터링 불필요**:
+   ```
+   Cross-Filter가 이미 처리:
+   - Stage 1: Body 검증 (없는 부위 제거)
+   - Stage 2-4: 종속 규칙 (부모 없으면 자식 제거)
+   - Suspicious 제거: confidence < 2.0 (불확실한 위치)
+   
+   → Ghost Filter의 프레임 이탈 체크 불필요
+   ```
+
+3. **코드 복잡도 감소**:
+   ```
+   Before: DWPose → Ghost Filter → Cross-Filter → Renderer
+   After:  DWPose + Body → Cross-Filter → Renderer
+   
+   - 파이프라인 단순화 ✓
+   - 유지보수 용이 ✓
+   - 성능 향상 (필터 1개 감소) ✓
+   ```
+
+4. **설정 혼란 제거**:
+   ```yaml
+   # Before (복잡함)
+   ghost_filter:
+     enabled: false  # 왜 비활성화?
+     bounds_margin: 0.05
+     predictable_margin: 0.15
+     # ... 12개 옵션
+   
+   cross_filter:
+     enabled: true
+     # ... 8개 옵션
+   
+   # After (명확함)
+   cross_filter:
+     enabled: true
+     # Cross-Filter만 사용
+   ```
+
+**최종 결정**:
+> Ghost Filter를 프로젝트에서 완전히 제거  
+> Cross-Filter가 할루시네이션 제거를 충분히 담당  
+> 코드 단순화 및 유지보수성 향상
 
 ---
 
@@ -83,16 +299,15 @@
     └────┬─────────┘
          │
     ┌────▼─────────┐
-    │Ghost Filter  │ (프레임 이탈 체크)
-    └────┬─────────┘
-         │
-    ┌────▼─────────┐
     │   Renderer   │
     └────┬─────────┘
          │
     ┌────▼─────────┐
     │Final Output  │
     └──────────────┘
+
+참고: Ghost Filter는 현재 비활성화 상태 (enabled: false)
+      Cross-Filter가 할루시네이션 제거를 충분히 처리
 ```
 
 ### 2.2 Cross-Filter 처리 단계
@@ -187,7 +402,7 @@ pose_transfer/
 ├── logic/
 │   ├── cross_filter.py          # 핵심 Cross-Filter 로직
 │   ├── debug_generator.py       # 디버그 정보 생성
-│   └── ghost_filter.py          # 프레임 이탈 체크
+│   └── ghost_filter.py          # 프레임 이탈 체크 (현재 비활성화)
 ├── extractors/
 │   ├── dwpose_extractor.py      # DWPose 추론
 │   └── body_extractor.py        # Body(YOLO) 추론 (신규)
@@ -695,17 +910,13 @@ cross_filter:
                   │ approved_indices (Set[int])
                   │
     ┌─────────────▼──────────────────────────────┐
-    │        Ghost Filter Stage                  │
-    │  - Frame margin check (5%)                │
-    │  - Boundary tolerance (10px)              │
-    │  - Occluded/Out-of-frame marking          │
-    └─────────────┬──────────────────────────────┘
-                  │
-    ┌─────────────▼──────────────────────────────┐
     │        Renderer Stage                      │
     │  - Draw bones (body/face/hands/feet)      │
-    │  - Apply occluded transparency (50%)      │
-    │  - Skip out-of-frame lines                │
+    │  - Color coding by confidence             │
+    │  - Line thickness by importance           │
+    │                                            │
+    │  Note: Ghost Filter 비활성화 상태         │
+    │        (Cross-Filter가 검증 처리)         │
     └─────────────┬──────────────────────────────┘
                   │
     ┌─────────────▼──────────────────────────────┐
@@ -1066,6 +1277,7 @@ def check_anatomical_constraints(keypoints):
   - 핵심 기능 모두 구현 완료
   - Adaptive threshold 시스템 작동
   - 종속 규칙 정상 작동
+  - **Ghost Filter 비활성화**: Cross-Filter가 할루시네이션 제거를 충분히 처리하므로 중복 필터링 불필요
 
 - ⚠️ **할루시네이션 제거율**: 80%
   - 8.jpg 등 일부 완전 제거 실패
@@ -1114,7 +1326,145 @@ def check_anatomical_constraints(keypoints):
 - `CROSS_FILTER_DOCUMENTATION.md` (본 문서)
 - `README.md` - 프로젝트 개요
 
-### C. 연락처 및 기여
+### C. Ghost Filter 제거 작업 가이드
+
+**현재 상태**: Ghost Filter 코드는 아직 프로젝트에 남아있으나 `enabled: false`로 비활성화됨
+
+**제거 필요 파일 및 코드**:
+
+#### 1. **pose_transfer/pipeline.py** (주요 작업)
+
+제거할 Import:
+```python
+from .logic.ghost_filter import (
+    GhostFilter, GhostFilterConfig, FilterResult,
+    create_ghost_filter, filter_keypoints
+)
+```
+
+제거할 필드 (PipelineConfig):
+```python
+ghost_filter_enabled: bool = True
+ghost_bounds_margin: float = 0.05
+ghost_predictable_margin: float = 0.15
+ghost_confidence_threshold: float = 0.1
+ghost_check_boundary_values: bool = True
+ghost_boundary_tolerance: float = 3.0
+ghost_check_clustering: bool = True
+ghost_min_cluster_spread: float = 20.0
+# ... 모든 ghost_ 접두사 필드
+```
+
+제거할 메서드:
+```python
+def _apply_ghost_filter_single(self, kpts, scores, image_size):
+    """Ghost Filter 적용"""
+    # 이 메서드 전체 제거
+```
+
+수정할 코드 (transfer_poses 메서드):
+```python
+# 제거 전:
+# [STEP 2] Ghost Filter - 프레임 이탈 체크
+src_filtered_scores, src_filter_result = self._apply_ghost_filter_single(...)
+ref_filtered_scores, ref_filter_result = self._apply_ghost_filter_single(...)
+
+# 제거 후:
+# Ghost Filter 단계 완전 삭제
+# Cross-Filter가 직접 scores 처리
+```
+
+#### 2. **pose_transfer/logic/__init__.py**
+
+제거할 Export:
+```python
+from .ghost_filter import (
+    GhostFilter, GhostFilterConfig,
+    create_ghost_filter, FilterResult
+)
+
+__all__ = [
+    # ...
+    'GhostFilter',        # 제거
+    'GhostFilterConfig',  # 제거
+    'create_ghost_filter',  # 제거
+    'FilterResult',       # 제거
+    # ...
+]
+```
+
+#### 3. **pose_transfer/config/default.yaml**
+
+제거할 섹션:
+```yaml
+# =============================================================================
+# [5] Ghost Filter v3.1 (수동 조절 가능)
+# =============================================================================
+ghost_filter:
+  enabled: false
+  confidence_threshold: 0.1
+  # ... 전체 섹션 제거
+```
+
+#### 4. **pose_transfer/renderers/skeleton_renderer.py**
+
+제거할 주석:
+```python
+# GhostFilter의 -2 레이어 마킹을 신뢰 (렌더링 시점 재계산 불필요)
+```
+
+수정할 코드:
+```python
+# 제거 전:
+occluded_indices 파라미터 사용 (Ghost Filter 결과)
+
+# 제거 후:
+occluded_indices 파라미터 제거 또는 사용 안 함
+```
+
+#### 5. **pose_transfer/logic/ghost_filter.py**
+
+**보관 권장**: 완전 삭제하지 말고 `archive/` 폴더로 이동
+```bash
+mkdir -p pose_transfer/logic/archive
+mv pose_transfer/logic/ghost_filter.py pose_transfer/logic/archive/
+```
+
+이유: 향후 참고나 실험을 위해 보관
+
+---
+
+### D. Ghost Filter 제거 체크리스트
+
+수정 순서 (의존성 역순):
+
+- [ ] 1. **default.yaml**: ghost_filter 섹션 제거
+- [ ] 2. **pipeline.py**: 
+  - [ ] PipelineConfig에서 ghost_ 필드 제거
+  - [ ] from_yaml에서 ghost 설정 로드 제거
+  - [ ] __init__에서 ghost_filter 초기화 제거
+  - [ ] _apply_ghost_filter_single 메서드 제거
+  - [ ] transfer_poses에서 Ghost Filter 호출 제거
+- [ ] 3. **logic/__init__.py**: Ghost Filter export 제거
+- [ ] 4. **skeleton_renderer.py**: Ghost Filter 관련 주석/코드 제거
+- [ ] 5. **ghost_filter.py**: archive 폴더로 이동
+
+검증:
+```bash
+# Import 에러 확인
+python -c "from pose_transfer import PoseTransferPipeline; print('OK')"
+
+# 테스트 실행
+python test_transfer.py --source test_io/inputs/14.jpg
+
+# Cross-Filter만 활성화 확인
+# 출력에 "Ghost Filter" 문구 없어야 함
+# "Cross-Filter" 문구만 있어야 함
+```
+
+---
+
+### E. 연락처 및 기여
 
 **작성자**: GitHub Copilot (Claude Sonnet 4.5)  
 **프로젝트**: Pose Extractor (DWPose + Cross-Filter)  
@@ -1124,3 +1474,4 @@ def check_anatomical_constraints(keypoints):
 ---
 
 **END OF DOCUMENT**
+

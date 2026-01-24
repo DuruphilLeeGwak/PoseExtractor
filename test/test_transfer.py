@@ -148,18 +148,8 @@ def process_image(
         # [Step 1] Source 추출
         src_img = load_image(src_path)
         src_kpts, src_scores, _, src_size = pipeline.extract_pose(src_img)
-        # Ghost Filter 적용 (파이프라인과 동일한 규칙)
-        src_scores_f, gf_res = pipeline._apply_ghost_filter_single(src_kpts, src_scores, src_size)
-
-        # Collect GhostFilter debug info into output (instead of only terminal prints)
-        if getattr(gf_res, "debug_lines", None):
-            dbg_path = out_dir / "_ghostfilter_layers_debug.txt"
-            block = [
-                "=" * 100,
-                f"FILE: {src_path.name}",
-                *gf_res.debug_lines,
-            ]
-            _append_with_header_if_needed(dbg_path, GHOSTFILTER_LAYERS_DEBUG_GLOSSARY, block)
+        # Cross-Filter가 extract_pose()에서 이미 적용됨
+        src_scores_f = src_scores
         
         analyze_keypoints("Source", src_scores_f, config_threshold)
 
@@ -175,9 +165,7 @@ def process_image(
         src_skel = pipeline.renderer.render_skeleton_only(
             (src_size[0], src_size[1], 3), 
             src_kpts, 
-            src_scores_f,
-            occluded_indices=gf_res.occluded_indices,
-            out_of_frame_indices=gf_res.out_of_frame_indices
+            src_scores_f
         )
         save_image(src_skel, str(out_dir / f"{file_stem}_sk.jpg"))
         
@@ -185,9 +173,7 @@ def process_image(
         src_overlay = pipeline.renderer.render(
             src_img, 
             src_kpts, 
-            src_scores_f,
-            occluded_indices=gf_res.occluded_indices,
-            out_of_frame_indices=gf_res.out_of_frame_indices
+            src_scores_f
         )
         save_image(src_overlay, str(out_dir / f"{file_stem}_rend.jpg"))
 
@@ -291,7 +277,7 @@ def main():
             
             # Reference 분석 결과도 한 번 저장
             ref_kpts, ref_scores, _, ref_size = pipeline.extract_pose(ref_img)
-            ref_scores_f, _ = pipeline._apply_ghost_filter_single(ref_kpts, ref_scores, ref_size)
+            ref_scores_f = ref_scores
             r_skel = pipeline.renderer.render_skeleton_only((ref_size[0], ref_size[1], 3), ref_kpts, ref_scores_f)
             save_image(r_skel, str(out_dir / "reference_sk.jpg"))
         else:
