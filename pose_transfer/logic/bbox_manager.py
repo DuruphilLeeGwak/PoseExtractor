@@ -161,39 +161,22 @@ class BboxManager:
 
 
     def get_bboxes(self, image, kpts, scores) -> Tuple[BboxInfo, BboxInfo, DebugBboxData]:
-        """
-        Person 및 Face Bbox를 생성하는 메인 메서드
-        
-        처리 흐름:
-        1. Keypoint 기반 Person Bbox 계산
-        2. Keypoint 기반 Face Bbox 계산
-        3. (선택적) YOLO 검증 및 Hybrid Bbox 생성
-        
-        Args:
-            image: 입력 이미지 (np.ndarray, HxWxC)
-            kpts: Keypoint 좌표 배열 (133x2)
-            scores: Keypoint 신뢰도 점수 배열 (133,)
-        
-        Returns:
-            Tuple[BboxInfo, BboxInfo, DebugBboxData]:
-                - hybrid_person: 최종 Person Bbox
-                - hybrid_face: 최종 Face Bbox
-                - debug_data: 모든 중간 Bbox 정보 (디버깅용)
-        """
         h, w = image.shape[:2]
         
-        # Step 1: Keypoint 기반 Bbox 계산
+        # Step 1: Person Bbox 먼저 계산
         kpt_p = self._kpt_to_person(kpts, scores, (h, w))
-        kpt_f = self._kpt_to_face(kpts, scores)
+        
+        # Step 2: Face Bbox 계산 시 Person Bbox 정보를 제약조건으로 전달
+        # (kpt_p를 넘겨줘서 이 영역을 벗어나지 않게 함)
+        kpt_f = self._kpt_to_face(kpts, scores, size=(h, w), person_bbox_info=kpt_p)
         
         # 디버그 데이터 초기화
         debug_data = DebugBboxData(kpt_person=kpt_p, kpt_face=kpt_f)
         
-        # Step 2: YOLO 검증 및 Hybrid Bbox 생성
+        # Step 3: YOLO 검증 (기존 로직 유지)
         if self.config.yolo_verification_enabled and self._yolo_person:
             debug_data, _ = self._run_yolo(image, kpt_p, kpt_f, debug_data)
         else:
-            # YOLO 비활성화 시: Keypoint Bbox를 그대로 사용
             debug_data.hybrid_person = kpt_p
             debug_data.hybrid_face = kpt_f
             
@@ -271,69 +254,122 @@ class BboxManager:
             "keypoint"
         )
 
-    def _kpt_to_face(self, kpts, scores):
+    def _kpt_to_face(self, kpts, scores, size=None, person_bbox_info=None):
         """
-        Keypoint로부터 Face Bounding Box 생성
-        
-        사용되는 Keypoint:
-        - Body: nose(0), eyes(1,2), ears(3,4)
-        - Face: jaw(23-39), brows(40-49)
-        
-        알고리즘:
-        1. 얼굴 관련 keypoint만 선택 (score > threshold)
-        2. 선택된 keypoint들의 min/max로 bbox 계산
-        3. face_bbox_margin(%) 만큼 확장
-        
-        Args:
-            kpts: Keypoint 좌표 배열 (133x2)
-            scores: Keypoint 신뢰도 점수 (133,)
-        
-        Returns:
-            BboxInfo: Face Bbox 정보
-                - 유효 keypoint < 2개면 fallback bbox (0,0,100,100) 반환
+        [Final Adjusted] Face BBox 생성
+        - Gaze-Aware Shift: 뒤통수 확보 (유지)
+        - Person Constraint: Person BBox 범위를 넘지 않도록 절삭 (추가)
+        - Reduced Padding: 상단 패딩 비율 축소 (수정)
         """
-        # 얼굴 관련 keypoint 인덱스 수집
+        # 1. 얼굴 관련 keypoint 인덱스 수집
         idx = (
             [BODY_INDICES['nose']] +      # 코
             BODY_INDICES['eyes'] +         # 눈
             BODY_INDICES['ears'] +         # 귀
-            JAW_INDICES +                  # 턱선 (Face keypoints)
-            BROW_INDICES                   # 눈썹 (Face keypoints)
+            JAW_INDICES +                  # 턱선
+            BROW_INDICES                   # 눈썹
         )
         
-        # score > threshold인 keypoint만 선택
         valid = [
             kpts[i] for i in idx 
             if i < len(scores) and scores[i] > self.config.kpt_threshold
         ]
         
-        # Fallback: 유효 keypoint가 2개 미만이면 기본값 반환
-        if len(valid) < 2: 
-            return BboxInfo(
-                (0, 0, 100, 100), 
-                (50, 50), 
-                100, 
-                "fallback"
-            )
+        if len(valid) < 1: 
+            return BboxInfo((0, 0, 100, 100), (50.0, 50.0), 100.0, "fallback")
         
-        # Min/Max 좌표로 bounding box 계산
+        # 2. 기초 BBox (이목구비 기준)
         v = np.array(valid)
         mn, mx = v.min(0), v.max(0)
+        x1, y1 = mn[0], mn[1]
+        x2, y2 = mx[0], mx[1]
         
-        # Face margin 적용 (설정 파일에서 지정)
+        # -------------------------------------------------------------------
+        # 🧠 Skull Estimation & Constraints
+        # -------------------------------------------------------------------
+        LS, RS = 5, 6
+        NOSE = 0
+        
+        if LS < len(scores) and RS < len(scores) and \
+           scores[LS] > 0.1 and scores[RS] > 0.1:
+            
+            shoulder_width = np.linalg.norm(kpts[RS] - kpts[LS])
+            min_skull_size = shoulder_width * 0.5
+            
+            # (A) Gaze-Aware Shift (뒤통수 확보 - 기존 유지)
+            shift_x = 0.0
+            if scores[NOSE] > 0.1:
+                nose_x = kpts[NOSE][0]
+                neck_x = (kpts[LS][0] + kpts[RS][0]) / 2.0
+                look_vec = nose_x - neck_x
+                if abs(look_vec) > shoulder_width * 0.1:
+                    shift_x = -look_vec * 0.8
+            
+            current_cx = (x1 + x2) / 2
+            target_cx = current_cx + shift_x
+            
+            half_size = min_skull_size / 2
+            new_x1 = target_cx - half_size
+            new_x2 = target_cx + half_size
+            
+            x1 = min(x1, new_x1)
+            x2 = max(x2, new_x2)
+            
+            # (B) Top Padding 조정 (과도한 상측 확장 방지)
+            # 기존 0.6 -> 0.35로 축소 (이마+머리카락 정도만 확보)
+            y1 = y1 - (min_skull_size * 0.35)
+            
+            # 하단은 턱 아래 약간만
+            y2 = max(y2, y1 + min_skull_size * 1.1)
+
+        # -------------------------------------------------------------------
+        # ✂️ Person BBox Constraint (Person 영역 밖으로 나가지 않게 절삭)
+        # -------------------------------------------------------------------
+        if person_bbox_info is not None:
+            px1, py1, px2, py2 = person_bbox_info.bbox
+            
+            # Face BBox가 Person BBox를 벗어나면 잘라냄
+            # 단, Person BBox가 너무 타이트할 수 있으므로 아주 약간의 여유(slack)는 허용 가능
+            # 여기서는 엄격하게 자르는 방식을 적용
+            
+            # 상단(머리 위)이 Person BBox보다 높으면 자름
+            if y1 < py1:
+                # print(f"   ✂️ Clipping Top: {y1:.1f} -> {py1}")
+                y1 = py1
+            
+            # 좌우/하단도 Person BBox 내부로 제한
+            x1 = max(x1, px1)
+            x2 = min(x2, px2)
+            y2 = min(y2, py2)
+
+        # 4. Margin 적용 (기본 설정값)
         margin = self.config.face_bbox_margin
-        wd, ht = mx - mn
+        wd, ht = x2 - x1, y2 - y1
         mx_pad, my_pad = wd * margin, ht * margin
         
-        x1, y1 = int(mn[0] - mx_pad), int(mn[1] - my_pad)
-        x2, y2 = int(mx[0] + mx_pad), int(mx[1] + my_pad)
-        size = max(x2-x1, y2-y1)
+        x1 -= mx_pad
+        y1 -= my_pad
+        x2 += mx_pad
+        y2 += my_pad
+        
+        # 5. 좌표 클리핑
+        x1 = max(0, int(x1))
+        y1 = max(0, int(y1))
+        x2 = max(x1 + 1, int(x2))
+        y2 = max(y1 + 1, int(y2))
+        
+        if size:
+            h, w = size
+            x2 = min(w, x2)
+            y2 = min(h, y2)
+        
+        final_size = float(max(x2-x1, y2-y1))
         
         return BboxInfo(
-            (x1, y1, x2, y2), 
-            ((x1+x2)/2, (y1+y2)/2), 
-            size, 
-            "keypoint"
+            bbox=(x1, y1, x2, y2), 
+            center=((x1+x2)/2.0, (y1+y2)/2.0), 
+            size=final_size, 
+            source="keypoint"
         )
     
     # ============================================================

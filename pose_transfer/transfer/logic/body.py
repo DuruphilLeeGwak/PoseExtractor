@@ -150,94 +150,90 @@ class BodyTransfer:
         processed.add(l_hip); processed.add(r_hip)
         log['torso'] = 'spine_calc'
 
-    def transfer_chain(self, t_kpts, t_scores, lengths, r_kpts, r_scores, scale, processed, log, is_lower=False,
-                      src_proportions=None, ref_proportions=None, src_depths=None, ref_depths=None, depth_z_scale=1.0):
+    def transfer_chain(
+        self,
+        trans_kpts: np.ndarray,
+        trans_scores: np.ndarray,
+        corrected_lengths: dict,
+        ref_kpts: np.ndarray,
+        ref_scores: np.ndarray,
+        hand_scale_ratio: float,
+        processed: set,
+        log: dict = None,
+        is_lower: bool = False,
+        src_proportions=None, ref_proportions=None,
+        src_depths=None, ref_depths=None, depth_z_scale=None
+    ):
         """
-        Per-bone 3D transfer: use src torso length and ref per-bone 3D ratio for each bone.
-        If depth is available, use 3D bone/torso ratio; else fallback to 2D.
+        [수정됨] 사지(팔/다리) 전이 - Source 길이 보존 모드
+        
+        변경사항:
+        - Ref 비율(ratio) 기반 길이 계산을 제거했습니다.
+        - 무조건 corrected_lengths(Src 길이)를 사용하여, Ref가 롱다리여도 Src 비율을 유지합니다.
         """
-        order = self.lower_body_order if is_lower else self.upper_body_order
-        chain_type = "LOWER" if is_lower else "UPPER"
-        print(f"\n   🔍 [DEBUG] transfer_chain({chain_type}) START [3D ratio mode]")
-        print(f"      processed indices: {sorted(processed)}")
+        chain = self.lower_body_order if is_lower else self.upper_body_order
+        chain_name = "LOWER" if is_lower else "UPPER"
+        
+        # 디버그 로그 시작
+        if log is not None:
+            if 'chain_debug' not in log: log['chain_debug'] = []
+            print(f"   🔍 [DEBUG] transfer_chain({chain_name}) START [Source Length Priority]")
+        
+        processed_indices = []
 
-        # Get src torso length (3D if possible)
-        def get_torso_length(proportions, depths=None):
-            if proportions is None:
-                return None
-            if depths is not None and len(depths) == len(t_kpts):
-                # 3D torso length
-                l_sh, r_sh = BODY_KEYPOINTS['left_shoulder'], BODY_KEYPOINTS['right_shoulder']
-                l_hip, r_hip = BODY_KEYPOINTS['left_hip'], BODY_KEYPOINTS['right_hip']
-                if all(idx is not None for idx in [l_sh, r_sh, l_hip, r_hip]):
-                    neck = (t_kpts[l_sh] + t_kpts[r_sh]) / 2.0
-                    root = (t_kpts[l_hip] + t_kpts[r_hip]) / 2.0
-                    dz = ((depths[l_sh] + depths[r_sh]) / 2.0 - (depths[l_hip] + depths[r_hip]) / 2.0) * depth_z_scale
-                    return float(np.sqrt(np.sum((neck - root) ** 2) + dz ** 2))
-            # fallback to 2D
-            return proportions.torso_length
-
-        src_torso = get_torso_length(src_proportions, src_depths)
-        ref_torso = get_torso_length(ref_proportions, ref_depths)
-
-        for _, p_name, children in order:
-            p_idx = get_keypoint_index(p_name)
-            if p_idx not in processed:
+        for parent_name, self_name, children_names in chain:
+            parent_idx = get_keypoint_index(parent_name)
+            self_idx = get_keypoint_index(self_name)
+            
+            # 부모가 처리되지 않았거나 신뢰도가 낮으면 스킵
+            if trans_scores[parent_idx] == 0:
                 continue
-            p_pos = t_kpts[p_idx]
-            for c_name in children:
-                c_idx = get_keypoint_index(c_name)
-                if c_idx is None:
+            
+            # 자식 노드들 처리
+            for child_name in children_names:
+                child_idx = get_keypoint_index(child_name)
+                if child_idx in processed:
                     continue
-                r_score = r_scores[c_idx] if c_idx < len(r_scores) else 0
-                if r_score < 0.1:
-                    print(f"      ❌ {c_name} (idx={c_idx}): ref_score={r_score:.3f} < 0.1, SKIP")
-                    continue
-                bone = f"{p_name}_{c_name}"
-                alt = f"{c_name}_{p_name}"
-
-                # --- Per-bone 3D ratio logic ---
-                # 1. Get ref bone length (3D if possible)
-                def bone_length_3d(kpts, depths, idx1, idx2):
-                    if depths is not None and len(depths) == len(kpts):
-                        diff = kpts[idx2] - kpts[idx1]
-                        dz = (float(depths[idx2]) - float(depths[idx1])) * float(depth_z_scale)
-                        return float(np.sqrt(diff[0] ** 2 + diff[1] ** 2 + dz ** 2))
-                    else:
-                        return calculate_distance(kpts[idx1], kpts[idx2])
-
-                ref_bone_len = bone_length_3d(r_kpts, ref_depths, p_idx, c_idx)
-                # 2. Get ref bone/torso ratio
-                if ref_torso and ref_torso > 1e-6:
-                    ref_bone_ratio = ref_bone_len / ref_torso
+                
+                # 1. 뼈 이름 및 Src 길이 가져오기
+                bone_name = f"{self_name}_{child_name}"
+                
+                # [핵심] Ref 비율 계산 없이, Src의 길이를 직접 사용
+                target_length = corrected_lengths.get(bone_name)
+                
+                # Src 길이가 없으면(감지 실패 등), Fallback으로 거리 직접 계산
+                if target_length is None or target_length <= 0:
+                    # Fallback: Ref 길이 * hand_scale_ratio (최후의 수단)
+                    ref_dist = calculate_distance(ref_kpts[self_idx], ref_kpts[child_idx])
+                    target_length = ref_dist * hand_scale_ratio
+                    src_str = "Fallback(Ref*Scale)"
                 else:
-                    ref_bone_ratio = None
+                    src_str = "SrcFixed"
 
-                # 3. Use src torso length for scale
-                if src_torso and ref_bone_ratio:
-                    length = src_torso * ref_bone_ratio
-                    source = f"src_torso*ref_ratio3d"
+                # 2. 방향 벡터 (Direction) - Ref 기준
+                # Ref에 해당 뼈가 있으면 그 방향을 사용
+                if ref_scores[self_idx] > 0.1 and ref_scores[child_idx] > 0.1:
+                    direction_vec = ref_kpts[child_idx] - ref_kpts[self_idx]
+                    direction = normalize_vector(direction_vec)
                 else:
-                    # fallback: src length or ref*scale
-                    src_length = lengths.get(bone) or lengths.get(alt)
-                    if src_length:
-                        length = src_length
-                        source = "SRC"
-                    else:
-                        length = ref_bone_len * scale
-                        source = f"REF*scale"
+                    # Ref에도 없으면 Src 방향 유지 (거의 발생 안 함)
+                    direction = np.array([0, 1]) # 기본 아래로
 
-                # Use ref direction (angle)
-                vec = r_kpts[c_idx] - r_kpts[p_idx]
-                direct = normalize_vector(vec)
-                t_kpts[c_idx] = p_pos + direct * length
-                t_scores[c_idx] = 0.8
-                processed.add(c_idx)
-                log[c_name] = 'chain3d'
-                print(f"      ✅ {c_name} (idx={c_idx}): length={length:.1f} ({source})")
+                # 3. 좌표 결정: 부모 위치 + (Ref 방향 * Src 길이)
+                trans_kpts[child_idx] = trans_kpts[self_idx] + direction * target_length
+                
+                # 점수는 부모 점수와 Ref 점수 중 낮은 것 (보수적 접근)
+                trans_scores[child_idx] = min(trans_scores[self_idx], ref_scores[child_idx]) \
+                                          if ref_scores[child_idx] > 0 else trans_scores[self_idx] * 0.5
+                
+                processed.add(child_idx)
+                processed_indices.append(child_idx)
+                
+                print(f"      ✅ {child_name} (idx={child_idx}): length={target_length:.1f} ({src_str})")
 
-        print(f"   🔍 [DEBUG] transfer_chain({chain_type}) END [3D ratio mode]")
-        print(f"      final processed: {sorted(processed)}")
+        if log is not None:
+            print(f"   🔍 [DEBUG] transfer_chain({chain_name}) END")
+            print(f"      final processed: {sorted(list(processed))}")
 
     def fine_tune_lower_ratio(
         self,
@@ -548,178 +544,63 @@ class BodyTransfer:
             'deltas_vs_2d': _delta_map(ratio_map_2d, ratio_map_used)
         }
 
-    def transfer_feet(self, t_kpts, t_scores, src_kpts, src_scores, lengths, r_kpts, r_scores, scale, processed, log):
+    def transfer_feet(
+        self,
+        trans_kpts: np.ndarray,
+        trans_scores: np.ndarray,
+        s_kpts: np.ndarray,
+        s_scores: np.ndarray,
+        corrected_lengths: dict,  # 인자 활용
+        r_kpts: np.ndarray,
+        r_scores: np.ndarray,
+        scale: float,
+        processed: set,
+        log: dict = None
+    ):
         """
-        Feet 키포인트 전이 (DEBUG VERSION)
+        발 전이 - Source 길이 우선
         """
-        print(f"\n" + "="*60)
-        print(f"🦶 [DEBUG] transfer_feet()")
-        print("="*60)
-        print(f"   global_scale (어깨비율): {scale:.3f}")
+        print(f"\n============================================================")
+        print(f"🦶 [DEBUG] transfer_feet() - Source Length Priority")
+        print(f"============================================================")
 
-        if log is not None:
-            log.setdefault('foot_debug', [])
-        
-        # 발 관련 뼈 길이 확인
-        feet_bones = [k for k in lengths.keys() if any(x in k for x in ['ankle', 'toe', 'heel'])]
-        print(f"   src에서 계산된 발 뼈 길이: {feet_bones if feet_bones else 'NONE!'}")
-        
-        if not FEET_KEYPOINTS:
-            print(f"   ⚠️ FEET_KEYPOINTS not defined, skipping")
-            return
-
-        def _foot_mean(kpts, scores, ankle_idx, foot_indices, thr=0.2):
-            if ankle_idx is None or ankle_idx >= len(scores) or scores[ankle_idx] <= thr:
-                return None, 0
-            ankle = kpts[ankle_idx]
-            dists = []
-            for idx in foot_indices:
-                if idx < len(scores) and scores[idx] > thr:
-                    dists.append(np.linalg.norm(kpts[idx] - ankle))
-            if len(dists) == 0:
-                return None, 0
-            return float(np.mean(dists)), len(dists)
-
-        def _torso_length(kpts, scores, thr=0.2):
-            l_sh, r_sh = BODY_KEYPOINTS['left_shoulder'], BODY_KEYPOINTS['right_shoulder']
-            l_hip, r_hip = BODY_KEYPOINTS['left_hip'], BODY_KEYPOINTS['right_hip']
-            if (scores[l_sh] > thr and scores[r_sh] > thr and scores[l_hip] > thr and scores[r_hip] > thr):
-                neck = (kpts[l_sh] + kpts[r_sh]) / 2.0
-                root = (kpts[l_hip] + kpts[r_hip]) / 2.0
-                return float(np.linalg.norm(neck - root))
-            return None
-
-        left_ankle_idx = BODY_KEYPOINTS.get('left_ankle')
-        right_ankle_idx = BODY_KEYPOINTS.get('right_ankle')
-        left_foot_indices = [
-            FEET_KEYPOINTS.get('left_big_toe'),
-            FEET_KEYPOINTS.get('left_small_toe'),
-            FEET_KEYPOINTS.get('left_heel')
-        ]
-        right_foot_indices = [
-            FEET_KEYPOINTS.get('right_big_toe'),
-            FEET_KEYPOINTS.get('right_small_toe'),
-            FEET_KEYPOINTS.get('right_heel')
-        ]
-
-        src_left_mean, src_left_cnt = _foot_mean(src_kpts, src_scores, left_ankle_idx, left_foot_indices)
-        src_right_mean, src_right_cnt = _foot_mean(src_kpts, src_scores, right_ankle_idx, right_foot_indices)
-        src_base_candidates = [m for m, c in [(src_left_mean, src_left_cnt), (src_right_mean, src_right_cnt)] if m is not None and c > 0]
-        src_base = float(max(src_base_candidates)) if len(src_base_candidates) > 0 else None
-
-        ref_torso = _torso_length(r_kpts, r_scores)
-        ref_left_mean, ref_left_cnt = _foot_mean(r_kpts, r_scores, left_ankle_idx, left_foot_indices)
-        ref_right_mean, ref_right_cnt = _foot_mean(r_kpts, r_scores, right_ankle_idx, right_foot_indices)
-
-        ref_ratios = {}
-        if ref_torso is not None and ref_torso > 1e-6:
-            if ref_left_mean is not None and ref_left_cnt > 0:
-                ref_ratios['LEFT'] = float(ref_left_mean / ref_torso)
-            if ref_right_mean is not None and ref_right_cnt > 0:
-                ref_ratios['RIGHT'] = float(ref_right_mean / ref_torso)
-        ref_ratio_max = max(ref_ratios.values()) if len(ref_ratios) > 0 else None
-        
-        for _, p_name, children in self.feet_order:
-            p_idx = get_keypoint_index(p_name)
+        for side in ['left', 'right']:
+            ankle_name = f'{side}_ankle'
+            ankle_idx = get_keypoint_index(ankle_name)
             
-            if p_idx is None or p_idx not in processed:
-                print(f"\n   ❌ {p_name} not in processed, SKIP")
+            if trans_scores[ankle_idx] == 0:
                 continue
+
+            # 발 구성요소: 뒤꿈치, 엄지, 새끼
+            feet_parts = [f'{side}_heel', f'{side}_big_toe', f'{side}_small_toe']
             
-            p_pos = t_kpts[p_idx]
-            side = "LEFT" if "left" in p_name else "RIGHT"
-            print(f"\n   [{side}] Foot from {p_name} ({p_idx})")
-            print(f"      parent_pos: ({p_pos[0]:.1f}, {p_pos[1]:.1f})")
-
-            foot_debug = {
-                'side': side,
-                'parent': p_name,
-                'parent_idx': int(p_idx)
-            }
+            print(f"   [{side.upper()}] Foot from {ankle_name} ({ankle_idx})")
             
-            for c_name in children:
-                c_idx = FEET_KEYPOINTS.get(c_name)
-                if c_idx is None:
-                    print(f"      ❌ {c_name}: not in FEET_KEYPOINTS")
-                    continue
+            for part_name in feet_parts:
+                part_idx = get_keypoint_index(part_name)
                 
-                r_score = r_scores[c_idx] if c_idx < len(r_scores) else 0
+                # 1. 길이 결정 (Src 길이 우선)
+                bone_name = f"{ankle_name}_{part_name}"
+                target_length = corrected_lengths.get(bone_name)
                 
-                if r_score < 0.1:
-                    print(f"      ❌ {c_name} (idx={c_idx}): ref_score={r_score:.3f} < 0.1, SKIP")
-                    continue
-                
-                # 뼈 길이 결정
-                bone = f"{p_name}_{c_name}"
-                alt = f"{c_name}_{p_name}"
-                
-                # 뼈 길이 결정: SRC 우선
-                bone = f"{p_name}_{c_name}"
-                alt = f"{c_name}_{p_name}"
-                
-                src_length = lengths.get(bone) or lengths.get(alt)
-                ref_length = calculate_distance(r_kpts[p_idx], r_kpts[c_idx])
-
-                length = None
-                source = None
-
-                # New strategy: ref foot/torso ratio normalized to src max foot size
-                ref_ratio = ref_ratios.get(side, None)
-                target_size = None
-                scale_factor = None
-                ref_mean_for_side = ref_left_mean if side == 'LEFT' else ref_right_mean
-                if src_base is not None and ref_ratio_max is not None and ref_ratio is not None and ref_ratio_max > 1e-6:
-                    target_size = src_base * (ref_ratio / ref_ratio_max)
-                    if ref_mean_for_side is not None and ref_mean_for_side > 1e-6:
-                        scale_factor = target_size / ref_mean_for_side
-
-                if scale_factor is not None:
-                    length = ref_length * scale_factor
-                    source = f"REF*ratio ({scale_factor:.3f})"
-                else:
-                    if src_length:
-                        length = src_length
-                        source = "SRC"
+                # Src 길이가 없으면 Ref 비율 fallback
+                if target_length is None or target_length <= 0:
+                    if r_scores[ankle_idx] > 0.1 and r_scores[part_idx] > 0.1:
+                        target_length = calculate_distance(r_kpts[ankle_idx], r_kpts[part_idx]) * scale
+                        src_str = "Fallback(Ref*Scale)"
                     else:
-                        length = ref_length * scale
-                        source = f"REF*scale ({ref_length:.1f}*{scale:.3f})"
-                
-                # REF 방향 사용
-                vec = r_kpts[c_idx] - r_kpts[p_idx]
-                direct = normalize_vector(vec)
-                
-                t_kpts[c_idx] = p_pos + direct * length
-                t_scores[c_idx] = 0.8
-                
-                processed.add(c_idx)
-                log[c_name] = 'feet_chain'
+                        continue # Ref도 없으면 스킵
+                else:
+                    src_str = "SrcFixed"
 
-                foot_debug.setdefault('children', []).append({
-                    'name': c_name,
-                    'idx': int(c_idx),
-                    'ref_score': float(r_score),
-                    'length': float(length),
-                    'source': source,
-                    'ref_vec': [float(vec[0]), float(vec[1])],
-                    'ref_len': float(np.linalg.norm(vec))
-                })
-
-                print(f"      ✅ {c_name} (idx={c_idx}): length={length:.1f} ({source})")
-
-            if log is not None:
-                foot_debug.update({
-                    'src_base': float(src_base) if src_base is not None else None,
-                    'ref_torso_len': float(ref_torso) if ref_torso is not None else None,
-                    'ref_ratio': float(ref_ratios.get(side)) if ref_ratios.get(side) is not None else None,
-                    'ref_ratio_max': float(ref_ratio_max) if ref_ratio_max is not None else None,
-                    'src_left_mean': float(src_left_mean) if src_left_mean is not None else None,
-                    'src_right_mean': float(src_right_mean) if src_right_mean is not None else None,
-                    'ref_left_mean': float(ref_left_mean) if ref_left_mean is not None else None,
-                    'ref_right_mean': float(ref_right_mean) if ref_right_mean is not None else None,
-                    'target_size': float(target_size) if target_size is not None else None,
-                    'scale_factor': float(scale_factor) if scale_factor is not None else None,
-                    'ref_mean_used': float(ref_mean_for_side) if ref_mean_for_side is not None else None
-                })
-                log['foot_debug'].append(foot_debug)
-        
-        print(f"\n   final feet processed: {sorted([i for i in processed if i >= 17 and i <= 22])}")
+                # 2. 방향 결정 (Ref 방향)
+                if r_scores[ankle_idx] > 0.1 and r_scores[part_idx] > 0.1:
+                    direction_vec = r_kpts[part_idx] - r_kpts[ankle_idx]
+                    direction = normalize_vector(direction_vec)
+                    
+                    # 좌표 계산
+                    trans_kpts[part_idx] = trans_kpts[ankle_idx] + direction * target_length
+                    trans_scores[part_idx] = min(trans_scores[ankle_idx], r_scores[part_idx])
+                    
+                    processed.add(part_idx)
+                    print(f"      ✅ {part_name} (idx={part_idx}): length={target_length:.1f} ({src_str})")

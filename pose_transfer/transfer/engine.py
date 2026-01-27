@@ -192,8 +192,15 @@ class PoseTransferEngine:
         # Body Face (코, 눈, 귀)는 항상 처리 (use_face 설정 무관)
         # 귀는 ref 방향 따르도록 먼저 배치
         self._transfer_ears_from_ref(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, processed, transfer_log)
+        
         # Body Face (코, 눈)를 ref 각도에 맞춰 회전
-        self._transfer_body_face(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores)
+        # [수정] body_scale 인자에 torso_ratio 전달
+        self._transfer_body_face(
+            trans_kpts, trans_scores, 
+            source_keypoints, source_scores, 
+            reference_keypoints, reference_scores,
+            body_scale=torso_ratio
+        )
         
         # Face Landmarks (23-90)는 use_face 설정에 따라 선택적 처리
         if self.config.use_face:
@@ -292,20 +299,15 @@ class PoseTransferEngine:
 
     def _transfer_body_face(
         self, trans_kpts, trans_scores,
-        src_kpts, src_scores, ref_kpts, ref_scores
+        src_kpts, src_scores, ref_kpts, ref_scores,
+        body_scale=1.0
     ):
         """
-        Body Face 전이 - 어깨 기준 Ref 구조 적용 방식
+        Body Face 전이 - 어깨 기준 Ref 구조 적용 (Ear-Based Vertical Scaling)
         
-        전략:
-        1. 양쪽 어깨를 pivot으로 Ref의 face 구조(귀-눈-코) 적용
-        2. Face 스케일: Src의 (어깨-귀 거리)/(몸통 높이) 비율을 Trans에 반영
-        3. Ref의 어깨→귀→눈→코 각도와 거리를 그대로 사용
-        
-        효과:
-        - Src 신체 비율 보존 (얼굴 크기 vs 몸통 크기)
-        - Ref 얼굴 각도 및 구조 100% 반영
-        - 좌우 독립 적용으로 비대칭 포즈도 정확
+        [수정사항]
+        - 측면/고개 든 포즈에서 불안정한 '목-코 거리' 대신 '목-귀 수직 거리' 사용.
+        - Src(0.8) vs Ref(고개듦) 차이를 보정하여 안정적인 0.8대 스케일 확보.
         """
         NOSE = 0
         LEFT_EYE, RIGHT_EYE = 1, 2
@@ -317,273 +319,186 @@ class PoseTransferEngine:
         if trans_scores[LS] < 0.1 or trans_scores[RS] < 0.1:
             print("   ⚠️ [Body Face] Trans 어깨가 없어 전이 불가")
             return
-        
-        if ref_scores[LS] < 0.1 or ref_scores[RS] < 0.1:
-            print("   ⚠️ [Body Face] Ref 어깨가 없어 전이 불가")
-            return
-        
-        if src_scores[LS] < 0.1 or src_scores[RS] < 0.1:
-            print("   ⚠️ [Body Face] Src 어깨가 없어 전이 불가")
-            return
 
-        # 1. Src의 얼굴-몸통 비율 계산 (디버그/폴백용)
-        # (얼굴 폭) / (몸통 높이)
+        # 1. Src 비율 분석 (얼굴 폭 기반)
         def _estimate_face_width(kpts, scores):
-            # 귀가 있으면 귀-귀 거리 사용
             if scores[LEFT_EAR] > 0.1 and scores[RIGHT_EAR] > 0.1:
                 return np.linalg.norm(kpts[RIGHT_EAR] - kpts[LEFT_EAR])
-            # 귀가 없으면 눈-눈 거리로 대체 (얼굴 폭의 근사치)
             if scores[LEFT_EYE] > 0.1 and scores[RIGHT_EYE] > 0.1:
                 return np.linalg.norm(kpts[RIGHT_EYE] - kpts[LEFT_EYE]) * 2.2
             return 100.0
 
         src_face_width = _estimate_face_width(src_kpts, src_scores)
         
-        # Src 몸통 높이 = 어깨 중점 → 엉덩이 중점
         src_neck = (src_kpts[LS] + src_kpts[RS]) / 2.0
         src_hip_center = (src_kpts[LEFT_HIP] + src_kpts[RIGHT_HIP]) / 2.0 if (src_scores[LEFT_HIP] > 0.1 and src_scores[RIGHT_HIP] > 0.1) else src_neck + np.array([0, 300])
         src_torso_height = np.linalg.norm(src_hip_center - src_neck)
         
-        # Src 얼굴-몸통 비율
         src_face_torso_ratio = src_face_width / src_torso_height if src_torso_height > 0 else 0.3
         
-        print(f"   📏 Src: 얼굴폭≈{src_face_width:.1f}px, 몸통 높이={src_torso_height:.1f}px")
-        print(f"   📊 Src: 얼굴/몸통 비율={src_face_torso_ratio:.3f}")
-
-        # 2. Trans 몸통 높이
+        # 2. Trans 목표 스케일 계산
         trans_neck = (trans_kpts[LS] + trans_kpts[RS]) / 2.0
         trans_hip_center = (trans_kpts[LEFT_HIP] + trans_kpts[RIGHT_HIP]) / 2.0 if (trans_scores[LEFT_HIP] > 0.1 and trans_scores[RIGHT_HIP] > 0.1) else trans_neck + np.array([0, 300])
         trans_torso_height = np.linalg.norm(trans_hip_center - trans_neck)
-        
-        # Trans에서 얼굴이 차지해야 할 크기
         trans_face_scale_target = src_face_torso_ratio * trans_torso_height
         
-        print(f"   📏 Trans: 몸통 높이={trans_torso_height:.1f}px")
-        print(f"   🎯 Trans: 목표 얼굴 크기={trans_face_scale_target:.1f}px (src 비율 적용)")
-
-        # 3. Ref 얼굴 폭
+        # 3. Ref 얼굴 폭 및 1차 스케일 계산 (Width Scale)
         ref_face_width = _estimate_face_width(ref_kpts, ref_scores)
+        width_scale = trans_face_scale_target / ref_face_width if ref_face_width > 0 else 1.0
+
+        # 4. [New] 목-귀 수직 거리 비율 계산 (Vertical Ear Scale)
+        #    고개 각도(Pitch)에 가장 영향을 덜 받는 척도
+        def _get_vertical_ear_dist(kpts, scores, neck_pt):
+            dists = []
+            if scores[LEFT_EAR] > 0.1:
+                dists.append(abs(kpts[LEFT_EAR][1] - neck_pt[1]))
+            if scores[RIGHT_EAR] > 0.1:
+                dists.append(abs(kpts[RIGHT_EAR][1] - neck_pt[1]))
+            
+            if not dists: return None
+            return np.mean(dists)
+
+        ref_neck = (ref_kpts[LS] + ref_kpts[RS]) / 2.0
+        src_ear_v_dist = _get_vertical_ear_dist(src_kpts, src_scores, src_neck)
+        ref_ear_v_dist = _get_vertical_ear_dist(ref_kpts, ref_scores, ref_neck)
         
-        # 4. Face 스케일 계산
-        face_scale = trans_face_scale_target / ref_face_width if ref_face_width > 0 else 1.0
+        ear_scale = None
+        if src_ear_v_dist and ref_ear_v_dist and ref_ear_v_dist > 1.0:
+            ear_scale = src_ear_v_dist / ref_ear_v_dist
+
+        # ---------------------------------------------------------------------
+        # ⚖️ [Final Scale Decision] 최적 스케일 선정
+        # ---------------------------------------------------------------------
+        threshold_ratio = 1.5
+        is_side_view = False
         
-        print(f"   📏 Ref: 얼굴폭≈{ref_face_width:.1f}px")
-        print(f"   🔄 Face Scale: {face_scale:.3f} (ref → trans)")
+        # 1. Width Scale이 너무 크면 (측면 의심)
+        if width_scale > body_scale * threshold_ratio:
+            print(f"   ⚠️ [Face Scale] Width scale ({width_scale:.3f}) implies side-view.")
+            is_side_view = True
+            
+            # 2. Ear Scale(0.83 추정)이 있다면 최우선 사용
+            if ear_scale is not None:
+                print(f"      -> Using Vertical Ear Scale ({ear_scale:.3f}) for stability.")
+                face_scale = ear_scale
+            # 3. 귀도 없으면 Body Scale 사용
+            else:
+                print(f"      -> Ear not found. Fallback to Body Scale ({body_scale:.3f}).")
+                face_scale = body_scale
+        else:
+            # 정면이면 Width Scale 사용
+            face_scale = width_scale
+            is_side_view = False
+
+        print(f"   🔄 Final Face Scale: {face_scale:.3f}")
         
-        # 디버그 정보 저장
         self._face_transfer_debug = {
             'src_face_torso_ratio': src_face_torso_ratio,
-            'src_face_width': src_face_width,
-            'src_torso_height': src_torso_height,
-            'trans_torso_height': trans_torso_height,
-            'trans_face_scale_target': trans_face_scale_target,
-            'ref_face_width': ref_face_width,
             'face_scale': face_scale
         }
 
-        # 5. 어깨 중점(neck)을 pivot으로 Face 배치
-        # 방향(회전)은 ref, 비율(거리)은 src를 사용
-        trans_neck = (trans_kpts[LS] + trans_kpts[RS]) / 2.0
-        ref_neck = (ref_kpts[LS] + ref_kpts[RS]) / 2.0
-        src_neck = (src_kpts[LS] + src_kpts[RS]) / 2.0
-
-        # 회전 계산 (눈 우선, 없으면 귀)
-        def _angle(vec):
-            return np.arctan2(vec[1], vec[0])
-
+        # ---------------------------------------------------------------------
+        # 📍 [Positioning] 좌표 배치
+        # ---------------------------------------------------------------------
+        # 회전 매트릭스
+        def _angle(vec): return np.arctan2(vec[1], vec[0])
         rot = 0.0
-        if (src_scores[LEFT_EYE] > 0.1 and src_scores[RIGHT_EYE] > 0.1 and
-            ref_scores[LEFT_EYE] > 0.1 and ref_scores[RIGHT_EYE] > 0.1):
+        if (src_scores[LEFT_EYE] > 0.1 and src_scores[RIGHT_EYE] > 0.1 and ref_scores[LEFT_EYE] > 0.1 and ref_scores[RIGHT_EYE] > 0.1):
             src_eye_vec = src_kpts[RIGHT_EYE] - src_kpts[LEFT_EYE]
             ref_eye_vec = ref_kpts[RIGHT_EYE] - ref_kpts[LEFT_EYE]
             rot = _angle(ref_eye_vec) - _angle(src_eye_vec)
-        elif (src_scores[LEFT_EAR] > 0.1 and src_scores[RIGHT_EAR] > 0.1 and
-              ref_scores[LEFT_EAR] > 0.1 and ref_scores[RIGHT_EAR] > 0.1):
-            src_ear_vec = src_kpts[RIGHT_EAR] - src_kpts[LEFT_EAR]
-            ref_ear_vec = ref_kpts[RIGHT_EAR] - ref_kpts[LEFT_EAR]
-            rot = _angle(ref_ear_vec) - _angle(src_ear_vec)
-
+        
         c, s = np.cos(rot), np.sin(rot)
-        def _rotate(vec):
-            return np.array([vec[0] * c - vec[1] * s, vec[0] * s + vec[1] * c])
-
-        # 스케일: face_scale 사용 (얼굴/몸통 비율 반영)
-        # face_scale은 이미 line 367에서 계산됨
-        face_scale_x = face_scale
-        face_scale_y = face_scale
+        face_scale_x, face_scale_y = face_scale, face_scale
 
         def _scale_vec(vec, dist):
             base = vec * dist
             return np.array([base[0] * face_scale_x, base[1] * face_scale_y])
 
-        # 좌/우 거리 비율 blending (귀 전용)
-        ear_alpha = 0.5
-        src_left_ear_dist = np.linalg.norm(src_kpts[LEFT_EAR] - src_neck) if src_scores[LEFT_EAR] > 0.1 else None
-        src_right_ear_dist = np.linalg.norm(src_kpts[RIGHT_EAR] - src_neck) if src_scores[RIGHT_EAR] > 0.1 else None
-        ref_left_ear_dist = np.linalg.norm(ref_kpts[LEFT_EAR] - ref_neck) if ref_scores[LEFT_EAR] > 0.1 else None
-        ref_right_ear_dist = np.linalg.norm(ref_kpts[RIGHT_EAR] - ref_neck) if ref_scores[RIGHT_EAR] > 0.1 else None
+        # 거리 선택 로직: Side View면 Ref 거리 사용 (구조 유지), Front면 Src 거리 사용 (비율 유지)
+        def get_target_dist(src_pt, src_pivot, ref_pt, ref_pivot, src_valid, ref_valid):
+            if not ref_valid: return 0.0, None, 0.0
+            
+            ref_vec_raw = ref_pt - ref_pivot
+            ref_len = np.linalg.norm(ref_vec_raw)
+            ref_dir = ref_vec_raw / ref_len if ref_len > 1e-6 else ref_vec_raw
+            
+            # Side View면 무조건 Ref 거리 사용 (Face Scale이 이미 비율을 맞췄으므로 Ref 구조 유지)
+            if is_side_view:
+                return ref_len, ref_dir, ref_len
+            
+            if src_valid:
+                src_len = np.linalg.norm(src_pt - src_pivot)
+                return src_len, ref_dir, ref_len
+            
+            return ref_len, ref_dir, ref_len
 
-        blended_left_ear_dist = None
-        blended_right_ear_dist = None
-        if (src_left_ear_dist and src_right_ear_dist and ref_left_ear_dist and ref_right_ear_dist):
-            src_sum = src_left_ear_dist + src_right_ear_dist
-            ref_sum = ref_left_ear_dist + ref_right_ear_dist
-            if src_sum > 1e-6 and ref_sum > 1e-6:
-                src_ratio = src_left_ear_dist / src_sum
-                ref_ratio = ref_left_ear_dist / ref_sum
-                blended_ratio = ear_alpha * ref_ratio + (1.0 - ear_alpha) * src_ratio
-                blended_left_ear_dist = src_sum * blended_ratio
-                blended_right_ear_dist = src_sum * (1.0 - blended_ratio)
-        
-        # 왼쪽 귀
-        if src_scores[LEFT_EAR] > 0.1 and ref_scores[LEFT_EAR] > 0.1:
-            src_dist = blended_left_ear_dist if blended_left_ear_dist is not None else np.linalg.norm(src_kpts[LEFT_EAR] - src_neck)
-            ref_vec = ref_kpts[LEFT_EAR] - ref_neck
-            ref_len = np.linalg.norm(ref_vec)
-            ref_dir = ref_vec / ref_len if ref_len > 1e-6 else ref_vec
-            trans_neck_to_lear_vec = _scale_vec(ref_dir, src_dist)
-            trans_lear = trans_neck + trans_neck_to_lear_vec
+        # 1. 왼쪽 귀
+        src_valid = src_scores[LEFT_EAR] > 0.1
+        ref_valid = ref_scores[LEFT_EAR] > 0.1
+        if src_valid or ref_valid:
+            target_dist, ref_dir, _ = get_target_dist(src_kpts[LEFT_EAR], src_neck, ref_kpts[LEFT_EAR], ref_neck, src_valid, ref_valid)
+            if ref_dir is not None:
+                trans_vec = _scale_vec(ref_dir, target_dist)
+                trans_kpts[LEFT_EAR] = trans_neck + trans_vec
+                trans_scores[LEFT_EAR] = min(src_scores[LEFT_EAR], ref_scores[LEFT_EAR]) if src_valid and ref_valid else (ref_scores[LEFT_EAR] if ref_valid else 0.0)
+                print(f"   👂 L-Ear: Neck 기준 벡터=({trans_vec[0]:.1f}, {trans_vec[1]:.1f})")
 
-            trans_kpts[LEFT_EAR][0] = trans_lear[0]
-            trans_kpts[LEFT_EAR][1] = trans_lear[1]
-            trans_scores[LEFT_EAR] = min(src_scores[LEFT_EAR], ref_scores[LEFT_EAR])
-            print(f"   👂 L-Ear: Neck 기준 벡터=({trans_neck_to_lear_vec[0]:.1f}, {trans_neck_to_lear_vec[1]:.1f})")
+        # 2. 왼쪽 눈
+        src_valid = src_scores[LEFT_EYE] > 0.1
+        ref_valid = ref_scores[LEFT_EYE] > 0.1
+        if src_valid or ref_valid:
+            target_dist, ref_dir, _ = get_target_dist(src_kpts[LEFT_EYE], src_neck, ref_kpts[LEFT_EYE], ref_neck, src_valid, ref_valid)
+            if ref_dir is not None:
+                trans_vec = _scale_vec(ref_dir, target_dist)
+                trans_kpts[LEFT_EYE] = trans_neck + trans_vec
+                trans_scores[LEFT_EYE] = min(src_scores[LEFT_EYE], ref_scores[LEFT_EYE]) if src_valid and ref_valid else (ref_scores[LEFT_EYE] if ref_valid else 0.0)
 
-            self._face_transfer_debug['left_ear_vec'] = trans_neck_to_lear_vec.tolist()
-        elif ref_scores[LEFT_EAR] > 0.1:
-            ref_neck_to_lear_vec = ref_kpts[LEFT_EAR] - ref_neck
-            trans_neck_to_lear_vec = ref_neck_to_lear_vec * face_scale
-            trans_lear = trans_neck + trans_neck_to_lear_vec
+        # 3. 오른쪽 귀
+        src_valid = src_scores[RIGHT_EAR] > 0.1
+        ref_valid = ref_scores[RIGHT_EAR] > 0.1
+        if src_valid or ref_valid:
+            target_dist, ref_dir, _ = get_target_dist(src_kpts[RIGHT_EAR], src_neck, ref_kpts[RIGHT_EAR], ref_neck, src_valid, ref_valid)
+            if ref_dir is not None:
+                trans_vec = _scale_vec(ref_dir, target_dist)
+                trans_kpts[RIGHT_EAR] = trans_neck + trans_vec
+                trans_scores[RIGHT_EAR] = min(src_scores[RIGHT_EAR], ref_scores[RIGHT_EAR]) if src_valid and ref_valid else (ref_scores[RIGHT_EAR] if ref_valid else 0.0)
 
-            trans_kpts[LEFT_EAR][0] = trans_lear[0]
-            trans_kpts[LEFT_EAR][1] = trans_lear[1]
-            trans_scores[LEFT_EAR] = min(src_scores[LEFT_EAR], ref_scores[LEFT_EAR])
-            print(f"   👂 L-Ear(fallback): Neck 기준 벡터=({trans_neck_to_lear_vec[0]:.1f}, {trans_neck_to_lear_vec[1]:.1f})")
+        # 4. 오른쪽 눈
+        src_valid = src_scores[RIGHT_EYE] > 0.1
+        ref_valid = ref_scores[RIGHT_EYE] > 0.1
+        if src_valid or ref_valid:
+            target_dist, ref_dir, _ = get_target_dist(src_kpts[RIGHT_EYE], src_neck, ref_kpts[RIGHT_EYE], ref_neck, src_valid, ref_valid)
+            if ref_dir is not None:
+                trans_vec = _scale_vec(ref_dir, target_dist)
+                trans_kpts[RIGHT_EYE] = trans_neck + trans_vec
+                trans_scores[RIGHT_EYE] = min(src_scores[RIGHT_EYE], ref_scores[RIGHT_EYE]) if src_valid and ref_valid else (ref_scores[RIGHT_EYE] if ref_valid else 0.0)
 
-            self._face_transfer_debug['left_ear_vec'] = trans_neck_to_lear_vec.tolist()
-        
-        # 왼쪽 눈
-        if src_scores[LEFT_EYE] > 0.1 and ref_scores[LEFT_EYE] > 0.1:
-            src_dist = np.linalg.norm(src_kpts[LEFT_EYE] - src_neck)
-            ref_vec = ref_kpts[LEFT_EYE] - ref_neck
-            ref_len = np.linalg.norm(ref_vec)
-            ref_dir = ref_vec / ref_len if ref_len > 1e-6 else ref_vec
-            trans_neck_to_leye_vec = _scale_vec(ref_dir, src_dist)
-            trans_leye = trans_neck + trans_neck_to_leye_vec
-
-            trans_kpts[LEFT_EYE][0] = trans_leye[0]
-            trans_kpts[LEFT_EYE][1] = trans_leye[1]
-            trans_scores[LEFT_EYE] = min(src_scores[LEFT_EYE], ref_scores[LEFT_EYE])
-            print(f"   👁️ L-Eye: Neck 기준 벡터=({trans_neck_to_leye_vec[0]:.1f}, {trans_neck_to_leye_vec[1]:.1f})")
-
-            self._face_transfer_debug['left_eye_vec'] = trans_neck_to_leye_vec.tolist()
-        elif ref_scores[LEFT_EYE] > 0.1:
-            ref_neck_to_leye_vec = ref_kpts[LEFT_EYE] - ref_neck
-            trans_neck_to_leye_vec = ref_neck_to_leye_vec * face_scale
-            trans_leye = trans_neck + trans_neck_to_leye_vec
-
-            trans_kpts[LEFT_EYE][0] = trans_leye[0]
-            trans_kpts[LEFT_EYE][1] = trans_leye[1]
-            trans_scores[LEFT_EYE] = min(src_scores[LEFT_EYE], ref_scores[LEFT_EYE])
-            print(f"   👁️ L-Eye(fallback): Neck 기준 벡터=({trans_neck_to_leye_vec[0]:.1f}, {trans_neck_to_leye_vec[1]:.1f})")
-
-            self._face_transfer_debug['left_eye_vec'] = trans_neck_to_leye_vec.tolist()
-
-        # 오른쪽 귀
-        if src_scores[RIGHT_EAR] > 0.1 and ref_scores[RIGHT_EAR] > 0.1:
-            src_dist = blended_right_ear_dist if blended_right_ear_dist is not None else np.linalg.norm(src_kpts[RIGHT_EAR] - src_neck)
-            ref_vec = ref_kpts[RIGHT_EAR] - ref_neck
-            ref_len = np.linalg.norm(ref_vec)
-            ref_dir = ref_vec / ref_len if ref_len > 1e-6 else ref_vec
-            trans_neck_to_rear_vec = _scale_vec(ref_dir, src_dist)
-            trans_rear = trans_neck + trans_neck_to_rear_vec
-
-            trans_kpts[RIGHT_EAR][0] = trans_rear[0]
-            trans_kpts[RIGHT_EAR][1] = trans_rear[1]
-            trans_scores[RIGHT_EAR] = min(src_scores[RIGHT_EAR], ref_scores[RIGHT_EAR])
-            print(f"   👂 R-Ear: Neck 기준 벡터=({trans_neck_to_rear_vec[0]:.1f}, {trans_neck_to_rear_vec[1]:.1f})")
-
-            self._face_transfer_debug['right_ear_vec'] = trans_neck_to_rear_vec.tolist()
-        elif ref_scores[RIGHT_EAR] > 0.1:
-            ref_neck_to_rear_vec = ref_kpts[RIGHT_EAR] - ref_neck
-            trans_neck_to_rear_vec = ref_neck_to_rear_vec * face_scale
-            trans_rear = trans_neck + trans_neck_to_rear_vec
-
-            trans_kpts[RIGHT_EAR][0] = trans_rear[0]
-            trans_kpts[RIGHT_EAR][1] = trans_rear[1]
-            trans_scores[RIGHT_EAR] = min(src_scores[RIGHT_EAR], ref_scores[RIGHT_EAR])
-            print(f"   👂 R-Ear(fallback): Neck 기준 벡터=({trans_neck_to_rear_vec[0]:.1f}, {trans_neck_to_rear_vec[1]:.1f})")
-
-            self._face_transfer_debug['right_ear_vec'] = trans_neck_to_rear_vec.tolist()
-        
-        # 오른쪽 눈
-        if src_scores[RIGHT_EYE] > 0.1 and ref_scores[RIGHT_EYE] > 0.1:
-            src_dist = np.linalg.norm(src_kpts[RIGHT_EYE] - src_neck)
-            ref_vec = ref_kpts[RIGHT_EYE] - ref_neck
-            ref_len = np.linalg.norm(ref_vec)
-            ref_dir = ref_vec / ref_len if ref_len > 1e-6 else ref_vec
-            trans_neck_to_reye_vec = _scale_vec(ref_dir, src_dist)
-            trans_reye = trans_neck + trans_neck_to_reye_vec
-
-            trans_kpts[RIGHT_EYE][0] = trans_reye[0]
-            trans_kpts[RIGHT_EYE][1] = trans_reye[1]
-            trans_scores[RIGHT_EYE] = min(src_scores[RIGHT_EYE], ref_scores[RIGHT_EYE])
-            print(f"   👁️ R-Eye: Neck 기준 벡터=({trans_neck_to_reye_vec[0]:.1f}, {trans_neck_to_reye_vec[1]:.1f})")
-
-            self._face_transfer_debug['right_eye_vec'] = trans_neck_to_reye_vec.tolist()
-        elif ref_scores[RIGHT_EYE] > 0.1:
-            ref_neck_to_reye_vec = ref_kpts[RIGHT_EYE] - ref_neck
-            trans_neck_to_reye_vec = ref_neck_to_reye_vec * face_scale
-            trans_reye = trans_neck + trans_neck_to_reye_vec
-
-            trans_kpts[RIGHT_EYE][0] = trans_reye[0]
-            trans_kpts[RIGHT_EYE][1] = trans_reye[1]
-            trans_scores[RIGHT_EYE] = min(src_scores[RIGHT_EYE], ref_scores[RIGHT_EYE])
-            print(f"   👁️ R-Eye(fallback): Neck 기준 벡터=({trans_neck_to_reye_vec[0]:.1f}, {trans_neck_to_reye_vec[1]:.1f})")
-
-            self._face_transfer_debug['right_eye_vec'] = trans_neck_to_reye_vec.tolist()
-
-        # 코: 양쪽 눈의 중점에서 Ref 비율로 배치
-        if trans_scores[LEFT_EYE] > 0.1 and trans_scores[RIGHT_EYE] > 0.1:
+        # 5. 코 (눈 중점 기준)
+        if trans_scores[LEFT_EYE] > 0.1 and trans_scores[RIGHT_EYE] > 0.1 and ref_scores[NOSE] > 0.1:
             trans_eye_center = (trans_kpts[LEFT_EYE] + trans_kpts[RIGHT_EYE]) / 2.0
-
-            # Src 눈 중점 → 코 벡터 (비율 유지)
-            if (src_scores[LEFT_EYE] > 0.1 and src_scores[RIGHT_EYE] > 0.1 and src_scores[NOSE] > 0.1 and
-                ref_scores[LEFT_EYE] > 0.1 and ref_scores[RIGHT_EYE] > 0.1 and ref_scores[NOSE] > 0.1):
+            ref_eye_center = (ref_kpts[LEFT_EYE] + ref_kpts[RIGHT_EYE]) / 2.0
+            
+            src_valid = src_scores[NOSE] > 0.1
+            
+            ref_vec_raw = ref_kpts[NOSE] - ref_eye_center
+            ref_len = np.linalg.norm(ref_vec_raw)
+            ref_dir = ref_vec_raw / ref_len if ref_len > 1e-6 else ref_vec_raw
+            
+            # Side View면 Ref 거리 유지, 아니면 Src 거리 유지
+            if is_side_view:
+                target_dist = ref_len
+            elif src_valid:
                 src_eye_center = (src_kpts[LEFT_EYE] + src_kpts[RIGHT_EYE]) / 2.0
-                src_dist = np.linalg.norm(src_kpts[NOSE] - src_eye_center)
+                target_dist = np.linalg.norm(src_kpts[NOSE] - src_eye_center)
+            else:
+                target_dist = ref_len
 
-                ref_eye_center = (ref_kpts[LEFT_EYE] + ref_kpts[RIGHT_EYE]) / 2.0
-                ref_vec = ref_kpts[NOSE] - ref_eye_center
-                ref_len = np.linalg.norm(ref_vec)
-                ref_dir = ref_vec / ref_len if ref_len > 1e-6 else ref_vec
-
-                trans_eyecenter_to_nose_vec = _scale_vec(ref_dir, src_dist)
-                trans_nose = trans_eye_center + trans_eyecenter_to_nose_vec
-
-                trans_kpts[NOSE][0] = trans_nose[0]
-                trans_kpts[NOSE][1] = trans_nose[1]
-                trans_scores[NOSE] = min(src_scores[NOSE], ref_scores[NOSE])
-                print(f"   👃 Nose: 눈 중점 기준 벡터=({trans_eyecenter_to_nose_vec[0]:.1f}, {trans_eyecenter_to_nose_vec[1]:.1f})")
-
-                self._face_transfer_debug['nose_vec'] = trans_eyecenter_to_nose_vec.tolist()
-            elif ref_scores[LEFT_EYE] > 0.1 and ref_scores[RIGHT_EYE] > 0.1 and ref_scores[NOSE] > 0.1:
-                ref_eye_center = (ref_kpts[LEFT_EYE] + ref_kpts[RIGHT_EYE]) / 2.0
-                ref_eyecenter_to_nose_vec = ref_kpts[NOSE] - ref_eye_center
-                trans_eyecenter_to_nose_vec = ref_eyecenter_to_nose_vec * face_scale
-                trans_nose = trans_eye_center + trans_eyecenter_to_nose_vec
-
-                trans_kpts[NOSE][0] = trans_nose[0]
-                trans_kpts[NOSE][1] = trans_nose[1]
-                trans_scores[NOSE] = min(src_scores[NOSE], ref_scores[NOSE])
-                print(f"   👃 Nose(fallback): 눈 중점 기준 벡터=({trans_eyecenter_to_nose_vec[0]:.1f}, {trans_eyecenter_to_nose_vec[1]:.1f})")
-
-                self._face_transfer_debug['nose_vec'] = trans_eyecenter_to_nose_vec.tolist()
+            trans_vec = _scale_vec(ref_dir, target_dist)
+            trans_kpts[NOSE] = trans_eye_center + trans_vec
+            trans_scores[NOSE] = min(src_scores[NOSE], ref_scores[NOSE]) if src_valid else ref_scores[NOSE]
         
-        print(f"   ✅ Body Face Transferred: 5 keypoints (Neck pivot)")
-        print(f"   ℹ️ Pivot: 어깨 중점(Neck) → 측면 포즈도 안정적")
-        print(f"   ℹ️ 양쪽 눈/귀 모두 Neck 기준으로 배치")
-        print(f"   ℹ️ Ref 구조 100% 반영, Src 얼굴/몸통 비율 유지")
+        print(f"   ✅ Body Face Transferred: 5 keypoints (Neck pivot, SideView={is_side_view})")
 
     def _transfer_face_landmarks(
         self, trans_kpts, trans_scores,
