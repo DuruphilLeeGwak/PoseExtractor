@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .extractors import (
-    DWPoseExtractor, DWPoseExtractorFactory, PersonFilter, RTMLIB_AVAILABLE
+    DWPoseExtractor, DWPoseExtractorFactory, PersonFilter, RTMLIB_AVAILABLE, DepthAnythingV2Extractor
 )
 from .extractors.keypoint_constants import BODY_KEYPOINTS
 from .transfer import PoseTransferEngine, TransferConfig, FallbackStrategy
@@ -60,6 +60,8 @@ class PipelineConfig:
     lower_body_confidence_threshold: float = 2.0
     lower_body_margin_ratio: float = 0.10
     visibility_margin: float = 0.2
+    enable_upper_ratio_tuning: bool = True
+    enable_lower_ratio_tuning: bool = True
     
     # Rendering
     line_thickness: int = 4
@@ -97,6 +99,13 @@ class PipelineConfig:
     cross_foot_hallucination_check: bool = True  # 발목 Body 낮으면 발가락 제거
     cross_foot_body_confidence_threshold: float = 0.25  # 발 할루시네이션 판정용
     cross_foot_dw_min_confidence: float = 2.5  # 발가락 DWPose 최소 신뢰도 (발가락 전용)
+
+    # Depth Anything V2 (optional)
+    depth_enabled: bool = False
+    depth_model: str = 'depth_anything_v2_vitl'
+    depth_device: str = 'cuda'
+    depth_z_scale: Optional[float] = None
+    depth_repo_path: Optional[str] = None
     
     # Bbox Margin
     person_bbox_margin: float = 0.0
@@ -118,6 +127,8 @@ class PipelineConfig:
         debug = config.get('debug', {})
         bbox = config.get('bbox', {})
         cross = config.get('cross_filter', {})
+        depth = config.get('depth_anything', {})
+        depth = config.get('depth_anything', {})
         
         return cls(
             # Model
@@ -144,6 +155,8 @@ class PipelineConfig:
             lower_body_confidence_threshold=transfer.get('lower_body_confidence_threshold', 2.0),
             lower_body_margin_ratio=transfer.get('lower_body_margin_ratio', 0.10),
             visibility_margin=transfer.get('visibility_margin', 0.2),
+            enable_upper_ratio_tuning=transfer.get('enable_upper_ratio_tuning', True),
+            enable_lower_ratio_tuning=transfer.get('enable_lower_ratio_tuning', True),
             
             # Rendering
             line_thickness=rendering.get('line_thickness', 4),
@@ -181,6 +194,13 @@ class PipelineConfig:
             cross_foot_hallucination_check=cross.get('foot_hallucination_check', True),
             cross_foot_body_confidence_threshold=cross.get('foot_body_confidence_threshold', 0.25),
             cross_foot_dw_min_confidence=cross.get('foot_dw_min_confidence', 2.5),
+
+            # Depth Anything V2 (optional)
+            depth_enabled=depth.get('enabled', False),
+            depth_model=depth.get('model', 'depth_anything_v2_vitl'),
+            depth_device=depth.get('device', 'cuda'),
+            depth_z_scale=depth.get('z_scale', None),
+            depth_repo_path=depth.get('repo_path', None),
             
             # Bbox
             person_bbox_margin=bbox.get('person_margin', 0.0),
@@ -261,6 +281,21 @@ class PoseTransferPipeline:
             to_openpose=self.config.to_openpose,
             force_new=True
         )
+
+        # Depth Anything V2 (optional)
+        self.depth_extractor = None
+        if self.config.depth_enabled:
+            print("🧭 Depth Anything V2 enabled")
+            try:
+                self.depth_extractor = DepthAnythingV2Extractor(
+                    model=self.config.depth_model,
+                    device=self.config.depth_device,
+                    repo_path=self.config.depth_repo_path
+                )
+            except Exception as e:
+                print(f"⚠️ Depth Anything V2 init failed, disabling depth: {e}")
+                self.depth_extractor = None
+                self.config.depth_enabled = False
         
         # [v4.0] Body extractor (17 keypoints, Cross-Filter용)
         self.body_extractor = None
@@ -313,7 +348,9 @@ class PoseTransferPipeline:
         
         transfer_config = TransferConfig(
             confidence_threshold=self.config.transfer_confidence_threshold,
-            visibility_margin=self.config.visibility_margin
+            visibility_margin=self.config.visibility_margin,
+            enable_upper_ratio_tuning=self.config.enable_upper_ratio_tuning,
+            enable_lower_ratio_tuning=self.config.enable_lower_ratio_tuning
         )
         self.transfer_engine = PoseTransferEngine(
             config=transfer_config,
@@ -405,6 +442,18 @@ class PoseTransferPipeline:
             print("   [extract_pose] Hand refinement done")
         
         return kpts, scores, idx, image_size
+
+    def _sample_depth_values(self, depth_map: np.ndarray, keypoints: np.ndarray) -> np.ndarray:
+        h, w = depth_map.shape[:2]
+        depth_vals = np.zeros(len(keypoints), dtype=np.float32)
+        for i, (x, y) in enumerate(keypoints):
+            xi = int(round(x))
+            yi = int(round(y))
+            if 0 <= xi < w and 0 <= yi < h:
+                depth_vals[i] = float(depth_map[yi, xi])
+            else:
+                depth_vals[i] = 0.0
+        return depth_vals
 
     def _sync_scale_to_source_face(
         self,
@@ -505,6 +554,25 @@ class PoseTransferPipeline:
         print("\n[STEP 1] Extracting poses...")
         src_kpts, src_scores, src_idx, src_size = self.extract_pose(src_img)
         ref_kpts, ref_scores, ref_idx, ref_size = self.extract_pose(ref_img)
+
+        # [STEP 1.5] Depth estimation (optional)
+        src_depth_vals = None
+        ref_depth_vals = None
+        depth_z_scale = self.config.depth_z_scale
+        if self.depth_extractor is not None:
+            print("\n[STEP 1.5] Estimating depth (Depth Anything V2)...")
+            src_depth_map = self.depth_extractor.estimate(src_img)
+            ref_depth_map = self.depth_extractor.estimate(ref_img)
+            src_depth_vals = self._sample_depth_values(src_depth_map, src_kpts)
+            ref_depth_vals = self._sample_depth_values(ref_depth_map, ref_kpts)
+            if depth_z_scale is None:
+                depth_z_scale = float(max(src_w, src_h))
+            print(
+                f"   Depth src: min={float(np.min(src_depth_map)):.3f} max={float(np.max(src_depth_map)):.3f} mean={float(np.mean(src_depth_map)):.3f}"
+            )
+            print(
+                f"   Depth ref: min={float(np.min(ref_depth_map)):.3f} max={float(np.max(ref_depth_map)):.3f} mean={float(np.mean(ref_depth_map)):.3f}"
+            )
         
         # Cross-Filter가 extract_pose()에서 이미 적용됨
         src_filtered_scores = src_scores
@@ -539,7 +607,10 @@ class PoseTransferPipeline:
             src_kpts, src_filtered_scores, ref_kpts, ref_filtered_scores,
             source_image_size=(src_h, src_w), reference_image_size=(ref_h, ref_w),
             target_image_size=(src_h, src_w),
-            alignment_case=should_transfer_lower
+            alignment_case=should_transfer_lower,
+            source_depths=src_depth_vals,
+            reference_depths=ref_depth_vals,
+            depth_z_scale=depth_z_scale
         )
         trans_kpts, trans_scores = result.keypoints, result.scores
         
@@ -608,6 +679,12 @@ class PoseTransferPipeline:
         print("# ✅ Transfer Complete")
         print("#"*70 + "\n")
         
+        processing_info = {'transfer_log': result.transfer_log}
+        if src_depth_vals is not None and ref_depth_vals is not None:
+            processing_info['depth_maps'] = {
+                'src': src_depth_map,
+                'ref': ref_depth_map
+            }
         return PipelineResult(
             transferred_keypoints=final_kpts, transferred_scores=final_filtered_scores,
             source_keypoints=src_kpts, source_scores=src_filtered_scores,
@@ -616,7 +693,7 @@ class PoseTransferPipeline:
             skeleton_image=skeleton_image, image_size=final_size,
             modified_source_image=final_src_img,
             selected_person_idx={'source': src_idx, 'reference': ref_idx},
-            processing_info={'transfer_log': result.transfer_log},
+            processing_info=processing_info,
             alignment_info=align_info,
             src_debug_image=src_debug_img, ref_debug_image=ref_debug_img
         )

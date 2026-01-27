@@ -1,0 +1,1 @@
+<copy of d:/2025/pose_extractor/scripts/maintenance/debug_runtime_pose_transfer.py>

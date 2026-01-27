@@ -1,5 +1,5 @@
 # =============================================================================
-# Pose Transfer Configuration v20 (Cross-Filter Only)
+# Pose Transfer Configuration v21 (Face Scale Fix + Debug Control)
 # =============================================================================
 
 # [1] 모델 설정
@@ -30,6 +30,8 @@ transfer:
   normalization_base: "shoulder_width"
   confidence_threshold: 0.3
   visibility_margin: 0.5
+  enable_upper_ratio_tuning: false
+  enable_lower_ratio_tuning: false
 
 # =============================================================================
 # [5] 교차 필터링 (Cross-Filtering) v4.0
@@ -136,13 +138,116 @@ system:
   enable_archiving: false
 
 # =============================================================================
+# [9.5] Depth Anything V2 (optional)
+# =============================================================================
+depth_anything:
+  enabled: true
+  model: "depth_anything_v2_vitl"
+  device: "cuda"
+  repo_path: "D:/2025/pose_extractor/vendor/Depth-Anything-V2"
+  # z_scale: null  # null이면 이미지 긴 변으로 자동 설정
+
+# =============================================================================
 # [10] 디버그 설정
 # =============================================================================
+# 콘솔 로그 출력 제어 - Transfer 및 Extraction 과정의 상세 로그를 개별 제어
+#
+# 배경:
+#   기존에는 모든 디버그 로그가 항상 출력되어 터미널이 매우 길어지는 문제가 있었습니다.
+#   이제 각 단계별로 로그를 선택적으로 켜고 끌 수 있습니다.
+#
+# 사용 시나리오:
+#   1. 일반 사용: 모두 false로 설정 → 필수 정보만 출력 (깔끔)
+#   2. 디버깅: 문제가 발생한 단계만 true로 설정 → 해당 단계만 상세 분석
+#   3. 개발: 모두 true로 설정 → 전체 파이프라인 분석
+#
+# 권장 설정 (일반 사용):
+#   show_cross_filter: true  (필터링 결과만 확인)
+#   나머지: false  (상세 로그 비활성화)
+#
+# 권장 설정 (얼굴 문제 디버깅):
+#   show_face_transfer: true  (얼굴 전이 상세 로그)
+#   나머지: false
+# =============================================================================
 debug:
-  bbox_visualization: true
-  visualize_keypoint_bbox: true
-  visualize_yolo_bbox: true
-  visualize_hybrid_bbox: true
+  # ===== Extraction 단계 로그 =====
+  # Pose extraction 과정 (DWPose, Cross-Filter 등)
+  
+  show_dwpose_coords: false        # DWPose 원본 좌표 출력
+                                   # true: 각 키포인트의 (x, y, score) 표시
+                                   #   예: "[DWPose] idx=9 xy=(3625.7, 3912.3) score=4.234"
+                                   # false: 출력 안함
+                                   # 💡 권장: false (매우 길어질 수 있음)
+  
+  show_cross_filter: true          # Cross-Filter 적용 결과
+                                   # true: 필터링 결과 요약 표시
+                                   #   예: "✅ Cross-Filter 적용: 133/133 keypoints 승인"
+                                   # false: 출력 안함
+                                   # 💡 권장: true (필터링 결과 확인용)
+  
+  show_hand_refinement: false      # Hand Refinement 처리 로그
+                                   # true: 손 영역 업스케일링 상세 정보
+                                   # false: 출력 안함
+                                   # 💡 권장: false (일반적으로 불필요)
+  
+  # ===== Transfer 단계 로그 =====
+  # Pose transfer 과정 (Body, Face, Hand 전이)
+  
+  show_transfer_stages: false      # Transfer 전체 단계 표시
+                                   # true: 각 단계 시작 메시지 표시
+                                   #   예: "🏃 Body Transfer...", "👤 Face Transfer..."
+                                   # false: 출력 안함
+                                   # 💡 권장: false (간결한 출력)
+  
+  show_body_transfer: false        # Body 전이 상세 로그
+                                   # true: Chain 전이, Feet 전이 등 상세 정보
+                                   #   - transfer_chain(UPPER/LOWER) 상세
+                                   #   - 각 뼈 길이 계산 및 적용 과정
+                                   #   - Feet transfer 상세 (발 각 부위별)
+                                   # false: 출력 안함
+                                   # ⚠️ 매우 길어질 수 있음 (50+ 줄)
+                                   # 💡 권장: false (Body 문제 디버깅 시만 true)
+  
+  show_face_transfer: false        # Face 전이 상세 로그
+                                   # true: Face Scale, Landmarks 전이 상세 정보
+                                   #   - Face Scale 계산 과정
+                                   #   - Body Face (코/눈/귀) 배치 상세
+                                   #   - Face Landmarks (68개) 전이 상세
+                                   # false: 출력 안함
+                                   # 💡 권장: false (얼굴 문제 디버깅 시만 true)
+  
+  show_hand_transfer: false        # Hand 전이 상세 로그
+                                   # true: 손 전이 전략, 스케일 계산 등
+                                   #   - 각 손가락별 전이 상세
+                                   #   - 스케일 계산 과정
+                                   # false: 출력 안함
+                                   # 💡 권장: false (손 문제 디버깅 시만 true)
+  
+  # ===== Post-processing 로그 =====
+  
+  show_alignment: false            # Alignment 상세 로그
+                                   # true: Feet/Face 정렬 계산 상세 정보
+                                   #   - Feet 정렬: 발 위치, shift_y 계산
+                                   #   - Face 정렬: 얼굴 중심, shift_x/y 계산
+                                   # false: 출력 안함
+                                   # 💡 권장: false (정렬 문제 디버깅 시만 true)
+  
+  show_canvas: false               # Canvas 확장 로그
+                                   # true: Bbox 계산, Padding 추가 등 상세 정보
+                                   #   - Valid keypoints bbox
+                                   #   - Required canvas bounds
+                                   #   - Padding calculation
+                                   # false: 출력 안함
+                                   # 💡 권장: false (Canvas 문제 디버그 시만 true)
+  
+  # ===== BBox 시각화 (이미지 렌더링) =====
+  # 디버그 이미지에 bbox를 그릴지 여부
+  # 콘솔 로그와 무관하게 이미지에만 영향
+  
+  bbox_visualization: true         # BBox 시각화 활성화
+  visualize_keypoint_bbox: true    # Keypoint 기반 bbox 표시
+  visualize_yolo_bbox: true        # YOLO 검출 bbox 표시
+  visualize_hybrid_bbox: true      # 하이브리드 bbox 표시
 
 # 디버깅 스크립트 실행 제어 (수동 실행 스크립트용)
 debug_tools:
@@ -171,8 +276,54 @@ bbox:
 # =============================================================================
 # [13] 얼굴 렌더링 (부위별 제어)
 # =============================================================================
+# 얼굴 전이 및 렌더링 설정
+#
+# v21 변경사항:
+#   - use_3d_depth: Depth map 기반 Z축 보정 (선택적)
+#   - jawline_correction: Jawline 미세 보정 (⭐ 새로 추가)
+#
+# use_3d_depth (3D Depth 보정):
+#   - false (기본값): 순수 2D 좌표계 사용
+#     → 안정적이고 예측 가능한 결과
+#   - true: Depth Anything V2의 depth 정보 활용
+#     → 극단적인 각도나 원근에서 개선 가능
+#     → 실험적 기능, 경우에 따라 부자연스러울 수 있음
+#
+# jawline_correction (Jawline 미세 보정):
+#   - false (권장): face_scale만 적용
+#     → face_scale이 이미 얼굴/몸통 비율을 정확히 반영하므로 충분함
+#     → 안정적이고 예측 가능한 결과
+#   - true: face_scale 적용 후 Jawline 비율을 추가로 재조정
+#     → Source와 Reference의 얼굴 형태가 크게 다를 때만 유용
+#     → 대부분의 경우 얼굴을 오히려 작게 만드는 부작용 발생
+#   ⚠️ 주의: true로 설정 시 얼굴이 0.5~0.7배로 축소될 수 있음
+#
+# depth_z_scale (3D 보정 강도):
+#   - use_3d_depth=true일 때만 의미 있음
+#   - 0.3~0.7 권장 (기본: 0.5)
+#   - 값이 클수록 depth 효과가 강해짐
+# =============================================================================
 face_rendering:
-  enabled: true
+  enabled: true                    # 얼굴 렌더링 활성화
+  
+  # ===== 3D Depth 기능 (선택적) =====
+  use_3d_depth: false              # Depth map 기반 보정
+                                   # false 권장: 2D 좌표계만 사용 (안정적)
+                                   # true: 3D depth 정보 활용 (실험적)
+  
+  depth_z_scale: 0.5               # 3D 보정 강도 (use_3d_depth=true일 때만)
+                                   # 0.3~0.7 권장 (기본: 0.5)
+  
+  # ===== Jawline 보정 (선택적) ⭐ v21 NEW =====
+  jawline_correction: false        # Jawline 미세 보정
+                                   # false 권장: face_scale만 적용 (안정적)
+                                   #   → 얼굴/몸통 비율이 정확히 반영됨
+                                   # true: 추가 비율 조정 (특수 케이스만)
+                                   #   → Source와 Ref 얼굴 형태가 매우 다를 때
+                                   # ⚠️ 주의: true 시 얼굴이 작아질 수 있음
+                                   #   → 내부적으로 0.5~0.7 scale이 추가 적용됨
+  
+  # ===== 부위별 렌더링 제어 =====
   parts:
     jawline:
       enabled: true
@@ -198,3 +349,13 @@ face_rendering:
     mouth_inner:
       enabled: false
       color: [255, 255, 255]
+
+# 단계별 콘솔 로그 출력 제어 (pipeline.py)
+  show_module_init: false         # 모듈 초기화 로그
+  show_step1: false              # [STEP 1] 포즈 추출 로그
+  show_step2: false              # [STEP 2] 정렬 방식 결정 로그
+  show_step3: false              # [STEP 3] Bbox 계산 로그
+  show_step4: true               # [STEP 4] transfer 단계 로그 (항상 true 권장)
+
+# DWPoseExtractor 전체 디버그 로그 제어
+show_dwpose_debug: false

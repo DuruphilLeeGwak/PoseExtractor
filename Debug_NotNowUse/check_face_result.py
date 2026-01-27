@@ -1,0 +1,1 @@
+<copy of d:/2025/pose_extractor/check_face_result.py>

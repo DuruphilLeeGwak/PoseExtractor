@@ -47,6 +47,9 @@ class PoseTransferEngine:
         reference_image_size: Optional[Tuple[int, int]] = None,
         target_image_size: Optional[Tuple[int, int]] = None,
         alignment_case: Optional[str] = None,
+        source_depths: Optional[np.ndarray] = None,
+        reference_depths: Optional[np.ndarray] = None,
+        depth_z_scale: Optional[float] = None,
     ) -> TransferResult:
         
         print("\n" + "="*70)
@@ -94,6 +97,17 @@ class PoseTransferEngine:
         transfer_log = {
             'face_parts': []  # For ear and face tracking
         }
+        if source_depths is not None and reference_depths is not None:
+            transfer_log['depth'] = {
+                'enabled': True,
+                'z_scale': float(depth_z_scale) if depth_z_scale is not None else None,
+                'src_depth_min': float(np.min(source_depths)),
+                'src_depth_max': float(np.max(source_depths)),
+                'src_depth_mean': float(np.mean(source_depths)),
+                'ref_depth_min': float(np.min(reference_depths)),
+                'ref_depth_max': float(np.max(reference_depths)),
+                'ref_depth_mean': float(np.mean(reference_depths))
+            }
         processed = set()
 
         # ══════════════════════════════════════════════════════════════
@@ -115,18 +129,29 @@ class PoseTransferEngine:
             r_scores=reference_scores,
         )
         self.body_logic.transfer_torso(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, hand_scale_ratio, processed, transfer_log)
-        self.body_logic.transfer_chain(trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log, is_lower=False)
-        # Fine-tune upper limb ratios before hand transfer
-        self.body_logic.fine_tune_upper_ratio(
-            trans_kpts, trans_scores,
-            source_keypoints, source_scores,
-            reference_keypoints, reference_scores,
-            processed, transfer_log
+        self.body_logic.transfer_chain(
+            trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log, is_lower=False,
+            src_proportions=source_proportions, ref_proportions=self.bone_calculator.calculate(reference_keypoints, reference_scores),
+            src_depths=source_depths, ref_depths=reference_depths, depth_z_scale=depth_z_scale
         )
+        # Fine-tune upper limb ratios before hand transfer
+        if getattr(self.config, 'enable_upper_ratio_tuning', True):
+            self.body_logic.fine_tune_upper_ratio(
+                trans_kpts, trans_scores,
+                source_keypoints, source_scores,
+                reference_keypoints, reference_scores,
+                processed, transfer_log,
+                source_depths=source_depths,
+                depth_z_scale=depth_z_scale
+            )
         
         # Lower Body
         if ref_lower_valid:
-            self.body_logic.transfer_chain(trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log, is_lower=True)
+            self.body_logic.transfer_chain(
+                trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log, is_lower=True,
+                src_proportions=source_proportions, ref_proportions=self.bone_calculator.calculate(reference_keypoints, reference_scores),
+                src_depths=source_depths, ref_depths=reference_depths, depth_z_scale=depth_z_scale
+            )
             self.body_logic.transfer_feet(
                 trans_kpts, trans_scores,
                 source_keypoints, source_scores,
@@ -136,12 +161,15 @@ class PoseTransferEngine:
                 processed, transfer_log
             )
             # Fine-tune lower limb ratios after feet transfer
-            self.body_logic.fine_tune_lower_ratio(
-                trans_kpts, trans_scores,
-                source_keypoints, source_scores,
-                reference_keypoints, reference_scores,
-                processed, transfer_log
-            )
+            if getattr(self.config, 'enable_lower_ratio_tuning', True):
+                self.body_logic.fine_tune_lower_ratio(
+                    trans_kpts, trans_scores,
+                    source_keypoints, source_scores,
+                    reference_keypoints, reference_scores,
+                    processed, transfer_log,
+                    source_depths=source_depths,
+                    depth_z_scale=depth_z_scale
+                )
 
         # ══════════════════════════════════════════════════════════════
         # STEP 1.5: Fill Missing Keypoints from Reference
@@ -170,7 +198,13 @@ class PoseTransferEngine:
         # Face Landmarks (23-90)는 use_face 설정에 따라 선택적 처리
         if self.config.use_face:
             print("   ✅ Face Landmarks enabled")
-            self._transfer_face_landmarks(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores)
+            self._transfer_face_landmarks(
+                trans_kpts, trans_scores,
+                source_keypoints, source_scores,
+                reference_keypoints, reference_scores,
+                source_depths=source_depths, reference_depths=reference_depths, depth_z_scale=depth_z_scale,
+                face_scale=self._face_transfer_debug.get('face_scale', 1.0)
+            )
         else:
             print("   ⏭️  Face Landmarks disabled (use_face=False)")
 
@@ -373,35 +407,13 @@ class PoseTransferEngine:
         def _rotate(vec):
             return np.array([vec[0] * c - vec[1] * s, vec[0] * s + vec[1] * c])
 
-        # 스케일: 좌우/상하 분리 (어깨 너비 / 몸통 높이 기준)
-        src_shoulder_width = np.linalg.norm(src_kpts[RS] - src_kpts[LS])
-        trans_shoulder_width = np.linalg.norm(trans_kpts[RS] - trans_kpts[LS])
-        ref_shoulder_width = np.linalg.norm(ref_kpts[RS] - ref_kpts[LS])
-        if src_shoulder_width > 1e-6:
-            face_scale_x = trans_shoulder_width / src_shoulder_width
-        else:
-            face_scale_x = 1.0
-
-        # 목 길이: src 몸 비율 + ref 어깨/목 비율 반영
-        if src_scores[NOSE] > 0.1:
-            src_neck_len = np.linalg.norm(src_kpts[NOSE] - src_neck)
-        else:
-            src_neck_len = np.linalg.norm(src_kpts[LEFT_EYE] - src_neck) if src_scores[LEFT_EYE] > 0.1 else 0.0
-
-        # 목 길이: src 비율만 사용 (어깨 너비 기준 스케일)
-        if src_neck_len > 1e-6 and src_shoulder_width > 1e-6:
-            neck_scale = trans_shoulder_width / src_shoulder_width
-        else:
-            neck_scale = 1.0
-
-        # Anchor 보정은 사용하지 않고, 어깨 스케일에만 종속
-        anchor_pull = 1.0
-
-        # 세로 스케일은 어깨 스케일과 동일하게 유지
-        face_scale_y = neck_scale
+        # 스케일: face_scale 사용 (얼굴/몸통 비율 반영)
+        # face_scale은 이미 line 367에서 계산됨
+        face_scale_x = face_scale
+        face_scale_y = face_scale
 
         def _scale_vec(vec, dist):
-            base = vec * (dist * anchor_pull)
+            base = vec * dist
             return np.array([base[0] * face_scale_x, base[1] * face_scale_y])
 
         # 좌/우 거리 비율 blending (귀 전용)
@@ -575,7 +587,9 @@ class PoseTransferEngine:
 
     def _transfer_face_landmarks(
         self, trans_kpts, trans_scores,
-        src_kpts, src_scores, ref_kpts, ref_scores
+        src_kpts, src_scores, ref_kpts, ref_scores,
+        source_depths=None, reference_depths=None, depth_z_scale=1.0,
+        face_scale=None
     ):
         """
         Face Landmarks 전이 (23~90: 68개 상세 얼굴 랜드마크)
@@ -610,15 +624,24 @@ class PoseTransferEngine:
         else:
             src_shoulder_width = 1.0
         
-        global_scale = trans_shoulder_width / src_shoulder_width if src_shoulder_width > 0 else 1.0
+        # Use face_scale from _transfer_body_face if available (better accuracy)
+        if face_scale is not None:
+            global_scale = face_scale
+            print(f"\n🎯 [Face Landmarks] Using face_scale from body_face: {global_scale:.3f}")
+        else:
+            # Fallback: calculate from shoulder width
+            global_scale = trans_shoulder_width / src_shoulder_width if src_shoulder_width > 0 else 1.0
+            print(f"\n🎯 [Face Landmarks] Calculated global_scale: {global_scale:.3f}")
         
-        # 3. Ref에서 코-랜드마크 벡터 가져와서 Trans에 적용
+
+        # 3. Ref에서 코-랜드마크 3D 벡터 가져와서 Trans에 적용 (depth가 있으면 3D, 없으면 기존 2D)
         if ref_scores[NOSE] < 0.1:
             print("   ⚠️ [Face Landmarks] Ref 코가 없어 전이 불가")
             return
-        
+
         ref_nose = ref_kpts[NOSE]
-        
+        use_3d = reference_depths is not None and source_depths is not None and len(reference_depths) > NOSE and len(source_depths) > NOSE
+
         # Face 5점(코/눈/귀) 정합: Ref → Trans 유사변환(s,R,t)
         def _compute_similarity(src_pts, dst_pts):
             src_mean = np.mean(src_pts, axis=0)
@@ -654,12 +677,44 @@ class PoseTransferEngine:
             trans_anchor = np.array(trans_anchor, dtype=np.float32)
             sim_scale, sim_R, sim_t = _compute_similarity(ref_anchor, trans_anchor)
 
-        # Ref 구조를 5점 정합으로 전이
+        # --- 3D z축 jawline~nose 비율 정규화 및 clamp ---
         face_landmarks_count = 0
+        # src/참조 jawline~nose z차 계산
+        def get_jaw_nose_z(kpts, depths, jaw_idx, nose_idx):
+            if depths is None or len(depths) <= max(jaw_idx, nose_idx):
+                return None
+            return float(depths[jaw_idx] - depths[nose_idx])
+
+        # jawline 기준점: 턱 중앙(8번)
+        JAW_CHIN_IDX = 23 + 8
+        src_jaw_z = get_jaw_nose_z(src_kpts, source_depths, JAW_CHIN_IDX, NOSE) if use_3d else None
+        ref_jaw_z = get_jaw_nose_z(ref_kpts, reference_depths, JAW_CHIN_IDX, NOSE) if use_3d else None
+        # clamp 계수(최대 1.5배)
+        z_clamp_ratio = 1.5
+
         for idx in face_landmarks_indices:
             if ref_scores[idx] > 0.1:
-                if use_similarity:
-                    trans_pos = sim_scale * (sim_R @ ref_kpts[idx]) + sim_t
+                if use_3d and idx < len(reference_depths) and NOSE < len(reference_depths):
+                    # 3D 벡터 계산
+                    ref_vec_3d = np.array([
+                        ref_kpts[idx][0] - ref_nose[0],
+                        ref_kpts[idx][1] - ref_nose[1],
+                        (reference_depths[idx] - reference_depths[NOSE]) * depth_z_scale
+                    ], dtype=np.float32)
+                    # jawline~nose z비율 정규화 및 clamp
+                    if idx == JAW_CHIN_IDX and src_jaw_z is not None and ref_jaw_z is not None and abs(ref_jaw_z) > 1e-6:
+                        # src/ref z비율로 보정, clamp
+                        z_ratio = np.clip(abs(src_jaw_z) / abs(ref_jaw_z), 1.0 / z_clamp_ratio, z_clamp_ratio)
+                        ref_vec_3d[2] = ref_vec_3d[2] * z_ratio
+                    # trans nose 기준 2D 위치에 3D 벡터의 xy만 적용 (z는 별도 저장/활용 가능)
+                    trans_pos = np.array([
+                        trans_nose[0] + ref_vec_3d[0] * global_scale,
+                        trans_nose[1] + ref_vec_3d[1] * global_scale
+                    ], dtype=np.float32)
+                elif use_similarity:
+                    sim_pos = sim_scale * (sim_R @ ref_kpts[idx]) + sim_t
+                    vec_from_nose = sim_pos - trans_nose
+                    trans_pos = trans_nose + vec_from_nose * (global_scale / sim_scale if sim_scale > 1e-6 else global_scale)
                 else:
                     # 폴백: 이전 방식 (ref 방향 + global_scale)
                     ref_nose_lm_vec = ref_kpts[idx] - ref_nose
@@ -674,83 +729,10 @@ class PoseTransferEngine:
                 trans_scores[idx] = ref_scores[idx]
                 face_landmarks_count += 1
 
-        # Jawline 보정: src 비율(좌우/상하) 기반으로 jawline을 재스케일
-        FACE_START = 23
-        jawline_idx = [FACE_START + i for i in range(0, 17)]
-        left_brow_idx = [FACE_START + i for i in range(17, 22)]
-        right_brow_idx = [FACE_START + i for i in range(22, 27)]
-
-        def _mean_point(kpts, scores, indices):
-            pts = [kpts[i] for i in indices if i < len(scores) and scores[i] > 0.1]
-            return np.mean(pts, axis=0) if len(pts) else None
-
-        # Src 기준 비율 계산 (jaw/ear, brow-chin/ear)
-        src_jaw_left = src_kpts[jawline_idx[0]] if src_scores[jawline_idx[0]] > 0.1 else None
-        src_jaw_right = src_kpts[jawline_idx[-1]] if src_scores[jawline_idx[-1]] > 0.1 else None
-        src_jaw_chin = src_kpts[jawline_idx[8]] if src_scores[jawline_idx[8]] > 0.1 else None
-        src_brow_center = _mean_point(src_kpts, src_scores, left_brow_idx + right_brow_idx)
-        src_ear_left = src_kpts[LEFT_EAR] if src_scores[LEFT_EAR] > 0.1 else None
-        src_ear_right = src_kpts[RIGHT_EAR] if src_scores[RIGHT_EAR] > 0.1 else None
-
-        # Trans 기준 현재 비율 계산
-        trans_jaw_left = trans_kpts[jawline_idx[0]] if trans_scores[jawline_idx[0]] > 0.1 else None
-        trans_jaw_right = trans_kpts[jawline_idx[-1]] if trans_scores[jawline_idx[-1]] > 0.1 else None
-        trans_jaw_chin = trans_kpts[jawline_idx[8]] if trans_scores[jawline_idx[8]] > 0.1 else None
-        trans_brow_center = _mean_point(trans_kpts, trans_scores, left_brow_idx + right_brow_idx)
-        trans_ear_left = trans_kpts[LEFT_EAR] if trans_scores[LEFT_EAR] > 0.1 else None
-        trans_ear_right = trans_kpts[RIGHT_EAR] if trans_scores[RIGHT_EAR] > 0.1 else None
-
-        src_jaw_width = np.linalg.norm(src_jaw_right - src_jaw_left) if (src_jaw_left is not None and src_jaw_right is not None) else None
-        src_ear_width = np.linalg.norm(src_ear_right - src_ear_left) if (src_ear_left is not None and src_ear_right is not None) else None
-        src_brow_chin = np.linalg.norm(src_jaw_chin - src_brow_center) if (src_brow_center is not None and src_jaw_chin is not None) else None
-
-        trans_jaw_width = np.linalg.norm(trans_jaw_right - trans_jaw_left) if (trans_jaw_left is not None and trans_jaw_right is not None) else None
-        trans_ear_width = np.linalg.norm(trans_ear_right - trans_ear_left) if (trans_ear_left is not None and trans_ear_right is not None) else None
-        trans_brow_chin = np.linalg.norm(trans_jaw_chin - trans_brow_center) if (trans_brow_center is not None and trans_jaw_chin is not None) else None
-
-        # 목표 jawline 크기: trans 귀폭에 src 비율을 반영
-        target_jaw_width = None
-        target_brow_chin = None
-        if src_jaw_width and src_ear_width and trans_ear_width and src_ear_width > 1e-6:
-            target_jaw_width = trans_ear_width * (src_jaw_width / src_ear_width)
-        if src_brow_chin and src_ear_width and trans_ear_width and src_ear_width > 1e-6:
-            target_brow_chin = trans_ear_width * (src_brow_chin / src_ear_width)
-
-        scale_x = (target_jaw_width / trans_jaw_width) if (target_jaw_width and trans_jaw_width and trans_jaw_width > 1e-6) else 1.0
-        scale_y = (target_brow_chin / trans_brow_chin) if (target_brow_chin and trans_brow_chin and trans_brow_chin > 1e-6) else 1.0
-
-        # 과도한 변형 방지
-        scale_x = float(np.clip(scale_x, 0.5, 2.0))
-        scale_y = float(np.clip(scale_y, 0.5, 2.0))
-
-        # Jawline pivot: 귀 중점 + 코 기준 (5점 기반 위치)
-        if trans_scores[LEFT_EAR] > 0.1 and trans_scores[RIGHT_EAR] > 0.1:
-            ear_mid = (trans_kpts[LEFT_EAR] + trans_kpts[RIGHT_EAR]) / 2.0
-        else:
-            ear_mid = _mean_point(trans_kpts, trans_scores, jawline_idx) or trans_nose
-
-        jaw_pivot = np.array([ear_mid[0], trans_nose[1]], dtype=np.float32)
-
-        if scale_x != 1.0 or scale_y != 1.0:
-            for idx in jawline_idx:
-                if idx < len(trans_scores) and trans_scores[idx] > 0.1:
-                    v = trans_kpts[idx] - jaw_pivot
-                    v = np.array([v[0] * scale_x, v[1] * scale_y])
-                    trans_kpts[idx] = jaw_pivot + v
-
-            # Jawline 보정에 맞춰 내부 파트도 미세 보정
-            inner_pivot = trans_nose
-            for idx in face_landmarks_indices:
-                if idx in jawline_idx:
-                    continue
-                if idx < len(trans_scores) and trans_scores[idx] > 0.1:
-                    v = trans_kpts[idx] - inner_pivot
-                    v = np.array([v[0] * scale_x, v[1] * scale_y])
-                    trans_kpts[idx] = inner_pivot + v
-        
+        # Jawline 보정 제거 (face_scale이 이미 적용됨)
         if face_landmarks_count > 0:
-            print(f"   ✅ Face Landmarks Transferred: {face_landmarks_count} keypoints (ref 구조)")
-            print(f"   🔧 Jawline scale: x={scale_x:.3f}, y={scale_y:.3f} (src ratio applied)")
+            print(f"   ✅ Face Landmarks Transferred: {face_landmarks_count} keypoints (face_scale={global_scale:.3f})")
+
 
     def _transfer_face_rigid(
         self, trans_kpts, trans_scores,
@@ -761,7 +743,11 @@ class PoseTransferEngine:
         _transfer_body_face()와 _transfer_face_landmarks()를 순차 호출
         """
         self._transfer_body_face(trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores)
-        self._transfer_face_landmarks(trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores)
+        # ⭐ FIX: Pass face_scale from _transfer_body_face
+        self._transfer_face_landmarks(
+            trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores,
+            face_scale=self._face_transfer_debug.get('face_scale', 1.0)
+        )
 
     def _transfer_hands(self, trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores, hand_scale_ratio, transfer_log=None):
         """

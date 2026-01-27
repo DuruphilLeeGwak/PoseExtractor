@@ -150,59 +150,93 @@ class BodyTransfer:
         processed.add(l_hip); processed.add(r_hip)
         log['torso'] = 'spine_calc'
 
-    def transfer_chain(self, t_kpts, t_scores, lengths, r_kpts, r_scores, scale, processed, log, is_lower=False):
+    def transfer_chain(self, t_kpts, t_scores, lengths, r_kpts, r_scores, scale, processed, log, is_lower=False,
+                      src_proportions=None, ref_proportions=None, src_depths=None, ref_depths=None, depth_z_scale=1.0):
+        """
+        Per-bone 3D transfer: use src torso length and ref per-bone 3D ratio for each bone.
+        If depth is available, use 3D bone/torso ratio; else fallback to 2D.
+        """
         order = self.lower_body_order if is_lower else self.upper_body_order
         chain_type = "LOWER" if is_lower else "UPPER"
-        
-        print(f"\n   🔍 [DEBUG] transfer_chain({chain_type}) START")
+        print(f"\n   🔍 [DEBUG] transfer_chain({chain_type}) START [3D ratio mode]")
         print(f"      processed indices: {sorted(processed)}")
-        
+
+        # Get src torso length (3D if possible)
+        def get_torso_length(proportions, depths=None):
+            if proportions is None:
+                return None
+            if depths is not None and len(depths) == len(t_kpts):
+                # 3D torso length
+                l_sh, r_sh = BODY_KEYPOINTS['left_shoulder'], BODY_KEYPOINTS['right_shoulder']
+                l_hip, r_hip = BODY_KEYPOINTS['left_hip'], BODY_KEYPOINTS['right_hip']
+                if all(idx is not None for idx in [l_sh, r_sh, l_hip, r_hip]):
+                    neck = (t_kpts[l_sh] + t_kpts[r_sh]) / 2.0
+                    root = (t_kpts[l_hip] + t_kpts[r_hip]) / 2.0
+                    dz = ((depths[l_sh] + depths[r_sh]) / 2.0 - (depths[l_hip] + depths[r_hip]) / 2.0) * depth_z_scale
+                    return float(np.sqrt(np.sum((neck - root) ** 2) + dz ** 2))
+            # fallback to 2D
+            return proportions.torso_length
+
+        src_torso = get_torso_length(src_proportions, src_depths)
+        ref_torso = get_torso_length(ref_proportions, ref_depths)
+
         for _, p_name, children in order:
             p_idx = get_keypoint_index(p_name)
-            
             if p_idx not in processed:
                 continue
-            
             p_pos = t_kpts[p_idx]
-            
             for c_name in children:
                 c_idx = get_keypoint_index(c_name)
                 if c_idx is None:
                     continue
-                    
                 r_score = r_scores[c_idx] if c_idx < len(r_scores) else 0
-                
                 if r_score < 0.1:
                     print(f"      ❌ {c_name} (idx={c_idx}): ref_score={r_score:.3f} < 0.1, SKIP")
                     continue
-                
                 bone = f"{p_name}_{c_name}"
                 alt = f"{c_name}_{p_name}"
-                
-                # 뼈 길이 결정: SRC 우선 (신체 비율 유지)
-                src_length = lengths.get(bone) or lengths.get(alt)
-                ref_length = calculate_distance(r_kpts[p_idx], r_kpts[c_idx])
-                
-                if src_length:
-                    length = src_length
-                    source = "SRC"
+
+                # --- Per-bone 3D ratio logic ---
+                # 1. Get ref bone length (3D if possible)
+                def bone_length_3d(kpts, depths, idx1, idx2):
+                    if depths is not None and len(depths) == len(kpts):
+                        diff = kpts[idx2] - kpts[idx1]
+                        dz = (float(depths[idx2]) - float(depths[idx1])) * float(depth_z_scale)
+                        return float(np.sqrt(diff[0] ** 2 + diff[1] ** 2 + dz ** 2))
+                    else:
+                        return calculate_distance(kpts[idx1], kpts[idx2])
+
+                ref_bone_len = bone_length_3d(r_kpts, ref_depths, p_idx, c_idx)
+                # 2. Get ref bone/torso ratio
+                if ref_torso and ref_torso > 1e-6:
+                    ref_bone_ratio = ref_bone_len / ref_torso
                 else:
-                    length = ref_length * scale
-                    source = f"REF*scale"
-                
-                # REF 방향 사용 (각도는 REF 따름)
+                    ref_bone_ratio = None
+
+                # 3. Use src torso length for scale
+                if src_torso and ref_bone_ratio:
+                    length = src_torso * ref_bone_ratio
+                    source = f"src_torso*ref_ratio3d"
+                else:
+                    # fallback: src length or ref*scale
+                    src_length = lengths.get(bone) or lengths.get(alt)
+                    if src_length:
+                        length = src_length
+                        source = "SRC"
+                    else:
+                        length = ref_bone_len * scale
+                        source = f"REF*scale"
+
+                # Use ref direction (angle)
                 vec = r_kpts[c_idx] - r_kpts[p_idx]
                 direct = normalize_vector(vec)
-                
                 t_kpts[c_idx] = p_pos + direct * length
                 t_scores[c_idx] = 0.8
-                
                 processed.add(c_idx)
-                log[c_name] = 'chain'
-                
+                log[c_name] = 'chain3d'
                 print(f"      ✅ {c_name} (idx={c_idx}): length={length:.1f} ({source})")
-        
-        print(f"   🔍 [DEBUG] transfer_chain({chain_type}) END")
+
+        print(f"   🔍 [DEBUG] transfer_chain({chain_type}) END [3D ratio mode]")
         print(f"      final processed: {sorted(processed)}")
 
     def fine_tune_lower_ratio(
@@ -210,7 +244,9 @@ class BodyTransfer:
         t_kpts, t_scores,
         src_kpts, src_scores,
         ref_kpts, ref_scores,
-        processed, log
+        processed, log,
+        source_depths=None,
+        depth_z_scale: float = 1.0
     ):
         """
         하체(hip~feet) 비율 미세튜닝:
@@ -246,7 +282,7 @@ class BodyTransfer:
             return
 
         # Src ratios (left/right avg)
-        def _src_ratio(p_name, c_name):
+        def _src_ratio_2d(p_name, c_name):
             p_idx = get_keypoint_index(p_name)
             c_idx = get_keypoint_index(c_name)
             if p_idx is None or c_idx is None:
@@ -256,7 +292,23 @@ class BodyTransfer:
             length = float(np.linalg.norm(src_kpts[c_idx] - src_kpts[p_idx]))
             return length / src_torso if src_torso > 1e-6 else None
 
-        ratio_map = {}
+        def _src_ratio_3d(p_name, c_name):
+            if source_depths is None or depth_z_scale is None:
+                return None
+            p_idx = get_keypoint_index(p_name)
+            c_idx = get_keypoint_index(c_name)
+            if p_idx is None or c_idx is None:
+                return None
+            if src_scores[p_idx] <= 0.2 or src_scores[c_idx] <= 0.2:
+                return None
+            diff = src_kpts[c_idx] - src_kpts[p_idx]
+            dz = (float(source_depths[c_idx]) - float(source_depths[p_idx])) * float(depth_z_scale)
+            length = float(np.sqrt(diff[0] ** 2 + diff[1] ** 2 + dz ** 2))
+            return length / src_torso if src_torso > 1e-6 else None
+
+        ratio_map_2d = {}
+        ratio_map_3d = {}
+        ratio_map_used = {}
         ratio_pairs = {
             'hip_knee': ('left_hip', 'left_knee', 'right_hip', 'right_knee'),
             'knee_ankle': ('left_knee', 'left_ankle', 'right_knee', 'right_ankle'),
@@ -266,16 +318,32 @@ class BodyTransfer:
         }
 
         for key, (lp, lc, rp, rc) in ratio_pairs.items():
-            l_ratio = _src_ratio(lp, lc)
-            r_ratio = _src_ratio(rp, rc)
-            if l_ratio is not None and r_ratio is not None:
-                ratio_map[key] = (l_ratio + r_ratio) / 2.0
-            elif l_ratio is not None:
-                ratio_map[key] = l_ratio
-            elif r_ratio is not None:
-                ratio_map[key] = r_ratio
+            l_ratio_2d = _src_ratio_2d(lp, lc)
+            r_ratio_2d = _src_ratio_2d(rp, rc)
+            if l_ratio_2d is not None and r_ratio_2d is not None:
+                ratio_map_2d[key] = (l_ratio_2d + r_ratio_2d) / 2.0
+            elif l_ratio_2d is not None:
+                ratio_map_2d[key] = l_ratio_2d
+            elif r_ratio_2d is not None:
+                ratio_map_2d[key] = r_ratio_2d
 
-        if not ratio_map:
+            l_ratio_3d = _src_ratio_3d(lp, lc)
+            r_ratio_3d = _src_ratio_3d(rp, rc)
+            if l_ratio_3d is not None and r_ratio_3d is not None:
+                ratio_map_3d[key] = (l_ratio_3d + r_ratio_3d) / 2.0
+            elif l_ratio_3d is not None:
+                ratio_map_3d[key] = l_ratio_3d
+            elif r_ratio_3d is not None:
+                ratio_map_3d[key] = r_ratio_3d
+
+        if source_depths is not None and len(ratio_map_3d) > 0:
+            ratio_map_used = ratio_map_3d
+            ratio_source = '3d'
+        else:
+            ratio_map_used = ratio_map_2d
+            ratio_source = '2d'
+
+        if not ratio_map_used:
             return
 
         # Apply ratios using ref direction
@@ -288,7 +356,7 @@ class BodyTransfer:
             heel = f"{side_prefix}_heel"
 
             def _place(parent, child, ratio_key):
-                if ratio_key not in ratio_map:
+                if ratio_key not in ratio_map_used:
                     return
                 p_idx = get_keypoint_index(parent)
                 c_idx = get_keypoint_index(child)
@@ -300,7 +368,7 @@ class BodyTransfer:
                     return
                 ref_vec = ref_kpts[c_idx] - ref_kpts[p_idx]
                 ref_dir = normalize_vector(ref_vec)
-                length = ratio_map[ratio_key] * trans_torso
+                length = ratio_map_used[ratio_key] * trans_torso
                 t_kpts[c_idx] = t_kpts[p_idx] + ref_dir * length
                 t_scores[c_idx] = 0.85
                 processed.add(c_idx)
@@ -314,10 +382,21 @@ class BodyTransfer:
         _apply_side('left')
         _apply_side('right')
 
+        def _delta_map(base_map, used_map):
+            delta = {}
+            for k, v in used_map.items():
+                if k in base_map:
+                    delta[k] = float(v - base_map[k])
+            return delta
+
         log['lower_ratio_tuning'] = {
             'src_torso': float(src_torso),
             'trans_torso': float(trans_torso),
-            'ratios': {k: float(v) for k, v in ratio_map.items()}
+            'ratio_source': ratio_source,
+            'ratios_2d': {k: float(v) for k, v in ratio_map_2d.items()},
+            'ratios_3d': {k: float(v) for k, v in ratio_map_3d.items()},
+            'ratios_used': {k: float(v) for k, v in ratio_map_used.items()},
+            'deltas_vs_2d': _delta_map(ratio_map_2d, ratio_map_used)
         }
 
     def fine_tune_upper_ratio(
@@ -325,7 +404,9 @@ class BodyTransfer:
         t_kpts, t_scores,
         src_kpts, src_scores,
         ref_kpts, ref_scores,
-        processed, log
+        processed, log,
+        source_depths=None,
+        depth_z_scale: float = 1.0
     ):
         """
         상체(shoulder~wrist) 비율 미세튜닝:
@@ -360,7 +441,7 @@ class BodyTransfer:
         if trans_torso <= 1e-6:
             return
 
-        def _src_ratio(p_name, c_name):
+        def _src_ratio_2d(p_name, c_name):
             p_idx = get_keypoint_index(p_name)
             c_idx = get_keypoint_index(c_name)
             if p_idx is None or c_idx is None:
@@ -370,23 +451,55 @@ class BodyTransfer:
             length = float(np.linalg.norm(src_kpts[c_idx] - src_kpts[p_idx]))
             return length / src_torso if src_torso > 1e-6 else None
 
-        ratio_map = {}
+        def _src_ratio_3d(p_name, c_name):
+            if source_depths is None or depth_z_scale is None:
+                return None
+            p_idx = get_keypoint_index(p_name)
+            c_idx = get_keypoint_index(c_name)
+            if p_idx is None or c_idx is None:
+                return None
+            if src_scores[p_idx] <= 0.2 or src_scores[c_idx] <= 0.2:
+                return None
+            diff = src_kpts[c_idx] - src_kpts[p_idx]
+            dz = (float(source_depths[c_idx]) - float(source_depths[p_idx])) * float(depth_z_scale)
+            length = float(np.sqrt(diff[0] ** 2 + diff[1] ** 2 + dz ** 2))
+            return length / src_torso if src_torso > 1e-6 else None
+
+        ratio_map_2d = {}
+        ratio_map_3d = {}
+        ratio_map_used = {}
         ratio_pairs = {
             'shoulder_elbow': ('left_shoulder', 'left_elbow', 'right_shoulder', 'right_elbow'),
             'elbow_wrist': ('left_elbow', 'left_wrist', 'right_elbow', 'right_wrist'),
         }
 
         for key, (lp, lc, rp, rc) in ratio_pairs.items():
-            l_ratio = _src_ratio(lp, lc)
-            r_ratio = _src_ratio(rp, rc)
-            if l_ratio is not None and r_ratio is not None:
-                ratio_map[key] = (l_ratio + r_ratio) / 2.0
-            elif l_ratio is not None:
-                ratio_map[key] = l_ratio
-            elif r_ratio is not None:
-                ratio_map[key] = r_ratio
+            l_ratio_2d = _src_ratio_2d(lp, lc)
+            r_ratio_2d = _src_ratio_2d(rp, rc)
+            if l_ratio_2d is not None and r_ratio_2d is not None:
+                ratio_map_2d[key] = (l_ratio_2d + r_ratio_2d) / 2.0
+            elif l_ratio_2d is not None:
+                ratio_map_2d[key] = l_ratio_2d
+            elif r_ratio_2d is not None:
+                ratio_map_2d[key] = r_ratio_2d
 
-        if not ratio_map:
+            l_ratio_3d = _src_ratio_3d(lp, lc)
+            r_ratio_3d = _src_ratio_3d(rp, rc)
+            if l_ratio_3d is not None and r_ratio_3d is not None:
+                ratio_map_3d[key] = (l_ratio_3d + r_ratio_3d) / 2.0
+            elif l_ratio_3d is not None:
+                ratio_map_3d[key] = l_ratio_3d
+            elif r_ratio_3d is not None:
+                ratio_map_3d[key] = r_ratio_3d
+
+        if source_depths is not None and len(ratio_map_3d) > 0:
+            ratio_map_used = ratio_map_3d
+            ratio_source = '3d'
+        else:
+            ratio_map_used = ratio_map_2d
+            ratio_source = '2d'
+
+        if not ratio_map_used:
             return
 
         def _apply_side(side_prefix):
@@ -395,7 +508,7 @@ class BodyTransfer:
             wrist = f"{side_prefix}_wrist"
 
             def _place(parent, child, ratio_key):
-                if ratio_key not in ratio_map:
+                if ratio_key not in ratio_map_used:
                     return
                 p_idx = get_keypoint_index(parent)
                 c_idx = get_keypoint_index(child)
@@ -407,7 +520,7 @@ class BodyTransfer:
                     return
                 ref_vec = ref_kpts[c_idx] - ref_kpts[p_idx]
                 ref_dir = normalize_vector(ref_vec)
-                length = ratio_map[ratio_key] * trans_torso
+                length = ratio_map_used[ratio_key] * trans_torso
                 t_kpts[c_idx] = t_kpts[p_idx] + ref_dir * length
                 t_scores[c_idx] = 0.85
                 processed.add(c_idx)
@@ -418,10 +531,21 @@ class BodyTransfer:
         _apply_side('left')
         _apply_side('right')
 
+        def _delta_map(base_map, used_map):
+            delta = {}
+            for k, v in used_map.items():
+                if k in base_map:
+                    delta[k] = float(v - base_map[k])
+            return delta
+
         log['upper_ratio_tuning'] = {
             'src_torso': float(src_torso),
             'trans_torso': float(trans_torso),
-            'ratios': {k: float(v) for k, v in ratio_map.items()}
+            'ratio_source': ratio_source,
+            'ratios_2d': {k: float(v) for k, v in ratio_map_2d.items()},
+            'ratios_3d': {k: float(v) for k, v in ratio_map_3d.items()},
+            'ratios_used': {k: float(v) for k, v in ratio_map_used.items()},
+            'deltas_vs_2d': _delta_map(ratio_map_2d, ratio_map_used)
         }
 
     def transfer_feet(self, t_kpts, t_scores, src_kpts, src_scores, lengths, r_kpts, r_scores, scale, processed, log):

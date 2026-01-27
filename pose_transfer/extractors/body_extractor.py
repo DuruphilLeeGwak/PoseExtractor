@@ -18,6 +18,33 @@ except ImportError:
     print("Warning: rtmlib not installed. Run: pip install rtmlib onnxruntime-gpu")
 
 
+# 디버그 플래그 (default: False)
+import yaml
+import os
+
+def _load_body_debug_flags():
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'default.yaml')
+    flags = {
+        'show_body_init': False,
+        'show_body_clean_mode': False,
+        'show_body_cross_filter': False
+    }
+    if not os.path.exists(config_path):
+        return flags
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        debug = config.get('debug', {})
+        flags['show_body_init'] = debug.get('show_body_init', False)
+        flags['show_body_clean_mode'] = debug.get('show_body_clean_mode', False)
+        flags['show_body_cross_filter'] = debug.get('show_body_cross_filter', False)
+    except Exception:
+        pass
+    return flags
+
+BODY_DEBUG_FLAGS = _load_body_debug_flags()
+
+
 class BodyExtractor:
     """
     rtmlib Body 모델 래퍼 (COCO 17 keypoints)
@@ -60,17 +87,19 @@ class BodyExtractor:
     
     def _init_model(self):
         """Body 모델 초기화"""
-        print(f"Initializing Body model (COCO 17 keypoints)...")
-        print(f"  Backend: {self.backend}")
-        print(f"  Device: {self.device}")
-        print(f"  Mode: {self.mode}")
+        if BODY_DEBUG_FLAGS['show_body_init']:
+            print(f"Initializing Body model (COCO 17 keypoints)...")
+            print(f"  Backend: {self.backend}")
+            print(f"  Device: {self.device}")
+            print(f"  Mode: {self.mode}")
         
         self.model = Body(
             mode=self.mode,
             backend=self.backend,
             device=self.device
         )
-        print("Body model initialized!")
+        if BODY_DEBUG_FLAGS['show_body_init']:
+            print("Body model initialized!")
     
     def extract(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """

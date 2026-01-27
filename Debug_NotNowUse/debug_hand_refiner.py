@@ -1,0 +1,1 @@
+<copy of d:/2025/pose_extractor/scripts/debug_hand_refiner.py>

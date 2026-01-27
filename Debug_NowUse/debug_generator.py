@@ -1,0 +1,1 @@
+<copy of d:/2025/pose_extractor/pose_transfer/logic/debug_generator.py>

@@ -1,0 +1,1 @@
+<copy of d:/2025/pose_extractor/scripts/debug_hand_clipping_20260104_223045.py>

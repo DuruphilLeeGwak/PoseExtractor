@@ -13,6 +13,7 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Optional, Union, Tuple
+import numpy as np
 
 # OpenMP 중복 로딩 에러 방지 (onnxruntime/rtmlib 충돌 회피)
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
@@ -275,6 +276,26 @@ def execute_pose_transfer(
         if result.ref_debug_image is not None:
             save_image(result.ref_debug_image, str(out_dirs["ref"] / "ref_debug_bbox.jpg"))
 
+        # Depth visualization 저장 (optional)
+        if result.processing_info and 'depth_maps' in result.processing_info:
+            depth_maps = result.processing_info['depth_maps']
+            if 'src' in depth_maps:
+                _save_depth_visual(depth_maps['src'], out_dirs["src"] / f"{final_src_path.stem}_depth.png")
+            if 'ref' in depth_maps:
+                _save_depth_visual(depth_maps['ref'], out_dirs["ref"] / f"{final_ref_path.stem}_depth.png")
+        elif getattr(pipeline, 'depth_extractor', None) is not None:
+            # Fallback: generate depth maps directly if not provided
+            try:
+                src_img = load_image(final_src_path)
+                ref_img = load_image(final_ref_path)
+                src_depth_map = pipeline.depth_extractor.estimate(src_img)
+                ref_depth_map = pipeline.depth_extractor.estimate(ref_img)
+                _save_depth_visual(src_depth_map, out_dirs["src"] / f"{final_src_path.stem}_depth.png")
+                _save_depth_visual(ref_depth_map, out_dirs["ref"] / f"{final_ref_path.stem}_depth.png")
+                print("   ✅ Depth visuals saved (fallback)")
+            except Exception as e:
+                print(f"   ⚠️ Depth visualization fallback failed: {e}")
+
         # [v4.1] Transfer Debug 정보 생성
         if do_save_debug_txt:
             try:
@@ -351,6 +372,16 @@ def _save_analysis(pipeline, image_path: Path, output_dir: Path, prefix: str, sa
         save_image(overlay_img, str(output_dir / f"{prefix}_rend.jpg"))
 
 
+def _save_depth_visual(depth_map: np.ndarray, output_path: Path) -> None:
+    depth = depth_map.astype(np.float32)
+    d_min = float(np.percentile(depth, 1))
+    d_max = float(np.percentile(depth, 99))
+    depth = (depth - d_min) / (d_max - d_min + 1e-6)
+    depth = np.clip(depth, 0.0, 1.0)
+    depth_u8 = (depth * 255).astype(np.uint8)
+    save_image(depth_u8, str(output_path))
+
+
 def _generate_transfer_debug_info(result, src_path: Path, ref_path: Path) -> str:
     """
     Transfer 결과에 대한 디버그 정보 생성
@@ -414,6 +445,24 @@ def _generate_transfer_debug_info(result, src_path: Path, ref_path: Path) -> str
     ref_total = len(result.reference_scores)
     lines.append(f"Reference: {ref_valid}/{ref_total} ({ref_valid/ref_total*100:.1f}%)")
     lines.append("")
+
+    # Depth info
+    if result.processing_info and 'transfer_log' in result.processing_info:
+        log = result.processing_info['transfer_log']
+        if 'depth' in log:
+            depth_info = log['depth']
+            lines.append("=" * 80)
+            lines.append("[3.5] Depth Information")
+            lines.append("=" * 80)
+            lines.append(f"enabled: {depth_info.get('enabled', False)}")
+            lines.append(f"z_scale: {depth_info.get('z_scale', 'N/A')}")
+            lines.append(f"src_depth_min: {depth_info.get('src_depth_min', 'N/A')}")
+            lines.append(f"src_depth_max: {depth_info.get('src_depth_max', 'N/A')}")
+            lines.append(f"src_depth_mean: {depth_info.get('src_depth_mean', 'N/A')}")
+            lines.append(f"ref_depth_min: {depth_info.get('ref_depth_min', 'N/A')}")
+            lines.append(f"ref_depth_max: {depth_info.get('ref_depth_max', 'N/A')}")
+            lines.append(f"ref_depth_mean: {depth_info.get('ref_depth_mean', 'N/A')}")
+            lines.append("")
     
     # Bone lengths (Source 기준)
     if result.source_bone_lengths:
@@ -516,9 +565,15 @@ def _generate_transfer_debug_info(result, src_path: Path, ref_path: Path) -> str
             tuning = log['upper_ratio_tuning']
             lines.append(f"src_torso: {tuning.get('src_torso', 'N/A')}")
             lines.append(f"trans_torso: {tuning.get('trans_torso', 'N/A')}")
-            ratios = tuning.get('ratios', {})
-            for k, v in ratios.items():
-                lines.append(f"  {k}: {v}")
+            ratios_2d = tuning.get('ratios_2d', {})
+            ratios_3d = tuning.get('ratios_3d', {})
+            ratios_used = tuning.get('ratios_used', {})
+            deltas = tuning.get('deltas_vs_2d', {})
+            lines.append(f"ratio_source: {tuning.get('ratio_source', 'N/A')}")
+            for k in sorted(set(list(ratios_used.keys()) + list(ratios_2d.keys()) + list(ratios_3d.keys()))):
+                lines.append(
+                    f"  {k}: 2d={ratios_2d.get(k, 'N/A')} 3d={ratios_3d.get(k, 'N/A')} used={ratios_used.get(k, 'N/A')} delta={deltas.get(k, 'N/A')}"
+                )
 
         if 'lower_ratio_tuning' in log:
             lines.append("")
@@ -528,9 +583,15 @@ def _generate_transfer_debug_info(result, src_path: Path, ref_path: Path) -> str
             tuning = log['lower_ratio_tuning']
             lines.append(f"src_torso: {tuning.get('src_torso', 'N/A')}")
             lines.append(f"trans_torso: {tuning.get('trans_torso', 'N/A')}")
-            ratios = tuning.get('ratios', {})
-            for k, v in ratios.items():
-                lines.append(f"  {k}: {v}")
+            ratios_2d = tuning.get('ratios_2d', {})
+            ratios_3d = tuning.get('ratios_3d', {})
+            ratios_used = tuning.get('ratios_used', {})
+            deltas = tuning.get('deltas_vs_2d', {})
+            lines.append(f"ratio_source: {tuning.get('ratio_source', 'N/A')}")
+            for k in sorted(set(list(ratios_used.keys()) + list(ratios_2d.keys()) + list(ratios_3d.keys()))):
+                lines.append(
+                    f"  {k}: 2d={ratios_2d.get(k, 'N/A')} 3d={ratios_3d.get(k, 'N/A')} used={ratios_used.get(k, 'N/A')} delta={deltas.get(k, 'N/A')}"
+                )
 
     # Face Transfer Debug Info
     if result.processing_info and 'face_transfer_debug' in result.processing_info:

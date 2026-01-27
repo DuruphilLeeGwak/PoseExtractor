@@ -7,6 +7,7 @@ from .dwpose_extractor import (
 )
 
 from .body_extractor import BodyExtractor
+from .depth_anything_v2 import DepthAnythingV2Extractor
 
 from .person_filter import (
     PersonFilter,
@@ -47,6 +48,8 @@ __all__ = [
     'RTMLIB_AVAILABLE',
     # Body Extractor
     'BodyExtractor',
+    # Depth Extractor
+    'DepthAnythingV2Extractor',
     # Person Filter
     'PersonFilter',
     'PersonScore',

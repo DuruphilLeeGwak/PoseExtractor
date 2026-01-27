@@ -1,0 +1,1 @@
+<copy of d:/2025/pose_extractor/analyze_ghost_filter.py>

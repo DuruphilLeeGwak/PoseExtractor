@@ -18,6 +18,25 @@ except ImportError:
     RTMLIB_AVAILABLE = False
     print("Warning: rtmlib not installed. Run: pip install rtmlib onnxruntime-gpu")
 
+# 디버그 플래그 (default: False)
+import yaml
+import os
+
+def _load_dwpose_debug_flag():
+    # default.yaml 경로 추정 (이 경로는 필요에 따라 조정)
+    config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'config', 'default.yaml')
+    if not os.path.exists(config_path):
+        return False
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+        debug = config.get('debug', {})
+        return debug.get('show_dwpose_debug', False)
+    except Exception:
+        return False
+
+SHOW_DWPOSE_DEBUG = _load_dwpose_debug_flag()
+
 
 class DWPoseExtractor:
     """
@@ -73,10 +92,11 @@ class DWPoseExtractor:
         중요: to_openpose=False로 고정하여 COCO-WholeBody 원본 형식(133 keypoints)을 사용합니다.
         OpenPose 형식(135 keypoints)으로 변환하지 않음으로써 키포인트 인덱스 혼란을 방지합니다.
         """
-        print(f"Initializing DWPose model...")
-        print(f"  Backend: {self.backend}")
-        print(f"  Device: {self.device}")
-        print(f"  Mode: {self.mode}")
+        if SHOW_DWPOSE_DEBUG:
+            print(f"Initializing DWPose model...")
+            print(f"  Backend: {self.backend}")
+            print(f"  Device: {self.device}")
+            print(f"  Mode: {self.mode}")
         
         # 핵심: to_openpose=False로 COCO-WholeBody 원본 형식 사용
         # 이렇게 하면 133개 키포인트가 표준 COCO-WholeBody 인덱스를 따릅니다
@@ -86,7 +106,8 @@ class DWPoseExtractor:
             backend=self.backend,
             device=self.device
         )
-        print("Model initialized successfully!")
+        if SHOW_DWPOSE_DEBUG:
+            print("Model initialized successfully!")
     
     def extract(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -121,9 +142,8 @@ class DWPoseExtractor:
         scores = np.array(scores)
         
         # 🔍 디버그: rtmlib에서 반환된 원본 좌표 확인 (클리핑 전)
-        if len(keypoints) > 0:
+        if SHOW_DWPOSE_DEBUG and len(keypoints) > 0:
             person_0 = keypoints[0]
-            # LHand 손가락 좌표 샘플 확인
             debug_indices = [9, 96, 97, 100, 17, 18, 20, 21, 22]  # 손목, 손가락, 발가락
             print(f"\n   🔍 [DWPose 원본 좌표] 이미지 크기: {img_w}x{img_h}")
             for idx in debug_indices:
@@ -288,7 +308,7 @@ def extract_pose(image: Union[np.ndarray, str, Path], backend: str = 'onnxruntim
     """
     편의 함수: 이미지에서 포즈 추출
     
-    팩토리를 통해 추출기를 가져와 포즈를 추출합니다.
+    팩토리를 통해 추출기를 가져오기 위해
     간단한 사용을 위한 고수준 API입니다.
     
     Args:

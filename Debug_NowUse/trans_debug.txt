@@ -1,0 +1,1 @@
+<copy of d:/2025/pose_extractor/io/outputs/20260125_010411_src_to_ref/trans/trans_debug.txt>

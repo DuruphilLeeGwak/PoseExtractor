@@ -11,16 +11,29 @@ FACE_PARTS_IDX = {
 class FaceTransfer:
     def __init__(self, config):
         self.config = config
+        # 3D depth 사용 여부 (기본값 False로 안정성 우선)
+        self.use_3d_depth = getattr(config.face_rendering, 'use_3d_depth', False)
 
-    def transfer(self, t_kpts, t_scores, s_kpts, s_scores, r_kpts, r_scores, log):
+    def transfer(self, t_kpts, t_scores, s_kpts, s_scores, r_kpts, r_scores, log, 
+                 src_depth=None, ref_depth=None):
         """
-        얼굴 전이 v5 (Pure Source Shape + Reference Rotation)
-        - 형태(Shape): Source 얼굴의 상대 좌표를 그대로 사용 (Identity 보존)
-        - 각도(Angle): Ref 양쪽 눈 각도와 Source 양쪽 눈 각도의 차이만큼 Source를 회전
-        - 위치(Pos): Source 목 길이와 Ref 목 방향을 결합한 Anchor에 배치
+        얼굴 전이 v6 (2D Body Anchor + Optional 3D Face Offset)
+        
+        핵심 개선:
+        - Face center를 항상 COCO nose로 통일 (2D 좌표계)
+        - Anchor는 2D body keypoint 기반으로 안정적 계산
+        - Depth는 선택적 보정으로만 사용 (use_3d_depth=True일 때)
+        
+        Args:
+            t_kpts, t_scores: Transfer 결과 (출력)
+            s_kpts, s_scores: Source keypoints
+            r_kpts, r_scores: Reference keypoints
+            log: 디버그 로그
+            src_depth: Source depth map (optional, HxW numpy array)
+            ref_depth: Reference depth map (optional, HxW numpy array)
         """
         print("\n" + "="*60)
-        print("👤 [DEBUG] FaceTransfer.transfer() - v5 (Src Identity + Ref Angle)")
+        print("👤 [DEBUG] FaceTransfer.transfer() - v6 (Unified 2D Coord)")
         print("="*60)
         
         if not self.config.face_rendering.enabled:
@@ -35,7 +48,7 @@ class FaceTransfer:
         r_sh = BODY_KEYPOINTS['right_shoulder']
         
         # ============================================================
-        # 1. 앵커 계산: Source 목 길이 유지 + Ref 목 방향 적용 (기존 유지)
+        # 1. 2D Body Anchor 계산 (기존 로직 유지)
         # ============================================================
         s_sh_center = (s_kpts[l_sh] + s_kpts[r_sh]) / 2
         s_neck_len = calculate_distance(s_kpts[nose], s_sh_center)
@@ -46,27 +59,77 @@ class FaceTransfer:
         
         t_sh_center = (t_kpts[l_sh] + t_kpts[r_sh]) / 2
         
-        # 앵커: Trans 어깨에서 Ref 방향으로, Source 길이만큼 이동
-        target_neck_len = max(s_neck_len, 20.0) 
-        anchor = t_sh_center + r_neck_dir * target_neck_len
+        # 기본 2D Anchor
+        target_neck_len = max(s_neck_len, 20.0)
+        anchor_2d = t_sh_center + r_neck_dir * target_neck_len
         
-        print(f"\n📍 Anchor Calculation:")
+        print(f"\n📍 2D Anchor Calculation:")
         print(f"   Src Neck Length: {s_neck_len:.1f}")
         print(f"   Ref Neck Dir: ({r_neck_dir[0]:.2f}, {r_neck_dir[1]:.2f})")
-        print(f"   New Anchor: ({anchor[0]:.1f}, {anchor[1]:.1f})")
+        print(f"   Base 2D Anchor: ({anchor_2d[0]:.1f}, {anchor_2d[1]:.1f})")
         
         # ============================================================
-        # 2. 회전 각도 계산 (Rotation Angle Calculation)
+        # 2. Optional Depth Offset (3D 보정)
         # ============================================================
-        # Source 눈 각도 (수평선 기준)
+        anchor = anchor_2d.copy()
+        depth_offset_applied = False
+        
+        if self.use_3d_depth and src_depth is not None and ref_depth is not None:
+            try:
+                # COCO nose 위치에서 depth 값 추출
+                h, w = src_depth.shape
+                
+                # Source nose depth
+                src_nose_y = int(np.clip(s_kpts[nose][1], 0, h - 1))
+                src_nose_x = int(np.clip(s_kpts[nose][0], 0, w - 1))
+                src_nose_depth = src_depth[src_nose_y, src_nose_x]
+                
+                # Reference nose depth
+                ref_nose_y = int(np.clip(r_kpts[nose][1], 0, h - 1))
+                ref_nose_x = int(np.clip(r_kpts[nose][0], 0, w - 1))
+                ref_nose_depth = ref_depth[ref_nose_y, ref_nose_x]
+                
+                # Depth 차이를 Y축 오프셋으로 변환
+                # (카메라 정면 가정: Z축 멀어지면 위로, 가까우면 아래로)
+                depth_diff = ref_nose_depth - src_nose_depth
+                z_scale = 0.5  # 튜닝 파라미터
+                
+                depth_offset = np.array([0, depth_diff * z_scale])
+                anchor = anchor_2d + depth_offset
+                depth_offset_applied = True
+                
+                print(f"\n🌊 Depth Offset:")
+                print(f"   Src Nose Depth: {src_nose_depth:.3f}")
+                print(f"   Ref Nose Depth: {ref_nose_depth:.3f}")
+                print(f"   Depth Diff: {depth_diff:.3f}")
+                print(f"   Y Offset: {depth_offset[1]:.1f}")
+                print(f"   Final Anchor: ({anchor[0]:.1f}, {anchor[1]:.1f})")
+                
+            except Exception as e:
+                print(f"   ⚠️ Depth offset 실패 (fallback to 2D): {e}")
+                anchor = anchor_2d
+        
+        if not depth_offset_applied:
+            print(f"   ℹ️ Using 2D Anchor only (3D depth: {'disabled' if not self.use_3d_depth else 'unavailable'})")
+        
+        # ============================================================
+        # 3. Face Center 통일 (항상 COCO Nose 사용)
+        # ============================================================
+        # CRITICAL FIX: 68 landmarks와 좌표계를 통일하기 위해 항상 COCO nose 사용
+        src_face_center = s_kpts[nose]  # 2D body keypoint
+        
+        print(f"\n🎯 Face Center:")
+        print(f"   Using COCO Nose (2D): ({src_face_center[0]:.1f}, {src_face_center[1]:.1f})")
+        
+        # ============================================================
+        # 4. 회전 각도 계산 (2D Eye Angle)
+        # ============================================================
         s_eye_vec = s_kpts[r_eye] - s_kpts[l_eye]
         s_angle = np.arctan2(s_eye_vec[1], s_eye_vec[0])
         
-        # Reference 눈 각도 (수평선 기준)
         r_eye_vec = r_kpts[r_eye] - r_kpts[l_eye]
         r_angle = np.arctan2(r_eye_vec[1], r_eye_vec[0])
         
-        # 회전해야 할 양 (Delta)
         delta_angle = r_angle - s_angle
         
         print(f"\n📐 Rotation Analysis:")
@@ -74,7 +137,7 @@ class FaceTransfer:
         print(f"   Ref Angle: {np.degrees(r_angle):.1f}°")
         print(f"   >>> Delta Rotation: {np.degrees(delta_angle):.1f}°")
         
-        # 회전 행렬 (Rotation Matrix)
+        # 회전 행렬
         cos_a = np.cos(delta_angle)
         sin_a = np.sin(delta_angle)
         rotation_matrix = np.array([
@@ -82,18 +145,12 @@ class FaceTransfer:
             [sin_a,  cos_a]
         ])
         
-        # Source 얼굴 중심 (회전축)
-        # (68 랜드마크가 없는 경우 COCO Nose 사용)
-        ref_face_nose_idx = FACE_START_IDX + 30
-        src_face_center = s_kpts[ref_face_nose_idx] if s_scores[ref_face_nose_idx] > 0.3 else s_kpts[nose]
-        
         # ============================================================
-        # 3. 전체 얼굴 전이 (Source 형태 + 회전 적용)
+        # 5. 전체 얼굴 전이 (68 landmarks + COCO head parts)
         # ============================================================
         transferred_count = 0
         
         # 68 랜드마크 + COCO Head Parts 통합 처리
-        # 주의: COCO Parts(눈,코,귀)도 함께 회전시켜야 함
         all_face_indices = list(range(FACE_START_IDX, FACE_END_IDX + 1)) + \
                            [nose, l_eye, r_eye, BODY_KEYPOINTS['left_ear'], BODY_KEYPOINTS['right_ear']]
         
@@ -107,28 +164,30 @@ class FaceTransfer:
                     t_scores[i] = 0.0
                     continue
             
-            # Source 점수가 유효한 경우에만 전이 (Source 형태를 쓰므로)
+            # Source 점수가 유효한 경우에만 전이
             if s_scores[i] > 0.1:
-                # 1. Source 중심 기준 상대 좌표 계산
+                # 1. Source 중심(COCO nose) 기준 상대 좌표 계산
                 rel_vec = s_kpts[i] - src_face_center
                 
-                # 2. 회전 적용 (Rotate)
+                # 2. 회전 적용
                 rotated_vec = np.dot(rotation_matrix, rel_vec)
                 
                 # 3. Anchor 위치에 배치
                 t_kpts[i] = anchor + rotated_vec
                 
-                # 점수는 Source 점수 혹은 Ref 점수 중 높은 것 사용 (또는 Source 유지)
+                # 4. 점수는 Source 점수 유지
                 t_scores[i] = s_scores[i]
                 
                 if i >= FACE_START_IDX:
-                    log[f'face_{i}'] = 'src_rotated'
+                    log[f'face_{i}'] = 'src_rotated_v6'
                     transferred_count += 1
             else:
-                # Source가 없으면 전이 불가 (Ref 형태를 쓰지 않기로 했으므로)
+                # Source가 없으면 전이 불가
                 t_scores[i] = 0.0
 
-        print(f"   ✅ Transferred {transferred_count} face keypoints using Source Identity + Ref Angle")
+        mode_str = "2D+3D" if depth_offset_applied else "2D-only"
+        print(f"   ✅ Transferred {transferred_count} face keypoints ({mode_str} mode)")
+        log['face_mode'] = mode_str
 
     def _get_part_name(self, idx):
         for name, r in FACE_PARTS_IDX.items():

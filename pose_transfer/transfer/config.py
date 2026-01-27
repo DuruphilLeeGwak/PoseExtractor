@@ -35,6 +35,8 @@ class TransferConfig:
     use_face: bool = True
     use_hands: bool = True
     enable_symmetric_fallback: bool = True
+    enable_upper_ratio_tuning: bool = True
+    enable_lower_ratio_tuning: bool = True
     
     # 하반신 검증용
     lower_body_confidence_threshold: float = 0.5
