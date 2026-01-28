@@ -550,7 +550,7 @@ class BodyTransfer:
         trans_scores: np.ndarray,
         s_kpts: np.ndarray,
         s_scores: np.ndarray,
-        corrected_lengths: dict,  # 인자 활용
+        corrected_lengths: dict,
         r_kpts: np.ndarray,
         r_scores: np.ndarray,
         scale: float,
@@ -558,49 +558,100 @@ class BodyTransfer:
         log: dict = None
     ):
         """
-        발 전이 - Source 길이 우선
+        발 전이 - Toe Chain Strategy (Heel&BigToe from Ankle, SmallToe from BigToe)
         """
         print(f"\n============================================================")
-        print(f"🦶 [DEBUG] transfer_feet() - Source Length Priority")
+        print(f"🦶 [DEBUG] transfer_feet() - Toe Chain (Big->Small Vector)")
         print(f"============================================================")
 
         for side in ['left', 'right']:
             ankle_name = f'{side}_ankle'
+            big_toe_name = f'{side}_big_toe'
+            small_toe_name = f'{side}_small_toe'
+            heel_name = f'{side}_heel'
+            
             ankle_idx = get_keypoint_index(ankle_name)
+            big_idx = get_keypoint_index(big_toe_name)
             
-            if trans_scores[ankle_idx] == 0:
-                continue
-
-            # 발 구성요소: 뒤꿈치, 엄지, 새끼
-            feet_parts = [f'{side}_heel', f'{side}_big_toe', f'{side}_small_toe']
+            if trans_scores[ankle_idx] == 0: continue
             
-            print(f"   [{side.upper()}] Foot from {ankle_name} ({ankle_idx})")
+            print(f"   [{side.upper()}] Foot from {ankle_name}")
             
-            for part_name in feet_parts:
+            # ----------------------------------------------------------
+            # 1. Heel & Big Toe (From Ankle)
+            # ----------------------------------------------------------
+            primary_parts = [heel_name, big_toe_name]
+            
+            for part_name in primary_parts:
                 part_idx = get_keypoint_index(part_name)
                 
-                # 1. 길이 결정 (Src 길이 우선)
+                # 길이: Src 대칭 평균
                 bone_name = f"{ankle_name}_{part_name}"
                 target_length = corrected_lengths.get(bone_name)
                 
-                # Src 길이가 없으면 Ref 비율 fallback
                 if target_length is None or target_length <= 0:
                     if r_scores[ankle_idx] > 0.1 and r_scores[part_idx] > 0.1:
-                        target_length = calculate_distance(r_kpts[ankle_idx], r_kpts[part_idx]) * scale
-                        src_str = "Fallback(Ref*Scale)"
-                    else:
-                        continue # Ref도 없으면 스킵
-                else:
-                    src_str = "SrcFixed"
+                        dist = np.linalg.norm(r_kpts[part_idx] - r_kpts[ankle_idx])
+                        target_length = dist * scale
+                    else: continue
 
-                # 2. 방향 결정 (Ref 방향)
+                # 방향: Ref (Ankle -> Part)
                 if r_scores[ankle_idx] > 0.1 and r_scores[part_idx] > 0.1:
-                    direction_vec = r_kpts[part_idx] - r_kpts[ankle_idx]
-                    direction = normalize_vector(direction_vec)
+                    ref_vec = r_kpts[part_idx] - r_kpts[ankle_idx]
+                    norm = np.linalg.norm(ref_vec)
+                    direction = ref_vec / norm if norm > 1e-6 else np.array([0, 1])
                     
-                    # 좌표 계산
                     trans_kpts[part_idx] = trans_kpts[ankle_idx] + direction * target_length
                     trans_scores[part_idx] = min(trans_scores[ankle_idx], r_scores[part_idx])
-                    
                     processed.add(part_idx)
-                    print(f"      ✅ {part_name} (idx={part_idx}): length={target_length:.1f} ({src_str})")
+                    print(f"      ✅ {part_name}: From Ankle, Dir=Ref")
+                else:
+                    print(f"      ❌ {part_name}: Ref missing")
+
+            # ----------------------------------------------------------
+            # 2. Small Toe (From Big Toe) - 핵심 수정!
+            # ----------------------------------------------------------
+            # 엄지발가락이 전이되었는지 확인
+            if trans_scores[big_idx] > 0:
+                small_idx = get_keypoint_index(small_toe_name)
+                
+                # 길이: Src 대칭 평균 (Big -> Small)
+                # _correct_bone_lengths에 추가한 bone_name 사용
+                bone_name = f"{big_toe_name}_{small_toe_name}"
+                target_length = corrected_lengths.get(bone_name)
+                
+                # Fallback length
+                if target_length is None or target_length <= 0:
+                    if r_scores[big_idx] > 0.1 and r_scores[small_idx] > 0.1:
+                        dist = np.linalg.norm(r_kpts[small_idx] - r_kpts[big_idx])
+                        target_length = dist * scale
+                
+                if target_length is not None and target_length > 0:
+                    # 방향: Ref (Big -> Small)
+                    # 엄지에서 새끼로 가는 벡터를 가져옴으로써 Ref의 발끝 각도를 복사함
+                    if r_scores[big_idx] > 0.1 and r_scores[small_idx] > 0.1:
+                        ref_vec = r_kpts[small_idx] - r_kpts[big_idx]
+                        norm = np.linalg.norm(ref_vec)
+                        direction = ref_vec / norm if norm > 1e-6 else np.array([0, 1])
+                        
+                        # 배치: Trans_Big_Toe + (Ref_Dir * Src_Len)
+                        trans_kpts[small_idx] = trans_kpts[big_idx] + direction * target_length
+                        trans_scores[small_idx] = min(trans_scores[big_idx], r_scores[small_idx])
+                        processed.add(small_idx)
+                        print(f"      ✅ {small_toe_name}: From BigToe, Dir=Ref (Toe Chain)")
+                    else:
+                        # Ref 정보 없으면 Ankle 기준 Fallback (기존 방식)
+                        bone_name_alt = f"{ankle_name}_{small_toe_name}"
+                        len_alt = corrected_lengths.get(bone_name_alt)
+                        if len_alt and r_scores[ankle_idx] > 0.1 and r_scores[small_idx] > 0.1:
+                             ref_vec = r_kpts[small_idx] - r_kpts[ankle_idx]
+                             norm = np.linalg.norm(ref_vec)
+                             direction = ref_vec / norm if norm > 1e-6 else np.array([0, 1])
+                             trans_kpts[small_idx] = trans_kpts[ankle_idx] + direction * len_alt
+                             trans_scores[small_idx] = r_scores[small_idx]
+                             processed.add(small_idx)
+                             print(f"      ⚠️ {small_toe_name}: Fallback to Ankle-based")
+                        else:
+                             print(f"      ❌ {small_toe_name}: Ref missing")
+                else:
+                     print(f"      ❌ {small_toe_name}: Length missing")
