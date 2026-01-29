@@ -1,22 +1,25 @@
 """
 Face Transfer 디버그 시각화 생성 모듈
+
+v2 리팩토링:
+- 파일 저장 로직 제거
+- numpy array 반환하여 api.py에서 저장 제어
 """
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional
 
 
-def create_face_transfer_visualization(
+def generate_face_transfer_image(
     debug_info: Dict,
     src_kpts: np.ndarray,
     src_scores: np.ndarray,
     ref_kpts: np.ndarray,
     ref_scores: np.ndarray,
     trans_kpts: np.ndarray,
-    trans_scores: np.ndarray,
-    output_path: Path
-) -> bool:
+    trans_scores: np.ndarray
+) -> Optional[np.ndarray]:
     """
     Face Transfer 디버그 시각화 이미지 생성
     
@@ -25,13 +28,12 @@ def create_face_transfer_visualization(
         src_kpts, src_scores: Source 키포인트
         ref_kpts, ref_scores: Reference 키포인트
         trans_kpts, trans_scores: Transfer 결과 키포인트
-        output_path: 출력 경로
     
     Returns:
-        성공 여부
+        시각화 이미지 (numpy array), 실패 시 None
     """
     if not debug_info:
-        return False
+        return None
     
     # 캔버스 크기 설정
     canvas_width = 1800
@@ -198,6 +200,43 @@ def create_face_transfer_visualization(
     cv2.putText(canvas, "Eyes", (50, legend_y + 75), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_TEXT, 1)
     
-    # 저장
+    return canvas
+
+
+# ============================================================
+# Legacy 호환: 기존 create_face_transfer_visualization 인터페이스 유지
+# ============================================================
+def create_face_transfer_visualization(
+    debug_info: Dict,
+    src_kpts: np.ndarray,
+    src_scores: np.ndarray,
+    ref_kpts: np.ndarray,
+    ref_scores: np.ndarray,
+    trans_kpts: np.ndarray,
+    trans_scores: np.ndarray,
+    output_path: Path
+) -> bool:
+    """
+    [DEPRECATED] Legacy 호환용 - 직접 파일 저장
+    
+    새로운 코드에서는 generate_face_transfer_image()를 사용하고
+    api.py에서 파일 저장을 제어하세요.
+    
+    Returns:
+        성공 여부
+    """
+    canvas = generate_face_transfer_image(
+        debug_info=debug_info,
+        src_kpts=src_kpts,
+        src_scores=src_scores,
+        ref_kpts=ref_kpts,
+        ref_scores=ref_scores,
+        trans_kpts=trans_kpts,
+        trans_scores=trans_scores
+    )
+    
+    if canvas is None:
+        return False
+    
     cv2.imwrite(str(output_path), canvas)
     return True

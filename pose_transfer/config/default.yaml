@@ -120,11 +120,34 @@ rendering:
 # =============================================================================
 # [8] 출력 설정
 # =============================================================================
+# 핵심 결과물 vs 디버그 결과물 분리
+#
+# 핵심 결과물 (항상 생성 권장):
+#   - *_kp.json: 키포인트 좌표 데이터 (후속 처리용)
+#   - *_sk.jpg: 스켈레톤 이미지 (ControlNet 입력용)
+#
+# 디버그 결과물 (개발/분석 시에만):
+#   - *_rend.jpg: 원본+스켈레톤 오버레이
+#   - *_debug_bbox.jpg: YOLO bbox 시각화
+#   - *_debug.txt: Cross-Filter 분석 텍스트
+#   - *_depth.png: Depth 시각화
+#   - face_transfer_debug.jpg: 얼굴 전이 시각화
+# =============================================================================
 output:
-  save_json: true
-  save_skeleton_image: true
-  save_debug_image: true
-  save_debug_txt: true              # ✅ Cross-Filter 디버그 정보 (_debug.txt) 생성
+  # ===== 핵심 결과물 (항상 생성 권장) =====
+  save_json: true                   # *_kp.json 저장
+  save_skeleton_image: true         # *_sk.jpg 저장
+  
+  # ===== 디버그 결과물 =====
+  debug:
+    enabled: true                  # 마스터 스위치 (false면 아래 모두 무시)
+    save_overlay: true             # *_rend.jpg (원본+스켈레톤 오버레이)
+    save_bbox: true                # *_debug_bbox.jpg (YOLO bbox)
+    save_text: true                # *_debug.txt (Cross-Filter 분석)
+    save_depth: true               # *_depth.png (Depth 시각화)
+    save_face_viz: false            # face_transfer_debug.jpg
+  
+  # ===== 기타 옵션 =====
   auto_crop_enabled: false
   canvas_padding_ratio: 0
   crop_padding_px: 0
