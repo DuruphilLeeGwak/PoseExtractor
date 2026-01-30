@@ -1,195 +1,219 @@
-import numpy as np
-from ...extractors.keypoint_constants import BODY_KEYPOINTS, FACE_START_IDX, FACE_END_IDX
-from ...utils.geometry import calculate_distance, normalize_vector
+"""
+Face Transfer Logic Module (Refactored v2.0)
 
-FACE_PARTS_IDX = {
-    'jawline': range(0, 17), 'left_eyebrow': range(17, 22), 'right_eyebrow': range(22, 27),
-    'nose': range(27, 36), 'left_eye': range(36, 42), 'right_eye': range(42, 48),
-    'mouth_outer': range(48, 60), 'mouth_inner': range(60, 68),
-}
+역할:
+- 얼굴 부위(0~4) 및 상세 랜드마크(23~90) 전이 담당
+- Body Scale을 기반으로 얼굴 크기(Face Scale) 정밀 계산
+- Reference의 회전(Rotation) 및 표정 구조 유지
+"""
+import numpy as np
+from typing import Dict, Any, Set, Optional, Tuple
 
 class FaceTransfer:
     def __init__(self, config):
         self.config = config
-        # 3D depth 사용 여부 (기본값 False로 안정성 우선)
-        self.use_3d_depth = getattr(config.face_rendering, 'use_3d_depth', False)
+        # 계산된 변환 정보(Scale, Pivot 등)를 저장하여 랜드마크 전이 시 재사용
+        self._transform_cache = {}
 
-    def transfer(self, t_kpts, t_scores, s_kpts, s_scores, r_kpts, r_scores, log, 
-                 src_depth=None, ref_depth=None):
+    def transfer_structure(
+        self,
+        trans_kpts: np.ndarray,
+        trans_scores: np.ndarray,
+        src_kpts: np.ndarray,
+        src_scores: np.ndarray,
+        ref_kpts: np.ndarray,
+        ref_scores: np.ndarray,
+        processed: Set[int],
+        log: Dict[str, Any],
+        body_scale: float = 1.0
+    ):
         """
-        얼굴 전이 v6 (2D Body Anchor + Optional 3D Face Offset)
-        
-        핵심 개선:
-        - Face center를 항상 COCO nose로 통일 (2D 좌표계)
-        - Anchor는 2D body keypoint 기반으로 안정적 계산
-        - Depth는 선택적 보정으로만 사용 (use_3d_depth=True일 때)
-        
-        Args:
-            t_kpts, t_scores: Transfer 결과 (출력)
-            s_kpts, s_scores: Source keypoints
-            r_kpts, r_scores: Reference keypoints
-            log: 디버그 로그
-            src_depth: Source depth map (optional, HxW numpy array)
-            ref_depth: Reference depth map (optional, HxW numpy array)
+        얼굴 기본 구조(0~4: 코, 눈, 귀) 전이 및 변환 행렬 계산
         """
-        print("\n" + "="*60)
-        print("👤 [DEBUG] FaceTransfer.transfer() - v6 (Unified 2D Coord)")
-        print("="*60)
+        NOSE = 0
+        LEFT_EYE, RIGHT_EYE = 1, 2
+        LEFT_EAR, RIGHT_EAR = 3, 4
+        LS, RS = 5, 6 # 어깨
         
-        if not self.config.face_rendering.enabled:
-            print("   ❌ face_rendering disabled")
+        # 0. 선행 조건: Trans 어깨가 생성되어 있어야 함 (Pivot 계산용)
+        if trans_scores[LS] < 0.1 or trans_scores[RS] < 0.1:
             return
-        
-        # 주요 키포인트 인덱스
-        nose = BODY_KEYPOINTS['nose']
-        l_eye = BODY_KEYPOINTS['left_eye']
-        r_eye = BODY_KEYPOINTS['right_eye']
-        l_sh = BODY_KEYPOINTS['left_shoulder']
-        r_sh = BODY_KEYPOINTS['right_shoulder']
-        
-        # ============================================================
-        # 1. 2D Body Anchor 계산 (기존 로직 유지)
-        # ============================================================
-        s_sh_center = (s_kpts[l_sh] + s_kpts[r_sh]) / 2
-        s_neck_len = calculate_distance(s_kpts[nose], s_sh_center)
-        
-        r_sh_center = (r_kpts[l_sh] + r_kpts[r_sh]) / 2
-        r_neck_vec = r_kpts[nose] - r_sh_center
-        r_neck_dir = normalize_vector(r_neck_vec)
-        
-        t_sh_center = (t_kpts[l_sh] + t_kpts[r_sh]) / 2
-        
-        # 기본 2D Anchor
-        target_neck_len = max(s_neck_len, 20.0)
-        anchor_2d = t_sh_center + r_neck_dir * target_neck_len
-        
-        print(f"\n📍 2D Anchor Calculation:")
-        print(f"   Src Neck Length: {s_neck_len:.1f}")
-        print(f"   Ref Neck Dir: ({r_neck_dir[0]:.2f}, {r_neck_dir[1]:.2f})")
-        print(f"   Base 2D Anchor: ({anchor_2d[0]:.1f}, {anchor_2d[1]:.1f})")
-        
-        # ============================================================
-        # 2. Optional Depth Offset (3D 보정)
-        # ============================================================
-        anchor = anchor_2d.copy()
-        depth_offset_applied = False
-        
-        if self.use_3d_depth and src_depth is not None and ref_depth is not None:
-            try:
-                # COCO nose 위치에서 depth 값 추출
-                h, w = src_depth.shape
-                
-                # Source nose depth
-                src_nose_y = int(np.clip(s_kpts[nose][1], 0, h - 1))
-                src_nose_x = int(np.clip(s_kpts[nose][0], 0, w - 1))
-                src_nose_depth = src_depth[src_nose_y, src_nose_x]
-                
-                # Reference nose depth
-                ref_nose_y = int(np.clip(r_kpts[nose][1], 0, h - 1))
-                ref_nose_x = int(np.clip(r_kpts[nose][0], 0, w - 1))
-                ref_nose_depth = ref_depth[ref_nose_y, ref_nose_x]
-                
-                # Depth 차이를 Y축 오프셋으로 변환
-                # (카메라 정면 가정: Z축 멀어지면 위로, 가까우면 아래로)
-                depth_diff = ref_nose_depth - src_nose_depth
-                z_scale = 0.5  # 튜닝 파라미터
-                
-                depth_offset = np.array([0, depth_diff * z_scale])
-                anchor = anchor_2d + depth_offset
-                depth_offset_applied = True
-                
-                print(f"\n🌊 Depth Offset:")
-                print(f"   Src Nose Depth: {src_nose_depth:.3f}")
-                print(f"   Ref Nose Depth: {ref_nose_depth:.3f}")
-                print(f"   Depth Diff: {depth_diff:.3f}")
-                print(f"   Y Offset: {depth_offset[1]:.1f}")
-                print(f"   Final Anchor: ({anchor[0]:.1f}, {anchor[1]:.1f})")
-                
-            except Exception as e:
-                print(f"   ⚠️ Depth offset 실패 (fallback to 2D): {e}")
-                anchor = anchor_2d
-        
-        if not depth_offset_applied:
-            print(f"   ℹ️ Using 2D Anchor only (3D depth: {'disabled' if not self.use_3d_depth else 'unavailable'})")
-        
-        # ============================================================
-        # 3. Face Center 통일 (항상 COCO Nose 사용)
-        # ============================================================
-        # CRITICAL FIX: 68 landmarks와 좌표계를 통일하기 위해 항상 COCO nose 사용
-        src_face_center = s_kpts[nose]  # 2D body keypoint
-        
-        print(f"\n🎯 Face Center:")
-        print(f"   Using COCO Nose (2D): ({src_face_center[0]:.1f}, {src_face_center[1]:.1f})")
-        
-        # ============================================================
-        # 4. 회전 각도 계산 (2D Eye Angle)
-        # ============================================================
-        s_eye_vec = s_kpts[r_eye] - s_kpts[l_eye]
-        s_angle = np.arctan2(s_eye_vec[1], s_eye_vec[0])
-        
-        r_eye_vec = r_kpts[r_eye] - r_kpts[l_eye]
-        r_angle = np.arctan2(r_eye_vec[1], r_eye_vec[0])
-        
-        delta_angle = r_angle - s_angle
-        
-        print(f"\n📐 Rotation Analysis:")
-        print(f"   Src Angle: {np.degrees(s_angle):.1f}°")
-        print(f"   Ref Angle: {np.degrees(r_angle):.1f}°")
-        print(f"   >>> Delta Rotation: {np.degrees(delta_angle):.1f}°")
-        
-        # 회전 행렬
-        cos_a = np.cos(delta_angle)
-        sin_a = np.sin(delta_angle)
-        rotation_matrix = np.array([
-            [cos_a, -sin_a],
-            [sin_a,  cos_a]
-        ])
-        
-        # ============================================================
-        # 5. 전체 얼굴 전이 (68 landmarks + COCO head parts)
-        # ============================================================
-        transferred_count = 0
-        
-        # 68 랜드마크 + COCO Head Parts 통합 처리
-        all_face_indices = list(range(FACE_START_IDX, FACE_END_IDX + 1)) + \
-                           [nose, l_eye, r_eye, BODY_KEYPOINTS['left_ear'], BODY_KEYPOINTS['right_ear']]
-        
-        for i in all_face_indices:
-            # 설정 체크 (68 랜드마크인 경우)
-            if i >= FACE_START_IDX:
-                local_idx = i - FACE_START_IDX
-                part_name = self._get_part_name(local_idx)
-                part_config = self.config.face_rendering.parts.get(part_name)
-                if part_config and not part_config.enabled:
-                    t_scores[i] = 0.0
-                    continue
-            
-            # Source 점수가 유효한 경우에만 전이
-            if s_scores[i] > 0.1:
-                # 1. Source 중심(COCO nose) 기준 상대 좌표 계산
-                rel_vec = s_kpts[i] - src_face_center
-                
-                # 2. 회전 적용
-                rotated_vec = np.dot(rotation_matrix, rel_vec)
-                
-                # 3. Anchor 위치에 배치
-                t_kpts[i] = anchor + rotated_vec
-                
-                # 4. 점수는 Source 점수 유지
-                t_scores[i] = s_scores[i]
-                
-                if i >= FACE_START_IDX:
-                    log[f'face_{i}'] = 'src_rotated_v6'
-                    transferred_count += 1
-            else:
-                # Source가 없으면 전이 불가
-                t_scores[i] = 0.0
 
-        mode_str = "2D+3D" if depth_offset_applied else "2D-only"
-        print(f"   ✅ Transferred {transferred_count} face keypoints ({mode_str} mode)")
-        log['face_mode'] = mode_str
+        # ---------------------------------------------------------
+        # 1. Scale Calculation (Src 얼굴 비율 vs Trans 어깨)
+        # ---------------------------------------------------------
+        
+        # Src 얼굴 너비 추정
+        if src_scores[LEFT_EAR] > 0.1 and src_scores[RIGHT_EAR] > 0.1:
+            src_face_width = np.linalg.norm(src_kpts[RIGHT_EAR] - src_kpts[LEFT_EAR])
+        elif src_scores[LEFT_EYE] > 0.1 and src_scores[RIGHT_EYE] > 0.1:
+            src_face_width = np.linalg.norm(src_kpts[RIGHT_EYE] - src_kpts[LEFT_EYE]) * 2.2
+        else:
+            src_face_width = 100.0
 
-    def _get_part_name(self, idx):
-        for name, r in FACE_PARTS_IDX.items():
-            if idx in r: return name
-        return None
+        # Src 어깨 너비
+        if src_scores[LS] > 0.1 and src_scores[RS] > 0.1:
+            src_shoulder_width = np.linalg.norm(src_kpts[RS] - src_kpts[LS])
+        else:
+            src_shoulder_width = 1.0
+        
+        # Trans 어깨 너비 (이미 BodyTransfer에서 생성됨)
+        trans_neck = (trans_kpts[LS] + trans_kpts[RS]) / 2.0
+        trans_shoulder_width = np.linalg.norm(trans_kpts[RS] - trans_kpts[LS])
+
+        # Body Ratio (Trans 어깨 / Src 어깨) -> 몸이 얼마나 커졌는지
+        body_ratio = trans_shoulder_width / src_shoulder_width if src_shoulder_width > 0 else 1.0
+        
+        # Ref 얼굴 너비
+        if ref_scores[LEFT_EAR] > 0.1 and ref_scores[RIGHT_EAR] > 0.1:
+            ref_face_width = np.linalg.norm(ref_kpts[RIGHT_EAR] - ref_kpts[LEFT_EAR])
+        elif ref_scores[LEFT_EYE] > 0.1 and ref_scores[RIGHT_EYE] > 0.1:
+            ref_face_width = np.linalg.norm(ref_kpts[RIGHT_EYE] - ref_kpts[LEFT_EYE]) * 2.2
+        else:
+            ref_face_width = 100.0
+
+        # [핵심] Face Scale 결정
+        # 목표: "Src의 얼굴 비율"을 유지해야 함 (SrcFaceWidth * BodyRatio)
+        # 즉, 몸이 2배 커졌으면 얼굴도 Src보다 2배 커져야 함. 그걸 Ref 얼굴 크기와 비교하여 Scale 산출.
+        target_face_width = src_face_width * body_ratio
+        face_scale = target_face_width / ref_face_width if ref_face_width > 0 else 1.0
+        
+        # 안전장치 (0.3배 ~ 3.0배 제한)
+        face_scale = float(np.clip(face_scale, 0.3, 3.0))
+
+        # ---------------------------------------------------------
+        # 2. Pivot Calculation (목 -> 눈 중심)
+        # ---------------------------------------------------------
+        
+        # Src 목-눈 거리 추정
+        src_neck = (src_kpts[LS] + src_kpts[RS]) / 2.0
+        if src_scores[LEFT_EYE] > 0.1 and src_scores[RIGHT_EYE] > 0.1:
+            src_eye_c = (src_kpts[LEFT_EYE] + src_kpts[RIGHT_EYE]) / 2.0
+            src_neck_eye_dist = np.linalg.norm(src_eye_c - src_neck)
+        else:
+            # 눈이 없으면 어깨 너비의 절반 정도로 추정
+            src_neck_eye_dist = src_shoulder_width * 0.5 
+
+        # Trans에서의 목표 목-눈 거리 (몸 커진 비율 반영)
+        target_neck_eye_dist = src_neck_eye_dist * body_ratio
+
+        # Ref의 목-눈 방향 벡터 (Ref의 고개 각도 반영)
+        ref_neck = (ref_kpts[LS] + ref_kpts[RS]) / 2.0
+        if ref_scores[LEFT_EYE] > 0.1 and ref_scores[RIGHT_EYE] > 0.1:
+            ref_eye_c = (ref_kpts[LEFT_EYE] + ref_kpts[RIGHT_EYE]) / 2.0
+            ref_dir_vec = ref_eye_c - ref_neck
+            ref_dir_norm = np.linalg.norm(ref_dir_vec)
+            # 방향 벡터 정규화
+            ref_dir = ref_dir_vec / ref_dir_norm if ref_dir_norm > 0 else np.array([0, -1])
+            ref_pivot_origin = ref_eye_c # Ref 기준점은 눈 중심
+        else:
+            ref_dir = np.array([0, -1]) # 수직 위
+            ref_pivot_origin = ref_kpts[NOSE] # 눈 없으면 코 기준
+
+        # 최종 Pivot (Trans에서의 눈 중심 위치)
+        pivot = trans_neck + ref_dir * target_neck_eye_dist
+
+        # ---------------------------------------------------------
+        # 3. Cache Transform & Apply
+        # ---------------------------------------------------------
+        
+        # 랜드마크 전이를 위해 캐시에 저장
+        self._transform_cache = {
+            'scale': face_scale,
+            'pivot': pivot,         # Trans 상의 기준점 (눈 중심)
+            'ref_origin': ref_pivot_origin # Ref 상의 기준점 (눈 중심)
+        }
+        
+        # 키포인트 0~4 배치
+        for idx in [NOSE, LEFT_EYE, RIGHT_EYE, LEFT_EAR, RIGHT_EAR]:
+            if ref_scores[idx] > 0.1:
+                # Ref에서의 상대 벡터 (Ref눈중심 -> Ref부위)
+                rel_vec = ref_kpts[idx] - ref_pivot_origin
+                
+                # Scale 적용 (회전은 Ref 좌표계에 이미 포함됨)
+                scaled_vec = rel_vec * face_scale
+                
+                # Trans Pivot에 더하기
+                trans_kpts[idx] = pivot + scaled_vec
+                trans_scores[idx] = ref_scores[idx]
+                processed.add(idx)
+
+        # 로그 기록
+        if log is not None:
+            log.setdefault('face_transfer_debug', {}).update({
+                'face_scale': face_scale,
+                'body_ratio': body_ratio,
+                'target_face_width': target_face_width
+            })
+
+    def transfer_landmarks(
+        self,
+        trans_kpts: np.ndarray,
+        trans_scores: np.ndarray,
+        ref_kpts: np.ndarray,
+        ref_scores: np.ndarray,
+        processed: Set[int]
+    ):
+        """
+        얼굴 상세 랜드마크(23~90) 전이
+        - transfer_structure에서 계산된 캐시 사용
+        """
+        if not self._transform_cache:
+            return
+
+        scale = self._transform_cache['scale']
+        pivot = self._transform_cache['pivot']
+        ref_origin = self._transform_cache['ref_origin']
+
+        for idx in range(23, 91):
+            if idx < len(ref_scores) and ref_scores[idx] > 0.1:
+                rel_vec = ref_kpts[idx] - ref_origin
+                trans_kpts[idx] = pivot + (rel_vec * scale)
+                trans_scores[idx] = ref_scores[idx]
+                processed.add(idx)
+
+    def transfer_ears_fallback(
+        self,
+        trans_kpts: np.ndarray,
+        trans_scores: np.ndarray,
+        ref_kpts: np.ndarray,
+        ref_scores: np.ndarray,
+        processed: Set[int]
+    ):
+        """
+        귀 전이 Fallback (눈/코가 없어서 구조 전이에 실패했을 때)
+        - 어깨를 기준으로 귀 위치 추정
+        """
+        LS, RS = 5, 6
+        LEFT_EAR, RIGHT_EAR = 3, 4
+        
+        # 이미 귀가 전이되었으면 패스
+        if trans_scores[LEFT_EAR] > 0.1 and trans_scores[RIGHT_EAR] > 0.1:
+            return
+
+        # 어깨가 없으면 포기
+        if trans_scores[LS] < 0.1 or trans_scores[RS] < 0.1:
+            return
+
+        trans_width = np.linalg.norm(trans_kpts[RS] - trans_kpts[LS])
+
+        for ear_idx, shoulder_idx in [(LEFT_EAR, LS), (RIGHT_EAR, RS)]:
+            # 이미 처리된 귀는 패스
+            if trans_scores[ear_idx] > 0.1: continue
+
+            if ref_scores[ear_idx] > 0.1 and ref_scores[shoulder_idx] > 0.1:
+                # Ref: 어깨 -> 귀 벡터
+                ref_vec = ref_kpts[ear_idx] - ref_kpts[shoulder_idx]
+                
+                # Ref 어깨 너비 대비 비율 계산
+                ref_sh_width = np.linalg.norm(ref_kpts[RS] - ref_kpts[LS])
+                ratio = np.linalg.norm(ref_vec) / ref_sh_width if ref_sh_width > 0 else 0.3
+                
+                # 방향은 Ref 유지
+                norm = np.linalg.norm(ref_vec)
+                dir_vec = ref_vec / norm if norm > 0 else ref_vec
+                
+                # Trans 적용
+                trans_kpts[ear_idx] = trans_kpts[shoulder_idx] + dir_vec * (trans_width * ratio)
+                trans_scores[ear_idx] = ref_scores[ear_idx] * 0.8
+                processed.add(ear_idx)

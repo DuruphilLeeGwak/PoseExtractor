@@ -2,6 +2,7 @@
 Logic Module - 정렬, BBox, 후처리, Cross-Filter 등 (Refactored v3.0)
 
 변경사항:
+- [v3.0] TransferLayout 추가 (AlignManager 리팩토링 대응)
 - AlignmentCase, BodyType Enum 제거 (단순화)
 - Ghost Filter 제거 (Cross-Filter로 통합)
 - v3.1: debug_generator 리팩토링 (문자열 반환으로 변경)
@@ -10,7 +11,7 @@ from .bbox_manager import (
     BboxManager, BboxInfo, DebugBboxData, 
     COLOR_KPT_BBOX, COLOR_YOLO_BBOX, COLOR_HYBRID_PERSON, COLOR_HYBRID_FACE
 )
-from .align_manager import AlignManager
+from .align_manager import AlignManager, TransferLayout
 from .post_processor import PostProcessor
 from .canvas_manager import CanvasManager
 
@@ -33,7 +34,7 @@ __all__ = [
     'COLOR_HYBRID_PERSON', 
     'COLOR_HYBRID_FACE',
     # Align
-    'AlignManager', 
+    'AlignManager', 'TransferLayout',
     # Post
     'PostProcessor',
     # Canvas

@@ -1,174 +1,177 @@
 """
-Simplified Align Manager (Refactored v2.0)
+Align Manager Module (Refactored v2.0 - Smart Anchor & Offset)
 
-변경사항:
-- Body Type 판별 로직 제거 (GhostFilter가 처리)
-- Case Enum 제거 (Boolean 기반으로 단순화)
-- 핵심 기능만 유지: 정렬 방식 결정 + 좌표 정렬
+역할:
+- Source와 Reference의 포즈/BBox 상태를 분석하여 전이 전략(Layout) 수립
+- Global Scale(크기 비율)과 Offset Vector(이동 좌표)를 계산하여 Engine에 전달
+- '발 끝 맞추기(Grounding)' vs '중심 맞추기(Center)' 전략 자동 분기
 """
 import numpy as np
-from typing import Tuple, Optional, Any
+from dataclasses import dataclass
+from typing import Tuple, Optional, Dict
+from .bbox_manager import BboxInfo
+
+@dataclass
+class TransferLayout:
+    """전이 전략 및 배치 정보"""
+    global_scale: float          # 적용할 확대/축소 배율
+    offset_vector: np.ndarray    # 최종 이동 벡터 (dx, dy)
+    anchor_type: str             # 'FEET', 'HIP', 'FACE'
+    anchor_point_src: Tuple[int, int]
+    anchor_point_ref: Tuple[int, int]
 
 class AlignManager:
-    """
-    단순화된 정렬 관리자
-    
-    역할:
-    1. 발 정렬 가능 여부 판단 (GhostFilter 처리 후 점수 기반)
-    2. 좌표 정렬 수행 (발 또는 얼굴 기준)
-    """
-    
     def __init__(self, config):
-        """
-        초기화
-        
-        Args:
-            config: Pipeline 설정 객체
-        """
         self.config = config
-        # 발목 인덱스 (left_ankle, right_ankle)
-        self.ankle_indices = [15, 16]
-    
-    def should_align_by_feet(
-        self, 
-        src_scores: np.ndarray, 
+
+    def analyze_layout(
+        self,
+        src_bbox_info: BboxInfo,
+        ref_bbox_info: BboxInfo,
+        src_kpts: np.ndarray,
+        src_scores: np.ndarray,
+        ref_kpts: np.ndarray,
         ref_scores: np.ndarray,
-        threshold: float = 0.1
-    ) -> Tuple[bool, bool]:
+        src_depth_map=None,
+        ref_depth_map=None,
+        src_depth_vals=None
+    ) -> TransferLayout:
         """
-        발 정렬 사용 가능 여부 판단
-        
-        Args:
-            src_scores: Source 키포인트 신뢰도 점수
-            ref_scores: Reference 키포인트 신뢰도 점수
-            threshold: 유효 판단 임계값 (기본: 0.1)
-        
-        Returns:
-            Tuple[bool, bool]:
-                - should_transfer_lower: 하반신 전이 여부 (ref에 발 있으면 True)
-                - align_by_feet: 발 정렬 사용 여부 (src, ref 둘 다 발 있으면 True)
-        
-        Note:
-            GhostFilter가 이미 유효하지 않은 키포인트를 제거했으므로
-            단순히 점수만 확인하면 됨
+        [Main] 최적의 배치 전략(Layout) 계산
         """
-        print("\n🔍 [AlignManager] Checking feet availability...")
+        # 1. 정렬 기준(Anchor Type) 결정
+        align_type = self._decide_alignment_type(src_bbox_info, ref_bbox_info)
         
-        # Source 발목 체크
-        src_left_ankle = src_scores[15] > threshold if 15 < len(src_scores) else False
-        src_right_ankle = src_scores[16] > threshold if 16 < len(src_scores) else False
-        src_has_feet = src_left_ankle and src_right_ankle
+        # 2. 스케일(Scale) 계산
+        # 정렬 기준에 따라 스케일 계산 방식도 달라짐 (발 기준이면 키 비율, 힙 기준이면 몸통 비율 등)
+        scale = self._calculate_scale(
+            align_type, src_kpts, src_scores, ref_kpts, ref_scores, 
+            src_bbox_info, ref_bbox_info
+        )
         
-        # Reference 발목 체크
-        ref_left_ankle = ref_scores[15] > threshold if 15 < len(ref_scores) else False
-        ref_right_ankle = ref_scores[16] > threshold if 16 < len(ref_scores) else False
-        ref_has_feet = ref_left_ankle and ref_right_ankle
+        # 3. 앵커 포인트(Anchor Point) 및 오프셋(Offset) 계산
+        offset, src_anchor, ref_anchor = self._calculate_offset(
+            align_type, scale, src_bbox_info, ref_bbox_info
+        )
         
-        print(f"   Source feet: L={src_left_ankle}, R={src_right_ankle} → {src_has_feet}")
-        print(f"   Reference feet: L={ref_left_ankle}, R={ref_right_ankle} → {ref_has_feet}")
+        print(f"   🧠 [AlignManager] Strategy: {align_type}")
+        print(f"      Scale: {scale:.3f}")
+        print(f"      Offset: {offset.astype(int)}")
         
-        # 하반신 전이: Reference에 발이 있으면 가능
-        should_transfer_lower = ref_has_feet
+        return TransferLayout(
+            global_scale=scale,
+            offset_vector=offset,
+            anchor_type=align_type,
+            anchor_point_src=src_anchor,
+            anchor_point_ref=ref_anchor
+        )
+
+    def _decide_alignment_type(self, src: BboxInfo, ref: BboxInfo) -> str:
+        """
+        Source와 Ref의 상태를 보고 정렬 기준 선택
+        우선순위: FEET(전신) > HIP(상반신) > FACE(얼굴)
+        """
+        # 1. 둘 다 하체가 존재하면 -> 발 끝 정렬 (바닥 고정)
+        if src.has_lower_body and ref.has_lower_body:
+            return 'FEET'
         
-        # 발 정렬: 둘 다 발이 있어야 가능
-        align_by_feet = src_has_feet and ref_has_feet
-        
-        print(f"   → should_transfer_lower: {should_transfer_lower}")
-        print(f"   → align_by_feet: {align_by_feet}")
-        
-        return should_transfer_lower, align_by_feet
-    
-    def align_coordinates(
+        # 2. 둘 다 얼굴이 존재하면 (상반신 샷 등) -> 힙/몸통 중심 정렬
+        # (얼굴 정렬보다 힙 정렬이 전체적인 포즈 안정성이 높음)
+        if src.has_face and ref.has_face:
+            return 'HIP'
+            
+        # 3. 그 외의 경우 (얼굴 클로즈업 등)
+        return 'FACE'
+
+    def _calculate_scale(
         self, 
-        kpts: np.ndarray, 
-        scores: np.ndarray, 
-        align_by_feet: bool,
-        src_person_bbox: Any, 
-        src_face_bbox: Any, 
-        face_bbox_func: callable
-    ) -> np.ndarray:
+        align_type: str,
+        src_kpts, src_scores, 
+        ref_kpts, ref_scores,
+        src_bbox: BboxInfo, ref_bbox: BboxInfo
+    ) -> float:
         """
-        좌표 정렬 수행
-        
-        Args:
-            kpts: 전이된 키포인트 좌표 (133, 2)
-            scores: 키포인트 신뢰도 점수 (133,)
-            align_by_feet: True면 발 정렬, False면 얼굴 정렬
-            src_person_bbox: Source의 Person bounding box
-            src_face_bbox: Source의 Face bounding box
-            face_bbox_func: 얼굴 bbox 계산 함수
-        
-        Returns:
-            np.ndarray: 정렬된 키포인트 좌표 (133, 2)
-        
-        Note:
-            - 발 정렬: 발 바닥을 Source 이미지 바닥에 맞춤
-            - 얼굴 정렬: 얼굴 중심을 Source 얼굴 중심에 맞춤
+        정렬 타입에 맞는 최적의 스케일 계산
         """
-        print("\n" + "="*60)
-        print(f"🔍 [AlignManager] align_coordinates(align_by_feet={align_by_feet})")
-        print("="*60)
+        scale = 1.0
         
-        aligned_kpts = kpts.copy()
-        
-        if align_by_feet:
-            # ========================================
-            # 발 정렬: 발 바닥을 Source 이미지 바닥에 맞춤
-            # ========================================
-            print("\n🦶 Feet-based alignment")
-            
-            # Source 이미지의 바닥 (person bbox의 y2)
-            src_bottom = src_person_bbox.bbox[3]
-            print(f"   src_person_bbox: {src_person_bbox.bbox}")
-            print(f"   src_bottom (y2): {src_bottom}")
-            
-            # 전이된 키포인트의 발 관련 포인트 중 가장 아래 찾기
-            feet_indices = [15, 16, 17, 18, 19, 20, 21, 22]  # ankles + toes + heels
-            valid_y = []
-            
-            print(f"\n   Checking feet keypoints:")
-            for i in feet_indices:
-                if i < len(scores) and scores[i] > 0.1:
-                    valid_y.append(kpts[i][1])
-                    print(f"      idx={i}: score={scores[i]:.3f}, y={kpts[i][1]:.1f} ✅")
-            
-            if valid_y:
-                trans_bottom = max(valid_y)
-                print(f"   trans_bottom (max y): {trans_bottom:.1f}")
+        # Case A: FEET (전신) -> 키(Height) 비율 or 몸통 길이 비율
+        # BBox 높이 비율을 사용하는 것이 가장 안정적 (노이즈에 강함)
+        if align_type == 'FEET':
+            if src_bbox.height > 0 and ref_bbox.height > 0:
+                scale = ref_bbox.height / src_bbox.height
                 
-                # 수직 이동량 계산
-                shift_y = src_bottom - trans_bottom
-                aligned_kpts[:, 1] += shift_y
-                
-                print(f"   ✅ shift_y = {src_bottom:.1f} - {trans_bottom:.1f} = {shift_y:.1f}")
+        # Case B: HIP (상반신) -> 몸통(Torso) 길이 비율
+        elif align_type == 'HIP':
+            # 키포인트 기반 척추 길이 계산 시도
+            src_torso = self._calc_torso_len(src_kpts, src_scores)
+            ref_torso = self._calc_torso_len(ref_kpts, ref_scores)
+            
+            if src_torso > 0 and ref_torso > 0:
+                scale = ref_torso / src_torso
             else:
-                print(f"   ❌ No valid feet keypoints found, NO SHIFT")
-        
+                # 척추 길이 모르면 BBox 높이 비율로 대체
+                scale = ref_bbox.height / src_bbox.height if src_bbox.height > 0 else 1.0
+                
+        # Case C: FACE -> 얼굴 크기 비율 (BBox or 귀/눈 거리)
         else:
-            # ========================================
-            # 얼굴 정렬: 얼굴 중심을 Source 얼굴 중심에 맞춤
-            # ========================================
-            print(f"\n👤 Face-based alignment")
-            
-            # 1. Source 이미지의 얼굴 중심
-            src_cx, src_cy = src_face_bbox.center
-            
-            # 2. 전이된 키포인트의 얼굴 중심 계산
-            trans_face_info = face_bbox_func(kpts, scores)
-            trans_cx, trans_cy = trans_face_info.center
-            
-            print(f"   Src Face Center: ({src_cx:.1f}, {src_cy:.1f})")
-            print(f"   Trans Face Center: ({trans_cx:.1f}, {trans_cy:.1f})")
-            
-            # 3. 이동량 계산
-            shift_x = src_cx - trans_cx
-            shift_y = src_cy - trans_cy
-            
-            # 4. 전체 키포인트 이동
-            aligned_kpts[:, 0] += shift_x
-            aligned_kpts[:, 1] += shift_y
-            
-            print(f"   ✅ Shift Applied: x={shift_x:.1f}, y={shift_y:.1f}")
+            # BBoxManager가 제공하는 Face BBox 사용
+            # (Face BBox는 이미 BBoxManager에서 계산됨)
+            # 여기서는 BBoxInfo 자체의 크기보다는, BBoxManager가 내부적으로 가지고 있는 Face Box가 필요함.
+            # 하지만 BBoxInfo.has_face가 True라면 src_bbox 안에 얼굴 정보가 포함되어 있거나
+            # 별도의 Face BBox가 넘어와야 함.
+            # pipeline.py에서 src_face_bbox를 별도로 넘겨주지 않고 
+            # src_bbox_info(Person)만 넘겨주고 있다면, 정밀도는 떨어질 수 있음.
+            # *현재 구조상 Person BBox 비율 사용*
+            scale = ref_bbox.width / src_bbox.width if src_bbox.width > 0 else 1.0
+
+        # 안전장치 (너무 과도한 스케일링 방지)
+        return float(np.clip(scale, 0.3, 3.0))
+
+    def _calculate_offset(
+        self, 
+        align_type: str, 
+        scale: float, 
+        src: BboxInfo, 
+        ref: BboxInfo
+    ) -> Tuple[np.ndarray, Tuple[int, int], Tuple[int, int]]:
+        """
+        Offset 계산: Ref_Anchor - (Src_Anchor * Scale)
+        """
+        src_anchor = (0, 0)
+        ref_anchor = (0, 0)
         
-        print("="*60)
-        return aligned_kpts
+        if align_type == 'FEET':
+            # 발 중심점 (BBoxInfo에 미리 계산되어 있음)
+            src_anchor = src.feet_center
+            ref_anchor = ref.feet_center
+            
+        elif align_type == 'HIP':
+            # 힙 중심점 (BBox의 중심 또는 하단 1/3 지점 등)
+            # 여기서는 BBox의 중심(Center) 사용
+            src_anchor = src.center
+            ref_anchor = ref.center
+            
+        elif align_type == 'FACE':
+            # 얼굴 중심점
+            src_anchor = src.face_center
+            ref_anchor = ref.face_center
+            
+        # 벡터 연산
+        v_src = np.array(src_anchor, dtype=np.float32)
+        v_ref = np.array(ref_anchor, dtype=np.float32)
+        
+        # 공식: Target = Source * Scale + Offset
+        # 따라서 Offset = Target - (Source * Scale)
+        offset = v_ref - (v_src * scale)
+        
+        return offset, src_anchor, ref_anchor
+
+    def _calc_torso_len(self, kpts, scores):
+        """[Helper] 척추 길이 계산 (Neck to Hip Center)"""
+        # COCO: 5,6(Sh), 11,12(Hip)
+        if (scores[5]>0.1 and scores[6]>0.1 and scores[11]>0.1 and scores[12]>0.1):
+            neck = (kpts[5] + kpts[6]) / 2.0
+            hip = (kpts[11] + kpts[12]) / 2.0
+            return np.linalg.norm(hip - neck)
+        return 0.0

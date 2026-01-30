@@ -1,118 +1,105 @@
 """
-Pose Transfer CLI Entry Point
+Pose Transfer CLI Entry Point (Refactored v2.1 - Folder Structure Restore)
 
-실행 모드:
-1. 독립 실행: python PoseExtractor.py
-   → io/inputs/src, io/inputs/ref 에서 이미지 자동 탐색
-   → io/outputs/ 에 결과 저장
-
-2. 경로 지정 실행: python PoseExtractor.py --source img1.jpg --reference img2.jpg
-   → 지정된 경로 사용
-   → --output 으로 출력 경로 지정 가능
-
-3. Pozibility 통합 시:
-   → data/inputs/src, ref 에서 자동 탐색
-   → data/outputs/ 에 결과 저장
+변경사항:
+- [복구] 출력 폴더명을 '날짜_시간_src_to_ref' 형식으로 자동 생성하도록 변경
+- api.execute 호출 시 해당 경로 전달
 """
 import sys
 import os
-import yaml
 import argparse
 from pathlib import Path
+from datetime import datetime
+from typing import Optional, Tuple
 
-# OpenMP 중복 로딩 에러 방지 (onnxruntime/rtmlib 충돌 회피)
+# OpenMP 중복 로딩 에러 방지
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-from pose_transfer.api import execute_pose_transfer
+# 모듈 경로 추가
+sys.path.append(str(Path(__file__).parent))
+
+from pose_transfer.api import PoseTransferAPI
+from pose_transfer.utils.io import get_image_files
+
+# 기본 경로 설정
+BASE_DIR = Path(__file__).parent
+DEFAULT_IO_DIR = BASE_DIR / "io"
+DEFAULT_SRC_DIR = DEFAULT_IO_DIR / "inputs" / "source"
+DEFAULT_REF_DIR = DEFAULT_IO_DIR / "inputs" / "reference"
+DEFAULT_OUT_DIR = DEFAULT_IO_DIR / "outputs"
+
+
+def find_input_images(src_arg: Optional[str], ref_arg: Optional[str]) -> Tuple[Path, Path]:
+    """입력 이미지 자동 탐색"""
+    if src_arg and ref_arg:
+        src_path = Path(src_arg)
+        ref_path = Path(ref_arg)
+        if not src_path.exists(): raise FileNotFoundError(f"Source not found: {src_path}")
+        if not ref_path.exists(): raise FileNotFoundError(f"Reference not found: {ref_path}")
+        return src_path, ref_path
+
+    print("\n🔍 Arguments not provided. Scanning default directories...")
+    src_dir = DEFAULT_SRC_DIR if DEFAULT_SRC_DIR.exists() else DEFAULT_IO_DIR / "inputs" / "src"
+    ref_dir = DEFAULT_REF_DIR if DEFAULT_REF_DIR.exists() else DEFAULT_IO_DIR / "inputs" / "ref"
+    
+    if not src_dir.exists() or not ref_dir.exists():
+        raise FileNotFoundError(f"Default input folders not found: {src_dir}, {ref_dir}")
+
+    src_files = get_image_files(src_dir)
+    ref_files = get_image_files(ref_dir)
+    
+    if not src_files: raise FileNotFoundError(f"No images found in {src_dir}")
+    if not ref_files: raise FileNotFoundError(f"No images found in {ref_dir}")
+    
+    src_path = src_files[0]
+    ref_path = ref_files[0]
+    
+    print(f"   👉 Auto-selected Source: {src_path.name}")
+    print(f"   👉 Auto-selected Ref   : {ref_path.name}")
+    
+    return src_path, ref_path
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description='Pose Transfer - Source 체형에 Reference 포즈 적용',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # 자동 탐색 모드 (io/inputs/ 폴더 사용)
-  python PoseExtractor.py
-
-  # 경로 직접 지정
-  python PoseExtractor.py --source person.jpg --reference pose.jpg
-
-  # 출력 경로 지정
-  python PoseExtractor.py --source person.jpg --reference pose.jpg --output results/
-        """
-    )
-    
-    parser.add_argument(
-        '--source', '-s',
-        type=str, 
-        default=None,
-        help='Source 이미지 경로 (체형 기준)'
-    )
-    parser.add_argument(
-        '--reference', '-r',
-        type=str, 
-        default=None,
-        help='Reference 이미지 경로 (포즈 기준)'
-    )
-    parser.add_argument(
-        '--output', '-o',
-        type=str,
-        default=None,  # None이면 api.py가 자동 결정
-        help='출력 디렉토리 (기본: io/outputs 또는 data/outputs)'
-    )
-    parser.add_argument(
-        '--config', '-c',
-        type=str,
-        default='pose_transfer/config/default.yaml',
-        help='설정 파일 경로'
-    )
-    
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--source', '--src', type=str)
+    parser.add_argument('--reference', '--ref', type=str)
+    parser.add_argument('--output', '--out', type=str, default=str(DEFAULT_OUT_DIR))
     args = parser.parse_args()
     
-    # 설정 파일 로드
-    config_path = Path(args.config)
-    yaml_config = {}
-    
-    if config_path.exists():
-        with open(config_path, 'r', encoding='utf-8') as f:
-            yaml_config = yaml.safe_load(f) or {}
-    else:
-        print(f"⚠️ Config file not found: {config_path}")
-        print("   Using default settings.")
-    
     try:
-        # 실행 (경로가 None이면 api.py가 자동 탐색)
-        results = execute_pose_transfer(
-            source_path=args.source,
-            reference_path=args.reference,
-            output_root=args.output,
-            config_path=str(config_path) if config_path.exists() else None,
-            explicit_config=yaml_config
+        # 1. API 초기화
+        api = PoseTransferAPI(base_dir=str(BASE_DIR))
+        
+        # 2. 실행 대상 결정
+        src_path, ref_path = find_input_images(args.source, args.reference)
+        
+        # 3. [복구] 폴더명 생성 로직 (YYYY-MM-DD_HH-MM-SS_src_to_ref)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        folder_name = f"{timestamp}_{src_path.stem}_to_{ref_path.stem}"
+        
+        # 최종 출력 경로: io/outputs/날짜_시간_src_to_ref/
+        final_output_dir = Path(args.output) / folder_name
+        
+        # 4. 실행
+        results = api.execute(
+            source_path=src_path,
+            reference_path=ref_path,
+            output_dir=final_output_dir,
+            prefix="trans" # 파일명 접두사는 깔끔하게 trans로 통일
         )
         
         print(f"\n{'='*50}")
-        print("✅ 완료!")
+        print("✅ Execution Finished Successfully")
         print(f"{'='*50}")
-        print(f"📁 결과 폴더: {results.get('job_dir', 'N/A')}")
-        print(f"🖼️  Skeleton: {results.get('skeleton', 'N/A')}")
-        print(f"📄 JSON: {results.get('json', 'N/A')}")
-        
-    except FileNotFoundError as e:
-        print(f"\n❌ 파일을 찾을 수 없습니다:")
-        print(f"   {e}")
-        print(f"\n💡 해결 방법:")
-        print(f"   1. io/inputs/src/ 폴더에 Source 이미지를 넣으세요")
-        print(f"   2. io/inputs/ref/ 폴더에 Reference 이미지를 넣으세요")
-        print(f"   3. 또는 --source, --reference 옵션으로 경로를 직접 지정하세요")
-        sys.exit(1)
-        
+        print(f"📁 Output Folder: {final_output_dir}")
+        print(f"   (Check inside for src/, ref/, trans/ folders)")
+            
     except Exception as e:
-        print(f"\n❌ 실행 실패: {e}")
+        print(f"\n❌ Error: {str(e)}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()
