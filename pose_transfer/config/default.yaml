@@ -109,10 +109,10 @@ fallback:
 # [7] 렌더링 스타일
 # =============================================================================
 rendering:
-  line_thickness: 2
-  face_line_thickness: 1
-  hand_line_thickness: 2
-  point_radius: 1
+  line_thickness: 4
+  face_line_thickness: 2
+  hand_line_thickness: 4
+  point_radius: 2
   background_color: [0, 0, 0]
   kpt_threshold: 0.1
   draw_neck: true  # Neck 키포인트 표시 (어깨 중심점)

@@ -1,33 +1,11 @@
-from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional
-import numpy as np
+"""
+Transfer Config Module (Refactored v4.5)
 
-@dataclass
-class FacePartConfig:
-    enabled: bool = True
-    color: Tuple[int, int, int] = (255, 255, 255)
-
-@dataclass
-class FaceRenderingConfig:
-    enabled: bool = True
-    parts: Dict[str, FacePartConfig] = field(default_factory=dict)
-    
-    @classmethod
-    def from_dict(cls, data: dict) -> 'FaceRenderingConfig':
-        config = cls()
-        if not data: return config
-        config.enabled = data.get('enabled', True)
-        parts_data = data.get('parts', {})
-        default_parts = ['jawline', 'left_eyebrow', 'right_eyebrow', 'nose', 
-                         'left_eye', 'right_eye', 'mouth_outer', 'mouth_inner']
-        config.parts = {}
-        for part in default_parts:
-            p_data = parts_data.get(part, {})
-            config.parts[part] = FacePartConfig(
-                enabled=p_data.get('enabled', True),
-                color=tuple(p_data.get('color', [255, 255, 255]))
-            )
-        return config
+위치: pose_transfer/transfer/config.py
+역할: 전이(Transfer) 관련 설정 클래스 정의 (Engine에서 분리됨)
+"""
+from dataclasses import dataclass
+from typing import Dict, Any
 
 @dataclass
 class TransferConfig:
@@ -35,22 +13,16 @@ class TransferConfig:
     use_face: bool = True
     use_hands: bool = True
     enable_symmetric_fallback: bool = True
+    visibility_margin: float = 0.2
     enable_upper_ratio_tuning: bool = True
     enable_lower_ratio_tuning: bool = True
-    
-    # 하반신 검증용
-    lower_body_confidence_threshold: float = 0.5
-    lower_body_margin_ratio: float = 0.05
-    
-    # [FIX] 누락되었던 필드 추가 (화면 밖 허용 마진)
-    visibility_margin: float = 0.15
-    
-    face_rendering: FaceRenderingConfig = field(default_factory=FaceRenderingConfig)
 
-@dataclass
-class TransferResult:
-    keypoints: np.ndarray
-    scores: np.ndarray
-    source_bone_lengths: Dict[str, float]
-    reference_directions: Dict[str, np.ndarray]
-    transfer_log: Dict[str, str] = field(default_factory=dict)
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]):
+        """YAML 설정을 Config 객체로 변환"""
+        if not data:
+            return cls()
+        valid_keys = cls.__dataclass_fields__.keys()
+        # YAML의 키 중 Config에 정의된 것만 필터링하여 주입
+        filtered = {k: v for k, v in data.items() if k in valid_keys}
+        return cls(**filtered)

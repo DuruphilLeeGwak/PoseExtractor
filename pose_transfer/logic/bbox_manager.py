@@ -1,22 +1,28 @@
 """
-Bbox Manager Module (Refactored v3.1 - Constants Fixed)
+Bbox Manager Module (Restored Original Logic - Constants Fixed)
 
 위치: pose_transfer/logic/bbox_manager.py
-변경사항:
-- [Fix] 외부에서 참조하는 색상 상수(COLOR_HYBRID_PERSON 등) 누락 복구
-- Skull Logic(두개골 확장) 포함 유지
+역할:
+- YOLO와 Keypoint 박스를 결합하여 최적의 BBox 산출
+- 좌상단 텍스트 라벨링 기능 포함
 """
 import cv2
 import numpy as np
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Tuple, Optional
 
-# =========================================================
-# [Color Constants] 외부 참조용 상수 복구
-# =========================================================
+# YOLO 로드 시도
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except ImportError:
+    YOLO_AVAILABLE = False
+
+# [Fix] 시스템이 참조하는 상수명으로 복구
 COLOR_KPT_BBOX = (0, 255, 0)        # Green
 COLOR_YOLO_BBOX = (0, 0, 255)       # Red
-COLOR_HYBRID_PERSON = (255, 255, 0) # Cyan (KPT + YOLO Combined)
+COLOR_HYBRID_PERSON = (255, 255, 0) # Cyan
 COLOR_HYBRID_FACE = (255, 0, 255)   # Magenta
 
 @dataclass
@@ -27,154 +33,189 @@ class BboxInfo:
     y2: int
     center: Tuple[int, int]
     
-    # AlignManager 필수 정보
+    # 정렬용 추가 정보
     has_lower_body: bool = False
     has_face: bool = False
     feet_center: Tuple[int, int] = (0, 0)
     face_center: Tuple[int, int] = (0, 0)
+    
+    # 디버그용 라벨
+    label: str = ""
 
     @property
     def width(self) -> int: return self.x2 - self.x1
     @property
     def height(self) -> int: return self.y2 - self.y1
-    def to_tuple(self) -> Tuple[int, int, int, int]: return (self.x1, self.y1, self.x2, self.y2)
+    def to_tuple(self): return (self.x1, self.y1, self.x2, self.y2)
 
 @dataclass
 class DebugBboxData:
-    kpt_person: Optional[Tuple[int, int, int, int]] = None
-    yolo_person: Optional[Tuple[int, int, int, int]] = None
-    kpt_face: Optional[Tuple[int, int, int, int]] = None
-    # Hybrid 정보가 필요하다면 추가 가능
+    kpt_person: Optional[BboxInfo] = None
+    yolo_person: Optional[BboxInfo] = None
+    final_person: Optional[BboxInfo] = None
+    final_face: Optional[BboxInfo] = None
 
 class BboxManager:
     def __init__(self, config):
         self.config = config
-        self.person_model = None # YOLO는 현재 비활성화 (필요시 추가)
+        self.person_model = None
+        self.face_model = None
+        
+        # 모델 로드 (경로 자동 탐색)
+        if YOLO_AVAILABLE:
+            base_dir = Path(__file__).parent.parent.parent
+            person_ckpt = base_dir / "models" / "yolo11n.pt"
+            face_ckpt = base_dir / "models" / "yolo11n-face.pt"
+            
+            if person_ckpt.exists():
+                try: self.person_model = YOLO(str(person_ckpt))
+                except: pass
+            if face_ckpt.exists():
+                try: self.face_model = YOLO(str(face_ckpt))
+                except: pass
 
     def get_bboxes(self, image: np.ndarray, keypoints: np.ndarray, scores: np.ndarray) -> Tuple[BboxInfo, BboxInfo, DebugBboxData]:
         h, w = image.shape[:2]
         debug_data = DebugBboxData()
         
-        # 1. Face BBox 계산 (Skull 보정 포함)
-        face_bbox = self._kpt_to_face(keypoints, scores, (h, w), margin=self.config.face_bbox_margin)
+        # 1. KPT 기반 계산
+        kpt_face = self._kpt_to_face(keypoints, scores, (h, w))
+        kpt_person = self._kpt_to_person(keypoints, scores, (h, w), face_top=kpt_face.y1)
+        kpt_person.label = "KPT"
+        debug_data.kpt_person = kpt_person
         
-        # 2. Person BBox 계산 (Face BBox의 Top을 반영하여 보정)
-        person_bbox = self._kpt_to_person(keypoints, scores, (h, w), face_bbox_top=face_bbox.y1, margin=self.config.person_bbox_margin)
+        # 2. YOLO 기반 계산
+        yolo_person = self._get_yolo_bbox(self.person_model, image, 0, "YOLO")
+        if yolo_person: debug_data.yolo_person = yolo_person
         
-        debug_data.kpt_person = person_bbox.to_tuple()
-        debug_data.kpt_face = face_bbox.to_tuple()
-        
-        return person_bbox, face_bbox, debug_data
-
-    def _kpt_to_face(self, kpts, scores, img_size, margin=0.0) -> BboxInfo:
-        """얼굴 BBox 계산 (이마/두개골 확장 로직 적용)"""
-        H, W = img_size
-        
-        # 얼굴 키포인트: 0(코), 1,2(눈), 3,4(귀)
-        face_indices = [0, 1, 2, 3, 4]
-        valid_pts = []
-        for i in face_indices:
-            if i < len(scores) and scores[i] > 0.1:
-                valid_pts.append(kpts[i])
-        
-        if not valid_pts:
-            return BboxInfo(0, 0, 0, 0, (0, 0))
-
-        valid_pts = np.array(valid_pts)
-        x1, y1 = np.min(valid_pts, axis=0)
-        x2, y2 = np.max(valid_pts, axis=0)
-        
-        # --- [Skull Logic] 두개골 확장 ---
-        face_width = x2 - x1
-        skull_extension = face_width * 0.6 # 이마 높이 추정
-        
-        y1_skull = y1 - skull_extension
-        y1 = int(max(0, y1_skull))
-        
-        # Margin 적용
-        w_box, h_box = x2 - x1, y2 - y1
-        pad_x = w_box * margin
-        pad_y = h_box * margin
-        
-        x1 = int(max(0, x1 - pad_x))
-        y1 = int(max(0, y1 - pad_y))
-        x2 = int(min(W, x2 + pad_x))
-        y2 = int(min(H, y2 + pad_y))
-        
-        center = (int((x1+x2)/2), int((y1+y2)/2))
-        
-        return BboxInfo(x1, y1, x2, y2, center, has_face=True, face_center=center)
-
-    def _kpt_to_person(self, kpts, scores, img_size, face_bbox_top=None, margin=0.0) -> BboxInfo:
-        """전신 BBox 계산"""
-        H, W = img_size
-        valid_mask = scores > 0.1
-        
-        if not np.any(valid_mask):
-            return BboxInfo(0, 0, W, H, (W//2, H//2))
-            
-        valid_kpts = kpts[valid_mask]
-        x1, y1 = np.min(valid_kpts, axis=0)
-        x2, y2 = np.max(valid_kpts, axis=0)
-        
-        # [Skull Logic] 키포인트 최상단보다 Face BBox의 상단(두개골)이 더 높다면 교체
-        if face_bbox_top is not None and face_bbox_top < y1:
-            y1 = face_bbox_top
-            
-        # Margin
-        w_box, h_box = x2 - x1, y2 - y1
-        pad_x = w_box * margin
-        pad_y = h_box * margin
-        
-        x1 = int(max(0, x1 - pad_x))
-        y1 = int(max(0, y1 - pad_y))
-        x2 = int(min(W, x2 + pad_x))
-        y2 = int(min(H, y2 + pad_y))
-        
-        center = (int((x1+x2)/2), int((y1+y2)/2))
-        
-        # 신체 정보 분석
-        has_lower = False
-        feet_pts = []
-        for idx in [15, 16, 19, 22]: # 발목, 발뒷꿈치
-            if idx < len(scores) and scores[idx] > 0.2:
-                has_lower = True
-                feet_pts.append(kpts[idx])
-        
-        if feet_pts:
-            fc = np.mean(feet_pts, axis=0)
-            feet_center = (int(fc[0]), int(fc[1]))
+        # 3. Hybrid Merge (기존 로직: Union)
+        if yolo_person and kpt_person.width > 0:
+            final_p = self._merge_bboxes(kpt_person, yolo_person, "Hybrid")
+        elif yolo_person:
+            final_p = yolo_person
+            final_p.label = "YOLO-Only"
         else:
-            feet_center = (center[0], y2)
+            final_p = kpt_person
+            final_p.label = "KPT-Only"
             
-        # 얼굴 존재 여부
-        has_face = False
-        face_pts = []
-        for idx in range(5):
-            if idx < len(scores) and scores[idx] > 0.2:
-                has_face = True
-                face_pts.append(kpts[idx])
+        # Face 처리 (YOLO Face 있으면 우선 사용)
+        yolo_face = self._get_yolo_bbox(self.face_model, image, None, "YOLO-F")
+        if yolo_face:
+            final_f = self._merge_bboxes(kpt_face, yolo_face, "Hybrid-F")
+        else:
+            final_f = kpt_face
+            
+        # 4. Margin & Anchor Update
+        final_p = self._apply_margin(final_p, (h, w), self.config.person_bbox_margin)
+        final_f = self._apply_margin(final_f, (h, w), self.config.face_bbox_margin)
+        
+        final_p = self._update_anchors(final_p, keypoints, scores, final_f)
+        final_f = self._update_anchors(final_f, keypoints, scores, None, is_face=True)
+        
+        debug_data.final_person = final_p
+        debug_data.final_face = final_f
+        
+        return final_p, final_f, debug_data
+
+    def _get_yolo_bbox(self, model, image, target_cls, label) -> Optional[BboxInfo]:
+        if model is None: return None
+        try:
+            results = model(image, verbose=False)
+            if not results or not results[0].boxes: return None
+            
+            # 가장 큰 박스 선택
+            best_box = None
+            max_area = 0
+            for box in results[0].boxes:
+                cls_id = int(box.cls[0])
+                if target_cls is not None and cls_id != target_cls: continue
                 
-        if face_pts:
-            fc_c = np.mean(face_pts, axis=0)
-            face_center = (int(fc_c[0]), int(fc_c[1]))
-        else:
-            face_center = (center[0], y1)
+                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                area = (xyxy[2]-xyxy[0]) * (xyxy[3]-xyxy[1])
+                if area > max_area:
+                    max_area = area
+                    best_box = xyxy
+            
+            if best_box is not None:
+                cx, cy = (best_box[0]+best_box[2])//2, (best_box[1]+best_box[3])//2
+                return BboxInfo(*best_box, (cx, cy), label=label)
+        except: pass
+        return None
 
-        return BboxInfo(
-            x1, y1, x2, y2, center,
-            has_lower_body=has_lower,
-            has_face=has_face,
-            feet_center=feet_center,
-            face_center=face_center
-        )
+    def _merge_bboxes(self, b1: BboxInfo, b2: BboxInfo, label) -> BboxInfo:
+        x1 = min(b1.x1, b2.x1); y1 = min(b1.y1, b2.y1)
+        x2 = max(b1.x2, b2.x2); y2 = max(b1.y2, b2.y2)
+        return BboxInfo(x1, y1, x2, y2, ((x1+x2)//2, (y1+y2)//2), label=label)
+
+    def _apply_margin(self, bbox: BboxInfo, img_size, margin) -> BboxInfo:
+        if margin <= 0: return bbox
+        H, W = img_size
+        px = int(bbox.width * margin); py = int(bbox.height * margin)
+        bbox.x1 = max(0, bbox.x1 - px); bbox.y1 = max(0, bbox.y1 - py)
+        bbox.x2 = min(W, bbox.x2 + px); bbox.y2 = min(H, bbox.y2 + py)
+        bbox.center = ((bbox.x1+bbox.x2)//2, (bbox.y1+bbox.y2)//2)
+        return bbox
+
+    def _update_anchors(self, bbox: BboxInfo, kpts, scores, face_bbox, is_face=False) -> BboxInfo:
+        if is_face:
+            bbox.has_face = True
+            bbox.face_center = bbox.center
+            return bbox
+            
+        # 발 좌표 계산 (발목+뒷꿈치 평균)
+        feet_indices = [15, 16, 19, 22]
+        valid_feet = [kpts[i] for i in feet_indices if i < len(scores) and scores[i] > 0.1]
+        
+        if valid_feet:
+            fc = np.mean(valid_feet, axis=0).astype(int)
+            bbox.feet_center = (fc[0], fc[1])
+            bbox.has_lower_body = True
+        else:
+            # 발이 없으면 박스 하단 중앙을 강제 할당 (정렬 실패 방지)
+            bbox.feet_center = (bbox.center[0], bbox.y2)
+            bbox.has_lower_body = False 
+            
+        if face_bbox and face_bbox.width > 0:
+            bbox.has_face = True
+            bbox.face_center = face_bbox.center
+            
+        return bbox
+
+    def _kpt_to_person(self, kpts, scores, img_size, face_top=None) -> BboxInfo:
+        H, W = img_size
+        valid = kpts[scores > 0.1]
+        if len(valid) == 0: return BboxInfo(0,0,W,H, (W//2, H//2), label="Fail")
+        
+        x1, y1 = np.min(valid, axis=0).astype(int)
+        x2, y2 = np.max(valid, axis=0).astype(int)
+        if face_top is not None and face_top < y1: y1 = face_top # 머리 위 보정
+        
+        return BboxInfo(x1, y1, x2, y2, ((x1+x2)//2, (y1+y2)//2))
+
+    def _kpt_to_face(self, kpts, scores, img_size) -> BboxInfo:
+        valid = [kpts[i] for i in range(5) if scores[i] > 0.1]
+        if not valid: return BboxInfo(0,0,0,0, (0,0))
+        valid = np.array(valid)
+        x1, y1 = np.min(valid, axis=0).astype(int)
+        x2, y2 = np.max(valid, axis=0).astype(int)
+        # 이마 보정
+        y1 = max(0, int(y1 - (x2-x1)*0.6))
+        return BboxInfo(x1, y1, x2, y2, ((x1+x2)//2, (y1+y2)//2))
 
     def draw_debug(self, image: np.ndarray, debug_data: DebugBboxData) -> np.ndarray:
         vis = image.copy()
-        if debug_data.kpt_person:
-            x1, y1, x2, y2 = debug_data.kpt_person
-            cv2.rectangle(vis, (x1, y1), (x2, y2), COLOR_KPT_BBOX, 2)
-        if debug_data.kpt_face:
-            x1, y1, x2, y2 = debug_data.kpt_face
-            cv2.rectangle(vis, (x1, y1), (x2, y2), COLOR_HYBRID_FACE, 2)
+        
+        def _draw(box: BboxInfo, color, thick=2):
+            if box and box.width > 0:
+                cv2.rectangle(vis, (box.x1, box.y1), (box.x2, box.y2), color, thick)
+                # 텍스트 라벨 복구
+                label = box.label if box.label else "Box"
+                cv2.putText(vis, label, (box.x1, max(20, box.y1-5)), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+        _draw(debug_data.kpt_person, COLOR_KPT_BBOX, 1)
+        _draw(debug_data.yolo_person, COLOR_YOLO_BBOX, 1)
+        _draw(debug_data.final_person, COLOR_HYBRID_PERSON, 3) # 최종은 굵게
+        _draw(debug_data.final_face, COLOR_HYBRID_FACE, 2)
+        
         return vis
