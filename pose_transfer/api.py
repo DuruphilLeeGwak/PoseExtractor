@@ -545,51 +545,140 @@ def _generate_transfer_debug_info(result, src_path: Path, ref_path: Path) -> str
         log = result.processing_info['transfer_log']
         
         # Depth info
-        if 'depth_info' in log:
-            depth_info = log['depth_info']
+        if 'depth' in log:
+            depth_info = log['depth']
             lines.append("=" * 80)
             lines.append("[4] Depth Information")
             lines.append("=" * 80)
-            lines.append(f"Source depth range: {depth_info.get('src_depth_range', 'N/A')}")
-            lines.append(f"Reference depth range: {depth_info.get('ref_depth_range', 'N/A')}")
+            lines.append(f"enabled: {depth_info.get('enabled', False)}")
+            lines.append(f"z_scale: {depth_info.get('z_scale', 'N/A')}")
+            lines.append(f"src_depth_min: {depth_info.get('src_depth_min', 'N/A')}")
+            lines.append(f"src_depth_max: {depth_info.get('src_depth_max', 'N/A')}")
+            lines.append(f"src_depth_mean: {depth_info.get('src_depth_mean', 'N/A')}")
+            lines.append(f"ref_depth_min: {depth_info.get('ref_depth_min', 'N/A')}")
+            lines.append(f"ref_depth_max: {depth_info.get('ref_depth_max', 'N/A')}")
+            lines.append(f"ref_depth_mean: {depth_info.get('ref_depth_mean', 'N/A')}")
             lines.append("")
 
-        # Hand Transfer
+        # Bone lengths (Source 기준)
+        if result.source_bone_lengths:
+            lines.append("=" * 80)
+            lines.append("[5] Source Bone Lengths (Reference for Transfer)")
+            lines.append("=" * 80)
+            for bone_name, length in sorted(result.source_bone_lengths.items()):
+                lines.append(f"{bone_name:20s}: {length:8.2f}")
+            lines.append("")
+
+        # Transfer Processing Log
+        lines.append("=" * 80)
+        lines.append("[6] Transfer Processing Log")
+        lines.append("=" * 80)
+        if 'body_transferred' in log:
+            lines.append(f"Body (17 keypoints): {log['body_transferred']}")
+        if 'face_transferred' in log:
+            lines.append(f"Face (68 keypoints): {log['face_transferred']}")
+        if 'hand_transferred' in log:
+            lines.append(f"Hands (42 keypoints): {log['hand_transferred']}")
+        if 'foot_transferred' in log:
+            lines.append(f"Feet (6 keypoints): {log['foot_transferred']}")
+        lines.append("")
+
+        # ============================================================
+        # [7] Scale Arbitration Logic (NEW - engine.py v36)
+        # ============================================================
+        if 'scale_arbitration' in log:
+            # scale_arbitration은 이미 포맷된 문자열
+            lines.append(log['scale_arbitration'])
+            lines.append("")
+
+        # Hand Transfer Details
         if 'hand_debug' in log:
             lines.append("=" * 80)
-            lines.append("[5] Hand Transfer Details")
+            lines.append("[8] Hand Transfer Details")
             lines.append("=" * 80)
-            lines.append(f"Hand Scale Ratio: {log.get('hand_scale_ratio', 'N/A')}")
+            lines.append(f"Hand Scale Ratio (ref→src): {log.get('hand_scale_ratio', 'N/A')}")
             for hand in log['hand_debug']:
                 side = hand.get('side', 'Unknown')
-                lines.append(f"[{side}] status: {hand.get('status', 'N/A')}")
+                lines.append("")
+                lines.append(f"[{side}]")
+                lines.append(f"  trans_wrist_score: {hand.get('trans_wrist_score', 'N/A')}")
+                if 'src_hand_count' in hand or 'ref_hand_count' in hand:
+                    lines.append(f"  src_hand_count: {hand.get('src_hand_count', 'N/A')}/21")
+                    lines.append(f"  ref_hand_count: {hand.get('ref_hand_count', 'N/A')}/21")
+                lines.append(f"  status: {hand.get('status', 'N/A')}")
+                if hand.get('status') == 'ok':
+                    lines.append(f"  strategy: {hand.get('strategy', 'N/A')}")
+                    lines.append(f"  scale: {hand.get('scale', 'N/A')}")
+                    lines.append(f"  scale_source: {hand.get('scale_source', 'N/A')}")
+                    lines.append(f"  transferred: {hand.get('transferred', 'N/A')}/21")
+                else:
+                    lines.append(f"  reason: {hand.get('reason', 'N/A')}")
             lines.append("")
 
-        # Foot Transfer
+        # Foot Transfer Details
         if 'foot_debug' in log:
             lines.append("=" * 80)
-            lines.append("[6] Foot Transfer Details")
+            lines.append("[9] Foot Transfer Details")
             lines.append("=" * 80)
             for foot in log['foot_debug']:
                 side = foot.get('side', 'Unknown')
-                lines.append(f"[{side}] scale: {foot.get('scale_factor', 'N/A')}")
+                lines.append("")
+                lines.append(f"[{side}]")
+                lines.append(f"  parent: {foot.get('parent', 'N/A')} ({foot.get('parent_idx', 'N/A')})")
+                lines.append(f"  src_base: {foot.get('src_base', 'N/A')}")
+                lines.append(f"  scale_factor: {foot.get('scale_factor', 'N/A')}")
             lines.append("")
 
-    # Face Transfer
+        # Upper Ratio Tuning
+        if 'upper_ratio_tuning' in log:
+            lines.append("=" * 80)
+            lines.append("[10] Upper Limb Ratio Tuning")
+            lines.append("=" * 80)
+            tuning = log['upper_ratio_tuning']
+            lines.append(f"src_torso: {tuning.get('src_torso', 'N/A')}")
+            lines.append(f"trans_torso: {tuning.get('trans_torso', 'N/A')}")
+            lines.append(f"ratio_source: {tuning.get('ratio_source', 'N/A')}")
+            lines.append("")
+
+        # Lower Ratio Tuning
+        if 'lower_ratio_tuning' in log:
+            lines.append("=" * 80)
+            lines.append("[11] Lower Limb Ratio Tuning")
+            lines.append("=" * 80)
+            tuning = log['lower_ratio_tuning']
+            lines.append(f"src_torso: {tuning.get('src_torso', 'N/A')}")
+            lines.append(f"trans_torso: {tuning.get('trans_torso', 'N/A')}")
+            lines.append(f"ratio_source: {tuning.get('ratio_source', 'N/A')}")
+            lines.append("")
+
+    # Face Transfer Details
     if result.processing_info and 'face_transfer_debug' in result.processing_info:
         face_debug = result.processing_info['face_transfer_debug']
         lines.append("=" * 80)
-        lines.append("[7] Face Transfer Details")
+        lines.append("[12] Face Transfer Details")
         lines.append("=" * 80)
-        if 'src_neck_nose_y' in face_debug:
-            lines.append(f"Source Neck→Nose Y: {face_debug['src_neck_nose_y']:.1f}px")
-        if 'trans_neck_nose_y' in face_debug:
-            lines.append(f"Transfer Neck→Nose Y: {face_debug['trans_neck_nose_y']:.1f}px")
         lines.append("")
+        
+        if 'src_neck_nose_y' in face_debug:
+            lines.append(f"🔹 Source (Src):")
+            lines.append(f"   Neck→Nose Y축 거리: {face_debug['src_neck_nose_y']:.1f}px")
+            lines.append("")
+        
+        if 'ref_neck_nose_y' in face_debug:
+            lines.append(f"🔹 Reference (Ref):")
+            lines.append(f"   Neck→Nose Y축 거리: {face_debug['ref_neck_nose_y']:.1f}px")
+            lines.append("")
+        
+        if 'trans_neck_nose_y' in face_debug:
+            lines.append(f"🔹 Transfer (Trans):")
+            lines.append(f"   Neck→Nose Y축 거리: {face_debug['trans_neck_nose_y']:.1f}px")
+            lines.append("")
     
     lines.append("=" * 80)
-    lines.append("[Note] This file is for debugging Pose Transfer results.")
+    lines.append("[Note]")
     lines.append("=" * 80)
+    lines.append("이 파일은 Pose Transfer 결과 분석을 위한 디버그 정보입니다.")
+    lines.append("")
     
     return "\n".join(lines)
 

@@ -53,163 +53,157 @@ class PoseTransferEngine:
     ) -> TransferResult:
         
         print("\n" + "="*70)
-        print("🔍 [DEBUG] PoseTransferEngine v30 (Dual Scaling: Torso-Width, Legs-Length)")
+        print("🔍 [DEBUG] PoseTransferEngine v36 (Auto-Save Report)")
         print("="*70)
         
-        # 0. Ref 기준으로 Src 누락 키포인트 생성
+        # ... (이전 코드와 동일: 0. 키포인트 생성 ~ 4. 초기화) ...
+        # 0. 키포인트 생성
         source_keypoints, source_scores = self.keypoint_generator.generate_missing_keypoints(
             source_keypoints, source_scores, reference_keypoints, reference_scores
         )
-        
-        # 1. 기본 설정
         if source_image_size is None:
             max_y = np.max(source_keypoints[:, 1])
             source_image_size = (int(max_y * 1.1), int(np.max(source_keypoints[:, 0])))
-
-        # 2. 하반신 유효성 체크
-        ref_lower_valid = True
-        if alignment_case in ['F_H', 'H_H']:
-            ref_lower_valid = False
-        else:
-            ref_knee_score = min(
-                reference_scores[BODY_KEYPOINTS['left_knee']], 
-                reference_scores[BODY_KEYPOINTS['right_knee']]
-            )
-            if ref_knee_score < 0.1:
-                ref_lower_valid = False
         
-        # 3. 데이터 추출 & 스케일 계산
+        ref_lower_valid = True
+        if alignment_case in ['F_H', 'H_H']: ref_lower_valid = False
+        elif min(reference_scores[13], reference_scores[14]) < 0.1: ref_lower_valid = False
+        
         source_proportions = self.bone_calculator.calculate(source_keypoints, source_scores)
         global_scale = self._calculate_global_scale(source_proportions, reference_keypoints, reference_scores)
-        
-        # 뼈 길이 보정
-        corrected_lengths = self._correct_bone_lengths(
-            source_proportions, 
-            global_scale, 
-            reference_keypoints, 
-            reference_scores
-        )
-        
+        corrected_lengths = self._correct_bone_lengths(source_proportions, global_scale, reference_keypoints, reference_scores)
         hand_scale_ratio = self._calculate_hand_scale_ratio(source_keypoints, source_scores, reference_keypoints, reference_scores)
         
-        # ----------------------------------------------------------------------
-        # 4. 결과 배열 초기화
-        # ----------------------------------------------------------------------
         num_kpts = len(source_keypoints)
         trans_kpts = np.zeros((num_kpts, 2))
         trans_scores = np.zeros(num_kpts)
-        transfer_log = {'face_parts': []}
+        transfer_log = {'face_parts': [], 'scale_arbitration': []}
         processed = set()
 
         # ══════════════════════════════════════════════════════════════
-        # STEP 1: Body Transfer (Torso Width Scaling)
+        # STEP 1: Body Transfer (With Report Generation)
         # ══════════════════════════════════════════════════════════════
-        print("\n🏃 Body Transfer...")
+        print("\n🏃 Body Transfer - Scale Arbitration")
         
-        # [핵심 수정] 몸통 비율(Torso Ratio)을 '높이'가 아닌 '어깨 너비' 기준으로 계산
-        ls, rs = 5, 6 
-        src_width = 0
-        ref_width = 0
-        
-        if source_scores[ls] > 0.1 and source_scores[rs] > 0.1:
-            src_width = np.linalg.norm(source_keypoints[ls] - source_keypoints[rs])
-            
-        if reference_scores[ls] > 0.1 and reference_scores[rs] > 0.1:
-            ref_width = np.linalg.norm(reference_keypoints[ls] - reference_keypoints[rs])
-            
-        # 어깨 없으면 힙 사용
-        if src_width == 0 or ref_width == 0:
-            lh, rh = 11, 12
-            if source_scores[lh] > 0.1 and source_scores[rh] > 0.1:
-                src_width = np.linalg.norm(source_keypoints[lh] - source_keypoints[rh])
-            if reference_scores[lh] > 0.1 and reference_scores[rh] > 0.1:
-                ref_width = np.linalg.norm(reference_keypoints[lh] - reference_keypoints[rh])
+        debug_lines = []
+        debug_lines.append("\n" + "="*80)
+        debug_lines.append("[7] Scale Arbitration Logic (Depth vs Spine)")
+        debug_lines.append("="*80)
 
-        # 최종 비율
-        if ref_width > 0:
-            torso_ratio = src_width / ref_width
-            torso_ratio = np.clip(torso_ratio, 0.5, 2.0)
-            print(f"   📐 Torso Scale Strategy: Width-Based (Src={src_width:.1f} / Ref={ref_width:.1f} -> {torso_ratio:.3f})")
+        # [A] Depth 신뢰도 평가
+        src_depth_reliability = 0.0
+        src_depth_range = 0.0
+        if source_depths is not None:
+            d_min, d_max = np.min(source_depths), np.max(source_depths)
+            src_depth_range = d_max - d_min
+            src_depth_reliability = 1.0 if src_depth_range > 0.35 else 0.1
+            debug_lines.append(f"1. Depth Check:")
+            debug_lines.append(f"   - Min: {d_min:.3f}, Max: {d_max:.3f}")
+            debug_lines.append(f"   - Range: {src_depth_range:.3f} (Threshold: 0.35)")
+            debug_lines.append(f"   - Reliability: {src_depth_reliability} {'(FAIL)' if src_depth_reliability < 0.5 else '(PASS)'}")
         else:
-            torso_ratio = 1.0
-            print(f"   ⚠️ Torso Scale Strategy: Default (Width calc failed)")
+            debug_lines.append(f"1. Depth Check: No Data -> Reliability=0.0")
 
-        # 기존 로직 수행
-        self.body_logic.transfer_shoulders(
-            trans_kpts, trans_scores, source_keypoints, source_scores,
-            reference_keypoints, torso_ratio=torso_ratio, processed=processed,
-            log=transfer_log, r_scores=reference_scores,
-        )
+        # [B] Spine 기하학적 증거 수집
+        ls, rs = 5, 6
+        nose_idx = 0
         
-        self.body_logic.transfer_torso(
-            trans_kpts, trans_scores, source_keypoints, source_scores, 
-            reference_keypoints, hand_scale_ratio, processed, transfer_log
-        )
+        src_width = np.linalg.norm(source_keypoints[ls]-source_keypoints[rs])
+        ref_width = np.linalg.norm(reference_keypoints[ls]-reference_keypoints[rs])
+        width_ratio = src_width / ref_width if ref_width > 0 else 1.0
         
-        # Upper Body Chain
-        self.body_logic.transfer_chain(
-            trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, 
-            hand_scale_ratio, processed, transfer_log, is_lower=False,
-            src_proportions=source_proportions, ref_proportions=self.bone_calculator.calculate(reference_keypoints, reference_scores),
-            src_depths=source_depths, ref_depths=reference_depths, depth_z_scale=depth_z_scale
-        )
+        src_face_size = np.linalg.norm(source_keypoints[3]-source_keypoints[4]) if (source_scores[3]>0.1) else 100
+        ref_face_size = np.linalg.norm(reference_keypoints[3]-reference_keypoints[4]) if (reference_scores[3]>0.1) else 100
+        face_ratio = src_face_size / ref_face_size if ref_face_size > 0 else 1.0
+
+        src_neck = (source_keypoints[ls] + source_keypoints[rs]) / 2.0
+        src_nose_neck = np.linalg.norm(source_keypoints[nose_idx] - src_neck)
+        src_spine_index = src_face_size / src_nose_neck if src_nose_neck > 1 else 10.0
         
+        debug_lines.append(f"2. Geometry Check:")
+        debug_lines.append(f"   - Width Ratio: {width_ratio:.4f} (Shoulder based)")
+        debug_lines.append(f"   - Face Ratio:  {face_ratio:.4f} (Head based)")
+        debug_lines.append(f"   - Src Spine Index: {src_spine_index:.4f} (High = Compressed/Vertical)")
+        
+       # [C] 판결 (The Verdict) - 로직 강화 버전
+        
+        # 1. 어깨 협소 체크
+        is_shoulder_too_narrow = width_ratio < face_ratio * 0.85
+        
+        # 2. Depth 신뢰도 체크
+        depth_explains_nothing = src_depth_reliability < 0.5
+        
+        # 3. 척추 압축 체크 (임계값 1.5)
+        spine_is_compressed = src_spine_index > 1.5
+        
+        # [NEW] 4. 강력한 척추 압축 체크 (임계값 1.8 - 이정도면 무조건 누운 것)
+        spine_critical = src_spine_index > 1.8
+
+        debug_lines.append(f"3. Logic Flags:")
+        debug_lines.append(f"   - [Flag] Shoulder Too Narrow? {is_shoulder_too_narrow} ({width_ratio:.3f} < {face_ratio*0.85:.3f})")
+        debug_lines.append(f"   - [Flag] Depth Unreliable?    {depth_explains_nothing}")
+        debug_lines.append(f"   - [Flag] Spine Compressed?    {spine_is_compressed} (idx={src_spine_index:.2f})")
+        debug_lines.append(f"   - [Flag] Spine CRITICAL?      {spine_critical} (Force Action)")
+
+        # 판결 로직 수정: Critical Spine이면 무조건 실행
+        if spine_critical:
+            verdict = "VERDICT: CRITICAL SPINE FORESHORTENING (Force Override)"
+            action = f"ACTION: Forcing Face Ratio ({face_ratio:.4f})"
+            torso_ratio = face_ratio
+            
+        elif is_shoulder_too_narrow and depth_explains_nothing and spine_is_compressed:
+            verdict = "VERDICT: TWIST/VERTICAL DETECTED (Depth Broken & Spine Compressed)"
+            action = f"ACTION: Forcing Face Ratio ({face_ratio:.4f})"
+            torso_ratio = face_ratio
+            
+        elif is_shoulder_too_narrow and not depth_explains_nothing:
+             verdict = "VERDICT: NARROW BUT DEPTH EXISTS (3D Perspective)"
+             action = f"ACTION: Blending Scales ({(width_ratio+face_ratio)/2:.4f})"
+             torso_ratio = (width_ratio + face_ratio) / 2
+             
+        else:
+            verdict = "VERDICT: STANDARD POSE"
+            action = f"ACTION: Using Width Ratio ({width_ratio:.4f})"
+            torso_ratio = width_ratio
+
+        final_ratio = np.clip(torso_ratio, 0.5, 2.0)
+        
+        debug_lines.append(f"4. Final Decision:")
+        debug_lines.append(f"   - {verdict}")
+        debug_lines.append(f"   - {action}")
+        debug_lines.append(f"   - Clamped Ratio: {final_ratio:.4f}")
+        
+        # [AUTO-PRINT] 콘솔에 즉시 출력
+        for line in debug_lines:
+            print(line)
+            
+        # [LOG SAVE] 나중에 저장을 위해 dict에 담기
+        transfer_log['scale_arbitration'] = "\n".join(debug_lines)
+
+        # 기존 로직 수행 (나머지 전체 코드 유지)
+        self.body_logic.transfer_shoulders(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, torso_ratio=final_ratio, processed=processed, log=transfer_log, r_scores=reference_scores)
+        self.body_logic.transfer_torso(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, hand_scale_ratio, processed, transfer_log)
+        self.body_logic.transfer_chain(trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log, is_lower=False, src_proportions=source_proportions, ref_proportions=self.bone_calculator.calculate(reference_keypoints, reference_scores), src_depths=source_depths, ref_depths=reference_depths, depth_z_scale=depth_z_scale)
         if getattr(self.config, 'enable_upper_ratio_tuning', True):
-            self.body_logic.fine_tune_upper_ratio(
-                trans_kpts, trans_scores, source_keypoints, source_scores,
-                reference_keypoints, reference_scores, processed, transfer_log,
-                source_depths=source_depths, depth_z_scale=depth_z_scale
-            )
-        
-        # Lower Body Chain
+            self.body_logic.fine_tune_upper_ratio(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, processed, transfer_log, source_depths=source_depths, depth_z_scale=depth_z_scale)
         if ref_lower_valid:
-            self.body_logic.transfer_chain(
-                trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, 
-                hand_scale_ratio, processed, transfer_log, is_lower=True,
-                src_proportions=source_proportions, ref_proportions=self.bone_calculator.calculate(reference_keypoints, reference_scores),
-                src_depths=source_depths, ref_depths=reference_depths, depth_z_scale=depth_z_scale
-            )
-            
-            self.body_logic.transfer_feet(
-                trans_kpts, trans_scores, source_keypoints, source_scores,
-                corrected_lengths, reference_keypoints, reference_scores,
-                hand_scale_ratio, processed, transfer_log
-            )
-            
+            self.body_logic.transfer_chain(trans_kpts, trans_scores, corrected_lengths, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log, is_lower=True, src_proportions=source_proportions, ref_proportions=self.bone_calculator.calculate(reference_keypoints, reference_scores), src_depths=source_depths, ref_depths=reference_depths, depth_z_scale=depth_z_scale)
+            self.body_logic.transfer_feet(trans_kpts, trans_scores, source_keypoints, source_scores, corrected_lengths, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log)
             if getattr(self.config, 'enable_lower_ratio_tuning', True):
-                self.body_logic.fine_tune_lower_ratio(
-                    trans_kpts, trans_scores, source_keypoints, source_scores,
-                    reference_keypoints, reference_scores, processed, transfer_log,
-                    source_depths=source_depths, depth_z_scale=depth_z_scale
-                )
-
-        # ══════════════════════════════════════════════════════════════
-        # STEP 1.5 ~ 4: 나머지 로직 (기존과 동일)
-        # ══════════════════════════════════════════════════════════════
+                self.body_logic.fine_tune_lower_ratio(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, processed, transfer_log, source_depths=source_depths, depth_z_scale=depth_z_scale)
         self._fill_missing_from_reference(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, hand_scale_ratio, processed, transfer_log)
-        
-        # Face
         self._transfer_ears_from_ref(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, processed, transfer_log)
-        self._transfer_body_face(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, body_scale=torso_ratio)
-        if self.config.use_face:
-            self._transfer_face_landmarks(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, source_depths, reference_depths, depth_z_scale, face_scale=self._face_transfer_debug.get('face_scale', 1.0))
+        self._transfer_body_face(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, body_scale=final_ratio)
+        if self.config.use_face: self._transfer_face_landmarks(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, source_depths, reference_depths, depth_z_scale, face_scale=self._face_transfer_debug.get('face_scale', 1.0))
+        if self.config.use_hands: self._transfer_hands(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, hand_scale_ratio, transfer_log)
         
-        # Hands
-        if self.config.use_hands:
-            self._transfer_hands(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, hand_scale_ratio, transfer_log)
-        
-        # Global Resize
         current_face_scale = self._face_transfer_debug.get('face_scale', 1.0)
         if current_face_scale > 0 and abs(current_face_scale - 1.0) > 0.05:
             resize_factor = 1.0 / current_face_scale
             resize_factor = np.clip(resize_factor, 0.5, 1.5)
-            
             ls, rs = 5, 6
-            if trans_scores[ls] > 0.1 and trans_scores[rs] > 0.1:
-                pivot = (trans_kpts[ls] + trans_kpts[rs]) / 2.0
-            else:
-                pivot = np.mean(trans_kpts[trans_scores>0.1], axis=0) if np.any(trans_scores>0.1) else np.array([0.,0.])
-            
+            if trans_scores[ls] > 0.1 and trans_scores[rs] > 0.1: pivot = (trans_kpts[ls] + trans_kpts[rs]) / 2.0
+            else: pivot = np.mean(trans_kpts[trans_scores>0.1], axis=0) if np.any(trans_scores>0.1) else np.array([0.,0.])
             mask = trans_scores > 0.0
             trans_kpts[mask] = pivot + (trans_kpts[mask] - pivot) * resize_factor
 
