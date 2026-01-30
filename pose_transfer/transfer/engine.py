@@ -1,18 +1,15 @@
 """
-PoseTransferEngine Module (Refactored v4.5 - Clean Separation)
+PoseTransferEngine Module (Refactored v6.0 - Depth Logging)
 
 위치: pose_transfer/transfer/engine.py
 변경사항:
-- [Fix] 내부 TransferConfig 클래스 삭제 -> config.py에서 import
+- [Fix] transfer 메서드에서 source_depths, reference_depths 인자 받음
+- [Fix] transfer_log에 Depth 통계 추가 (디버그 확인용)
 """
 import numpy as np
 from typing import Dict, Tuple, Optional, Any, TYPE_CHECKING
 from dataclasses import dataclass
-
-# [FIX] Config는 config.py에서 가져옴 (중복 정의 제거)
 from .config import TransferConfig
-
-# Logic Imports
 from .logic.body import BodyTransfer, BoneCalculator, BodyProportions
 from .logic.face import FaceTransfer
 from .logic.hands import HandTransfer
@@ -32,7 +29,6 @@ class TransferResult:
 class PoseTransferEngine:
     def __init__(self, config: TransferConfig = None, yaml_config: Optional[dict] = None):
         self.config = config or TransferConfig()
-        
         self.bone_calculator = BoneCalculator(self.config.confidence_threshold)
         self.body_logic = BodyTransfer(self.config)
         self.face_logic = FaceTransfer(self.config)
@@ -52,8 +48,8 @@ class PoseTransferEngine:
         source_image_size: Tuple[int, int],
         reference_image_size: Tuple[int, int],
         layout: Optional['TransferLayout'] = None,
-        source_depths: Optional[np.ndarray] = None,
-        reference_depths: Optional[np.ndarray] = None,
+        source_depths: Optional[np.ndarray] = None, # [Added]
+        reference_depths: Optional[np.ndarray] = None, # [Added]
         depth_z_scale: float = 1000.0
     ) -> TransferResult:
         
@@ -73,52 +69,40 @@ class PoseTransferEngine:
         else:
             global_scale = 1.0
 
+        # [Added] Depth Debug Log
+        if source_depths is not None:
+            print("   🧭 Source Depths Injected. (Avg: {:.2f})".format(np.mean(source_depths)))
+            transfer_log['depth_stats_src'] = {
+                'min': float(np.min(source_depths)),
+                'max': float(np.max(source_depths)),
+                'mean': float(np.mean(source_depths))
+            }
+
         # 1. Bone Calc
         source_proportions = self.bone_calculator.calculate(source_keypoints, source_scores)
         corrected_lengths = self._correct_bone_lengths(source_proportions, global_scale)
 
-        # 2. Body
-        self.body_logic.transfer_shoulders(
-            trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints,
-            corrected_lengths=corrected_lengths, processed=processed, log=transfer_log, r_scores=reference_scores
-        )
-        self.body_logic.transfer_torso(
-            trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints,
-            corrected_lengths=corrected_lengths, processed=processed, log=transfer_log
-        )
+        # 2. Logic Execution
+        self.body_logic.transfer_shoulders(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, corrected_lengths=corrected_lengths, processed=processed, log=transfer_log, r_scores=reference_scores)
+        self.body_logic.transfer_torso(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, corrected_lengths=corrected_lengths, processed=processed, log=transfer_log)
+        
+        # [Fix] Limbs에 Depth 정보 전달 (필요 시 Z축 활용)
         self.body_logic.transfer_limbs_chain(
             trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores,
             corrected_lengths=corrected_lengths, processed=processed, log=transfer_log,
             src_depths=source_depths, ref_depths=reference_depths, depth_z_scale=depth_z_scale
         )
 
-        # 3. Face
-        self.face_logic.transfer_structure(
-            trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores,
-            processed=processed, log=transfer_log, body_scale=global_scale
-        )
+        self.face_logic.transfer_structure(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, processed=processed, log=transfer_log, body_scale=global_scale)
         if self.config.use_face:
-            self.face_logic.transfer_landmarks(
-                trans_kpts, trans_scores, reference_keypoints, reference_scores, processed=processed
-            )
-        self.face_logic.transfer_ears_fallback(
-            trans_kpts, trans_scores, reference_keypoints, reference_scores, processed=processed
-        )
+            self.face_logic.transfer_landmarks(trans_kpts, trans_scores, reference_keypoints, reference_scores, processed=processed)
+        self.face_logic.transfer_ears_fallback(trans_kpts, trans_scores, reference_keypoints, reference_scores, processed=processed)
 
-        # 4. Hands
         if self.config.use_hands:
-            self.hand_logic.transfer_hands(
-                trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores,
-                hand_scale_ratio=global_scale, log=transfer_log
-            )
+            self.hand_logic.transfer_hands(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, hand_scale_ratio=global_scale, log=transfer_log)
 
-        # 5. Repair
-        self._fill_missing_from_reference(
-            trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores,
-            global_scale=global_scale, processed=processed, log=transfer_log
-        )
+        self._fill_missing_from_reference(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, global_scale=global_scale, processed=processed, log=transfer_log)
 
-        # 6. Offset
         if layout and layout.offset_vector is not None:
             offset = layout.offset_vector
             valid_mask = trans_scores > 0
@@ -132,8 +116,9 @@ class PoseTransferEngine:
             corrected_bone_lengths=corrected_lengths,
             transfer_log=transfer_log
         )
-
+        
     def _fill_missing_from_reference(self, trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores, global_scale, processed, log):
+        # (기존 로직 동일)
         parent_map = { 7: 5, 9: 7, 8: 6, 10: 8, 13: 11, 15: 13, 14: 12, 16: 14, 17: 15, 18: 15, 19: 15, 20: 16, 21: 16, 22: 16 }
         filled_cnt = 0
         for idx in range(len(trans_scores)):
