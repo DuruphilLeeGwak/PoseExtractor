@@ -13,6 +13,7 @@ from .config import TransferConfig
 from .logic.body import BodyTransfer, BoneCalculator, BodyProportions
 from .logic.face import FaceTransfer
 from .logic.hands import HandTransfer
+from .logic.feets import FeetTransfer
 from ..utils.geometry import calculate_distance
 
 if TYPE_CHECKING:
@@ -33,6 +34,7 @@ class PoseTransferEngine:
         self.body_logic = BodyTransfer(self.config)
         self.face_logic = FaceTransfer(self.config)
         self.hand_logic = HandTransfer(self.config)
+        self.feet_logic = FeetTransfer(self.config)
 
     def _correct_bone_lengths(self, source_proportions, target_scale):
         corrected = {}
@@ -78,13 +80,15 @@ class PoseTransferEngine:
                 'mean': float(np.mean(source_depths))
             }
 
-        # 1. Bone Calc
-        source_proportions = self.bone_calculator.calculate(source_keypoints, source_scores)
+        # 1. Bone Calc (Source에는 대칭 적용!)
+        # [Fix] is_source=True 추가 -> 좌우 평균화 수행
+        source_proportions = self.bone_calculator.calculate(source_keypoints, source_scores, is_source=True)
+        
         corrected_lengths = self._correct_bone_lengths(source_proportions, global_scale)
 
         # 2. Logic Execution
         self.body_logic.transfer_shoulders(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, corrected_lengths=corrected_lengths, processed=processed, log=transfer_log, r_scores=reference_scores)
-        self.body_logic.transfer_torso(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, corrected_lengths=corrected_lengths, processed=processed, log=transfer_log)
+        self.body_logic.transfer_torso(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, corrected_lengths=corrected_lengths, processed=processed, log=transfer_log,ref_scores=reference_scores)
         
         # [Fix] Limbs에 Depth 정보 전달 (필요 시 Z축 활용)
         self.body_logic.transfer_limbs_chain(
@@ -97,6 +101,16 @@ class PoseTransferEngine:
         if self.config.use_face:
             self.face_logic.transfer_landmarks(trans_kpts, trans_scores, reference_keypoints, reference_scores, processed=processed)
         self.face_logic.transfer_ears_fallback(trans_kpts, trans_scores, reference_keypoints, reference_scores, processed=processed)
+        
+        # [New] Feet Transfer Execution
+        self.feet_logic.transfer_feet(
+                trans_kpts, trans_scores, 
+                source_keypoints, source_scores, 
+                reference_keypoints, reference_scores, 
+                global_scale=global_scale, 
+                log=transfer_log
+            )
+            
 
         if self.config.use_hands:
             self.hand_logic.transfer_hands(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, hand_scale_ratio=global_scale, log=transfer_log)

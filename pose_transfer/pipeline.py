@@ -221,7 +221,8 @@ class PoseTransferPipeline:
             
         lines.append(f"\n[4] Bone Lengths (Pixel)")
         lines.append(f"{'-'*80}")
-        props = self.bone_calculator.calculate(kpts, scores)
+        is_src = (tag == "SRC")
+        props = self.bone_calculator.calculate(kpts, scores, is_source=is_src)
         if props and props.bone_lengths:
             for name, info in sorted(props.bone_lengths.items()):
                 valid_mark = "" if info.is_valid else "(Invalid)"
