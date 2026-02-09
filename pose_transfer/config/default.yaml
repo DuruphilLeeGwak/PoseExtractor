@@ -149,7 +149,7 @@ output:
   
   # ===== 기타 옵션 =====
   auto_crop_enabled: false
-  canvas_padding_ratio: 0
+  canvas_padding_ratio: 0.1      # 패딩된 방향에만 추가 여유 (가로=이미지W의 %, 세로=이미지H의 %)
   crop_padding_px: 0
   head_padding_ratio: 0.5
 

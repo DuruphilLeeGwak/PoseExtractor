@@ -55,29 +55,29 @@ class CanvasManager:
                 # print("   🖼️ Canvas: Fit perfectly. No expansion.")
                 return image, keypoints, (h, w)
 
-        # 확장 필요성 계산 (또는 패딩 요청 시)
+        # 확장 필요성 계산
         # 이미지 경계와 키포인트 경계 중 더 넓은 범위를 잡음
         current_min_x = min(0, min_x)
         current_min_y = min(0, min_y)
         current_max_x = max(w, max_x)
         current_max_y = max(h, max_y)
         
-        # 패딩 추가
-        roi_w = current_max_x - current_min_x
-        roi_h = current_max_y - current_min_y
-        pad_w = int(roi_w * padding_ratio)
-        pad_h = int(roi_h * padding_ratio)
+        # 기본 확장량 계산 (키포인트가 이미지 밖으로 나간 양)
+        base_pad_left = abs(current_min_x) if current_min_x < 0 else 0
+        base_pad_top = abs(current_min_y) if current_min_y < 0 else 0
+        base_pad_right = (current_max_x - w) if current_max_x > w else 0
+        base_pad_bottom = (current_max_y - h) if current_max_y > h else 0
         
-        target_min_x = int(current_min_x - pad_w)
-        target_min_y = int(current_min_y - pad_h)
-        target_max_x = int(current_max_x + pad_w)
-        target_max_y = int(current_max_y + pad_h)
+        # [수정] 패딩된 방향에만 추가 여유 패딩 적용
+        # 가로 패딩 = 이미지 가로(w)의 %, 세로 패딩 = 이미지 세로(h)의 %
+        extra_pad_h = int(w * padding_ratio)  # 가로방향 여유 (좌/우)
+        extra_pad_v = int(h * padding_ratio)  # 세로방향 여유 (상/하)
         
-        # 확장이 필요한 양 계산
-        pad_left = abs(target_min_x) if target_min_x < 0 else 0
-        pad_top = abs(target_min_y) if target_min_y < 0 else 0
-        pad_right = (target_max_x - w) if target_max_x > w else 0
-        pad_bottom = (target_max_y - h) if target_max_y > h else 0
+        # 패딩된 방향에만 추가 여유 적용
+        pad_left = int(base_pad_left + extra_pad_h) if base_pad_left > 0 else 0
+        pad_top = int(base_pad_top + extra_pad_v) if base_pad_top > 0 else 0
+        pad_right = int(base_pad_right + extra_pad_h) if base_pad_right > 0 else 0
+        pad_bottom = int(base_pad_bottom + extra_pad_v) if base_pad_bottom > 0 else 0
         
         # 최종 확인: 패딩이 0이면 원본 반환
         if pad_left == 0 and pad_top == 0 and pad_right == 0 and pad_bottom == 0:
