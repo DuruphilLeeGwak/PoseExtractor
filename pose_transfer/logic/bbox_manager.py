@@ -202,6 +202,10 @@ class BboxManager:
         y1 = max(0, int(y1 - (x2-x1)*0.6))
         return BboxInfo(x1, y1, x2, y2, ((x1+x2)//2, (y1+y2)//2))
 
+    def _kpt_to_face_public(self, kpts, scores) -> BboxInfo:
+        """img_size 없이 호출 가능한 래퍼 메서드"""
+        return self._kpt_to_face(kpts, scores, img_size=None)
+
     def draw_debug(self, image: np.ndarray, debug_data: DebugBboxData) -> np.ndarray:
         vis = image.copy()
         

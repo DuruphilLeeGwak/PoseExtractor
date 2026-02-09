@@ -270,6 +270,159 @@ class PoseTransferPipeline:
                 
         return "\n".join(lines)
 
+    def _get_ground_y(self, kpts, scores):
+        """발바닥 Y 좌표 반환 (가장 아래쪽 발 키포인트)"""
+        foot_indices = [15, 16, 17, 18, 19, 20, 21, 22]
+        valid_ys = []
+        for idx in foot_indices:
+            if idx < len(kpts) and scores[idx] > 0.1:
+                valid_ys.append(kpts[idx][1])
+        return max(valid_ys) if valid_ys else 0
+
+    def _sync_scale_to_source_face(self, trans_kpts, trans_scores, src_face, align_by_feet=True):
+        """
+        Source 얼굴 크기에 맞춰 전이된 키포인트 스케일 동기화
+        
+        정책:
+        - align_by_feet=True (발 정렬): 얼굴 관련 키포인트만 Pivot 기준 스케일링
+        - align_by_feet=False (얼굴 정렬): 전체 키포인트 동일 배율 스케일링
+        """
+        # Trans 얼굴 bbox 계산
+        current_trans_face = self.bbox_mgr._kpt_to_face_public(trans_kpts, trans_scores)
+        
+        # size = max(width, height) 로 계산
+        trans_face_size = max(current_trans_face.width, current_trans_face.height)
+        src_face_size = max(src_face.width, src_face.height)
+        
+        if trans_face_size <= 1 or src_face_size <= 1:
+            return trans_kpts, 1.0
+
+        scale_factor = float(np.clip(src_face_size / trans_face_size, 0.5, 2.0))
+        if abs(scale_factor - 1.0) < 0.01:
+            return trans_kpts, 1.0
+
+        scaled = trans_kpts.copy()
+
+        # 발 정렬 모드: 어깨(Neck) 기준 Pivot으로 전체 스케일링
+        if align_by_feet:
+            LS, RS = 5, 6
+            if trans_scores[LS] > 0.1 and trans_scores[RS] > 0.1:
+                pivot = (trans_kpts[LS] + trans_kpts[RS]) / 2.0
+            else:
+                pivot = np.array(current_trans_face.center, dtype=np.float32)
+
+            # 전체 키포인트를 Pivot 기준으로 스케일링
+            for idx in range(len(trans_scores)):
+                if trans_scores[idx] > 0.1:
+                    scaled[idx] = pivot + (scaled[idx] - pivot) * scale_factor
+
+            return scaled, scale_factor
+
+        # 얼굴 정렬 모드: 전체 스켈레톤 스케일링
+        scaled *= scale_factor
+        return scaled, scale_factor
+
+    def _sync_scale_to_source_face_feet_pivot(self, trans_kpts, trans_scores, src_face):
+        """
+        발을 Pivot으로 전체 스켈레톤 스케일링
+        - 발 위치 고정, 위쪽으로 확대/축소
+        - scale < 1: 스켈레톤 축소 (머리가 내려감)
+        - scale > 1: 스켈레톤 확대 (머리가 올라감)
+        """
+        # Trans 얼굴 bbox 계산
+        current_trans_face = self.bbox_mgr._kpt_to_face_public(trans_kpts, trans_scores)
+        
+        # size = max(width, height)
+        trans_face_size = max(current_trans_face.width, current_trans_face.height)
+        src_face_size = max(src_face.width, src_face.height)
+        
+        if trans_face_size <= 1 or src_face_size <= 1:
+            return trans_kpts, 1.0
+
+        scale_factor = float(np.clip(src_face_size / trans_face_size, 0.3, 3.0))
+        if abs(scale_factor - 1.0) < 0.01:
+            return trans_kpts, 1.0
+
+        scaled = trans_kpts.copy()
+        
+        # Pivot: 발바닥 위치 (가장 아래쪽 Y)
+        foot_y = self._get_ground_y(trans_kpts, trans_scores)
+        if foot_y <= 0:
+            # 발이 없으면 발목 사용
+            LA, RA = 15, 16
+            if trans_scores[LA] > 0.1:
+                foot_y = trans_kpts[LA][1]
+            elif trans_scores[RA] > 0.1:
+                foot_y = trans_kpts[RA][1]
+            else:
+                return trans_kpts, 1.0  # 발 정보 없음
+        
+        # X축 중심
+        valid_xs = trans_kpts[trans_scores > 0][:, 0]
+        pivot_x = np.mean(valid_xs) if len(valid_xs) > 0 else 0
+        pivot = np.array([pivot_x, foot_y])
+        
+        # 전체 키포인트를 발 Pivot 기준으로 스케일링
+        for idx in range(len(trans_scores)):
+            if trans_scores[idx] > 0.1:
+                scaled[idx] = pivot + (scaled[idx] - pivot) * scale_factor
+
+        return scaled, scale_factor
+
+    def _get_body_height(self, kpts, scores):
+        """어깨 중심 ~ 발바닥 거리 (Body Height)"""
+        LS, RS = 5, 6
+        if scores[LS] < 0.1 or scores[RS] < 0.1:
+            return 0
+        shoulder_y = (kpts[LS][1] + kpts[RS][1]) / 2
+        foot_y = self._get_ground_y(kpts, scores)
+        if foot_y <= 0:
+            # 발바닥 없으면 발목 사용
+            LA, RA = 15, 16
+            if scores[LA] > 0.1:
+                foot_y = kpts[LA][1]
+            elif scores[RA] > 0.1:
+                foot_y = kpts[RA][1]
+        if foot_y <= shoulder_y:
+            return 0
+        return foot_y - shoulder_y
+
+    def _sync_body_height(self, trans_kpts, trans_scores, src_kpts, src_scores):
+        """
+        Src 사람 높이에 맞춰 Trans 스켈레톤 스케일링 (어깨 Pivot)
+        - 어깨 고정, 아래쪽으로 확장하여 발 위치를 Src에 맞춤
+        """
+        src_height = self._get_body_height(src_kpts, src_scores)
+        trans_height = self._get_body_height(trans_kpts, trans_scores)
+        
+        if src_height <= 0 or trans_height <= 0:
+            return trans_kpts, 1.0
+        
+        scale_factor = src_height / trans_height
+        scale_factor = float(np.clip(scale_factor, 0.5, 3.0))
+        
+        if abs(scale_factor - 1.0) < 0.01:
+            return trans_kpts, 1.0
+        
+        scaled = trans_kpts.copy()
+        
+        # Pivot: 어깨 중심 (어깨 고정, 아래로 확장)
+        LS, RS = 5, 6
+        if trans_scores[LS] > 0.1 and trans_scores[RS] > 0.1:
+            shoulder_y = (trans_kpts[LS][1] + trans_kpts[RS][1]) / 2
+            pivot_x = (trans_kpts[LS][0] + trans_kpts[RS][0]) / 2
+        else:
+            return trans_kpts, 1.0
+        
+        pivot = np.array([pivot_x, shoulder_y])
+        
+        # 전체 키포인트를 어깨 Pivot 기준으로 스케일링
+        for idx in range(len(trans_scores)):
+            if trans_scores[idx] > 0.1:
+                scaled[idx] = pivot + (scaled[idx] - pivot) * scale_factor
+        
+        return scaled, scale_factor
+
     def transfer(self, source_image, reference_image):
         if isinstance(source_image, (str, Path)): src_img = load_image(source_image)
         else: src_img = source_image
@@ -298,6 +451,52 @@ class PoseTransferPipeline:
         )
         
         trans_kpts, trans_scores = result.keypoints, result.scores
+        
+        # 디버그: Engine 출력 직후 어깨/발 위치
+        LS, RS = 5, 6
+        LA, RA = 15, 16  # Ankle
+        if trans_scores[LS] > 0.1 and trans_scores[RS] > 0.1:
+            print(f"   [DEBUG] After Engine - Shoulder Y: {(trans_kpts[LS][1] + trans_kpts[RS][1])/2:.0f}")
+        if trans_scores[LA] > 0.1 and trans_scores[RA] > 0.1:
+            print(f"   [DEBUG] After Engine - Ankle Y: {(trans_kpts[LA][1] + trans_kpts[RA][1])/2:.0f}")
+        
+        # [Post-Processing 1] Layout Offset 적용 (Ref → Src 위치 이동)
+        # Engine에서 Ref 좌표계로 생성되었으므로, 먼저 Src 위치로 이동
+        if hasattr(layout, 'offset_vector') and layout.offset_vector is not None:
+            offset_vec = np.array(layout.offset_vector, dtype=np.float32)
+            mask = (trans_scores > 0)
+            trans_kpts[mask] += offset_vec
+            print(f"   🚚 [Pipeline] Layout Offset Applied: {offset_vec.astype(int)}")
+            # 디버그: Offset 적용 후 어깨 위치
+            if trans_scores[LS] > 0.1 and trans_scores[RS] > 0.1:
+                print(f"   [DEBUG] After Offset - Shoulder Y: {(trans_kpts[LS][1] + trans_kpts[RS][1])/2:.0f}")
+        
+        # [Post-Processing 2] Body Height 기반 스케일링
+        # Src 사람 높이에 맞춰 Trans 스켈레톤 스케일링 (어깨 Pivot)
+        trans_kpts, body_scale = self._sync_body_height(trans_kpts, trans_scores, src_kpts, src_scores)
+        if abs(body_scale - 1.0) > 0.01:
+            print(f"   📏 [Pipeline] Body Scale Applied: {body_scale:.3f}")
+        
+        # [Post-Processing 3] 발 정렬 미세 조정
+        src_foot_y = self._get_ground_y(src_kpts, src_scores)
+        trans_foot_y = self._get_ground_y(trans_kpts, trans_scores)
+        # 스케일링 후 발 위치가 Src와 어긋날 수 있음
+        src_foot_y = self._get_ground_y(src_kpts, src_scores)
+        trans_foot_y = self._get_ground_y(trans_kpts, trans_scores)
+        
+        if src_foot_y > 0 and trans_foot_y > 0:
+            offset_y = src_foot_y - trans_foot_y
+            # X축은 Src bbox 중앙과 Trans 중앙 맞춤
+            src_center_x = (src_bbox.x1 + src_bbox.x2) / 2
+            trans_xs = trans_kpts[trans_scores > 0][:, 0]
+            trans_center_x = (np.min(trans_xs) + np.max(trans_xs)) / 2 if len(trans_xs) > 0 else src_center_x
+            offset_x = src_center_x - trans_center_x
+            
+            feet_align_offset = np.array([offset_x, offset_y])
+            mask = (trans_scores > 0)
+            trans_kpts[mask] += feet_align_offset
+            print(f"   🦶 [Pipeline] Feet Align Offset: {feet_align_offset.astype(int)}")
+        
         final_img, final_kpts, final_size = self.canvas_mgr.expand_canvas_to_fit(src_img, trans_kpts, trans_scores, padding_ratio=self.config.canvas_padding_ratio)
         skeleton_img = self.renderer.render_skeleton_only((final_size[0], final_size[1], 3), final_kpts, trans_scores)
         

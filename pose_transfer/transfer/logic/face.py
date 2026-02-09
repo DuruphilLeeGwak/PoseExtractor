@@ -73,13 +73,18 @@ class FaceTransfer:
             ref_face_width = 100.0
 
         # [핵심] Face Scale 결정
-        # 목표: "Src의 얼굴 비율"을 유지해야 함 (SrcFaceWidth * BodyRatio)
-        # 즉, 몸이 2배 커졌으면 얼굴도 Src보다 2배 커져야 함. 그걸 Ref 얼굴 크기와 비교하여 Scale 산출.
-        target_face_width = src_face_width * body_ratio
-        face_scale = target_face_width / ref_face_width if ref_face_width > 0 else 1.0
+        # Src 좌표계에서 바디가 생성되었으므로, 얼굴도 Src 비율 유지
+        # Src 얼굴 크기를 그대로 사용 (body와 일관성 유지)
         
-        # 안전장치 (0.3배 ~ 3.0배 제한)
-        face_scale = float(np.clip(face_scale, 0.3, 3.0))
+        # Src 얼굴/어깨 비율 유지
+        face_to_shoulder_ratio = src_face_width / src_shoulder_width if src_shoulder_width > 0 else 0.5
+        
+        # Trans에서의 목표 얼굴 너비 = Trans 어깨 너비 * Src 비율
+        target_face_width = trans_shoulder_width * face_to_shoulder_ratio
+        
+        # Face Scale = Src 목표 얼굴 / Ref 얼굴 (Ref 얼굴을 Src 크기로 스케일링)
+        face_scale = target_face_width / ref_face_width if ref_face_width > 0 else 1.0
+        face_scale = np.clip(face_scale, 0.3, 3.0)  # 안전 범위
 
         # ---------------------------------------------------------
         # 2. Pivot Calculation (목 -> 눈 중심)

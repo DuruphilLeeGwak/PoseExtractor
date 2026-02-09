@@ -1,148 +1,117 @@
 """
-PoseTransferEngine Module (Refactored v6.0 - Depth Logging)
+Pose Transfer Engine (Refactored for Post-Alignment)
 
 위치: pose_transfer/transfer/engine.py
 변경사항:
-- [Fix] transfer 메서드에서 source_depths, reference_depths 인자 받음
-- [Fix] transfer_log에 Depth 통계 추가 (디버그 확인용)
+- [Critical] 본 생성 과정 중에는 Offset 적용 금지
+- [Critical] 모든 생성 완료 후, 마지막에 Offset을 일괄 적용 (Post-Alignment)
 """
 import numpy as np
-from typing import Dict, Tuple, Optional, Any, TYPE_CHECKING
-from dataclasses import dataclass
+import logging
+from typing import Optional, Dict
 from .config import TransferConfig
-from .logic.body import BodyTransfer, BoneCalculator, BodyProportions
+from .logic.body import BodyTransfer
 from .logic.face import FaceTransfer
 from .logic.hands import HandTransfer
 from .logic.feets import FeetTransfer
-from ..utils.geometry import calculate_distance
-
-if TYPE_CHECKING:
-    from ..logic.align_manager import TransferLayout
-
-@dataclass
-class TransferResult:
-    keypoints: np.ndarray
-    scores: np.ndarray
-    source_bone_lengths: Dict[str, float] = None
-    corrected_bone_lengths: Dict[str, float] = None
-    transfer_log: Dict[str, Any] = None
 
 class PoseTransferEngine:
     def __init__(self, config: TransferConfig = None, yaml_config: Optional[dict] = None):
         self.config = config or TransferConfig()
-        self.bone_calculator = BoneCalculator(self.config.confidence_threshold)
+        if yaml_config:
+            self.config.update_from_yaml(yaml_config)
+            
         self.body_logic = BodyTransfer(self.config)
         self.face_logic = FaceTransfer(self.config)
         self.hand_logic = HandTransfer(self.config)
         self.feet_logic = FeetTransfer(self.config)
 
-    def _correct_bone_lengths(self, source_proportions, target_scale):
-        corrected = {}
-        for bone_name, info in source_proportions.bone_lengths.items():
-            if info.is_valid: corrected[bone_name] = info.length * target_scale
-            else: corrected[bone_name] = 0.0
-        return corrected
-
-    def transfer(
-        self,
-        source_keypoints: np.ndarray, source_scores: np.ndarray,
-        reference_keypoints: np.ndarray, reference_scores: np.ndarray,
-        source_image_size: Tuple[int, int],
-        reference_image_size: Tuple[int, int],
-        layout: Optional['TransferLayout'] = None,
-        source_depths: Optional[np.ndarray] = None, # [Added]
-        reference_depths: Optional[np.ndarray] = None, # [Added]
-        depth_z_scale: float = 1000.0
-    ) -> TransferResult:
+    def transfer(self, source_keypoints, source_scores, reference_keypoints, reference_scores,
+                  source_size=None, reference_size=None, layout=None, 
+                  source_depths=None, reference_depths=None, log_callback=None):
+        # source_size, reference_size, depths are optional - reserved for future use
         
-        print("\n" + "="*70)
-        print("⚙️ [Engine] Executing Transfer")
-        print("="*70)
-
-        num_kpts = len(source_keypoints)
-        trans_kpts = np.zeros((num_kpts, 2), dtype=np.float32)
-        trans_scores = np.zeros(num_kpts, dtype=np.float32)
         transfer_log = {}
+
+        # 0. 초기화 (Canvas)
+        trans_kpts = np.zeros_like(source_keypoints)
+        trans_scores = np.zeros_like(source_scores)
         processed = set()
-
-        if layout:
-            global_scale = layout.global_scale
-            print(f"   📋 Layout Applied: Scale={global_scale:.3f}, Anchor={layout.anchor_type}")
-        else:
-            global_scale = 1.0
-
-        # [Added] Depth Debug Log
-        if source_depths is not None:
-            print("   🧭 Source Depths Injected. (Avg: {:.2f})".format(np.mean(source_depths)))
-            transfer_log['depth_stats_src'] = {
-                'min': float(np.min(source_depths)),
-                'max': float(np.max(source_depths)),
-                'mean': float(np.mean(source_depths))
-            }
-
-        # 1. Bone Calc (Source에는 대칭 적용!)
-        # [Fix] is_source=True 추가 -> 좌우 평균화 수행
-        source_proportions = self.bone_calculator.calculate(source_keypoints, source_scores, is_source=True)
         
-        corrected_lengths = self._correct_bone_lengths(source_proportions, global_scale)
-
-        # 2. Logic Execution
-        self.body_logic.transfer_shoulders(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, corrected_lengths=corrected_lengths, processed=processed, log=transfer_log, r_scores=reference_scores)
-        self.body_logic.transfer_torso(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, corrected_lengths=corrected_lengths, processed=processed, log=transfer_log,ref_scores=reference_scores)
+        # 1. Body Proportion Analysis
+        # Src 신체 비율 계산 (Src 길이 + Ref 벡터 방식)
+        src_props = self.body_logic.calculator.calculate(source_keypoints, source_scores, is_source=True)
+        corrected_lengths = {k: v.length for k, v in src_props.bone_lengths.items()}
+        corrected_lengths['shoulder_width'] = src_props.shoulder_width
+        corrected_lengths['hip_width'] = src_props.hip_width
+        # Torso 길이도 추가 (BodyTransfer.transfer_torso에서 사용)
+        if 'left_torso' in src_props.bone_lengths:
+            corrected_lengths['left_torso'] = src_props.bone_lengths['left_torso'].length
+        if 'right_torso' in src_props.bone_lengths:
+            corrected_lengths['right_torso'] = src_props.bone_lengths['right_torso'].length
         
-        # [Fix] Limbs에 Depth 정보 전달 (필요 시 Z축 활용)
+        # DEBUG: 본 길이 출력
+        lt = corrected_lengths.get('left_torso', 0)
+        rt = corrected_lengths.get('right_torso', 0)
+        lul = corrected_lengths.get('left_upper_leg', 0)
+        lll = corrected_lengths.get('left_lower_leg', 0)
+        print(f"   [DEBUG Engine] Bone Lengths: torso={lt:.0f}/{rt:.0f}, leg={lul:.0f}+{lll:.0f}")
+
+        # =====================================================================
+        # Phase 1: Skeleton Generation (In Reference Coordinate Space)
+        # =====================================================================
+        # 모든 부위를 Ref 위치 기준으로 생성합니다. Offset 적용 안 함.
+        
+        # A. Shoulders
+        self.body_logic.transfer_shoulders(
+            trans_kpts, trans_scores, source_keypoints, source_scores, 
+            reference_keypoints, corrected_lengths, processed, transfer_log, reference_scores, layout
+        )
+        
+        # B. Torso
+        self.body_logic.transfer_torso(
+            trans_kpts, trans_scores, source_keypoints, source_scores, 
+            reference_keypoints, corrected_lengths, processed, transfer_log, reference_scores, layout
+        )
+        
+        # C. Limbs (Arms, Legs) - Excludes Feet
         self.body_logic.transfer_limbs_chain(
-            trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores,
-            corrected_lengths=corrected_lengths, processed=processed, log=transfer_log,
-            src_depths=source_depths, ref_depths=reference_depths, depth_z_scale=depth_z_scale
+            trans_kpts, trans_scores, source_keypoints, source_scores, 
+            reference_keypoints, reference_scores, corrected_lengths, processed, transfer_log, layout=layout
         )
-
-        self.face_logic.transfer_structure(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, processed=processed, log=transfer_log, body_scale=global_scale)
-        if self.config.use_face:
-            self.face_logic.transfer_landmarks(trans_kpts, trans_scores, reference_keypoints, reference_scores, processed=processed)
-        self.face_logic.transfer_ears_fallback(trans_kpts, trans_scores, reference_keypoints, reference_scores, processed=processed)
         
-        # [New] Feet Transfer Execution
+        # D. Feet (독립 모듈)
         self.feet_logic.transfer_feet(
-                trans_kpts, trans_scores, 
-                source_keypoints, source_scores, 
-                reference_keypoints, reference_scores, 
-                global_scale=global_scale, 
-                log=transfer_log
-            )
-            
-
-        if self.config.use_hands:
-            self.hand_logic.transfer_hands(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, hand_scale_ratio=global_scale, log=transfer_log)
-
-        self._fill_missing_from_reference(trans_kpts, trans_scores, source_keypoints, source_scores, reference_keypoints, reference_scores, global_scale=global_scale, processed=processed, log=transfer_log)
-
-        if layout and layout.offset_vector is not None:
-            offset = layout.offset_vector
-            valid_mask = trans_scores > 0
-            trans_kpts[valid_mask] += offset
-            print(f"   🚚 Final Alignment Offset: {offset.astype(int)}")
-
-        return TransferResult(
-            keypoints=trans_kpts,
-            scores=trans_scores,
-            source_bone_lengths={k: v.length for k, v in source_proportions.bone_lengths.items()},
-            corrected_bone_lengths=corrected_lengths,
-            transfer_log=transfer_log
+            trans_kpts, trans_scores, source_keypoints, source_scores,
+            reference_keypoints, reference_scores, 
+            global_scale=layout.global_scale, log=transfer_log
         )
         
-    def _fill_missing_from_reference(self, trans_kpts, trans_scores, src_kpts, src_scores, ref_kpts, ref_scores, global_scale, processed, log):
-        # (기존 로직 동일)
-        parent_map = { 7: 5, 9: 7, 8: 6, 10: 8, 13: 11, 15: 13, 14: 12, 16: 14, 17: 15, 18: 15, 19: 15, 20: 16, 21: 16, 22: 16 }
-        filled_cnt = 0
-        for idx in range(len(trans_scores)):
-            if trans_scores[idx] < 0.01 and ref_scores[idx] > 0.3:
-                parent = parent_map.get(idx)
-                if parent is not None and trans_scores[parent] > 0.1:
-                    parent_pos = trans_kpts[parent]
-                    ref_vec = ref_kpts[idx] - ref_kpts[parent]
-                    trans_kpts[idx] = parent_pos + ref_vec * global_scale
-                    trans_scores[idx] = ref_scores[idx] * 0.6
-                    filled_cnt += 1
-        if filled_cnt > 0:
-            print(f"   🔧 Repaired {filled_cnt} missing keypoints.")
+        # E. Face & Hands (독립 모듈)
+        self.face_logic.transfer_structure(
+            trans_kpts, trans_scores, source_keypoints, source_scores,
+            reference_keypoints, reference_scores, processed, transfer_log,
+            body_scale=layout.global_scale if layout else 1.0
+        )
+        self.face_logic.transfer_landmarks(
+            trans_kpts, trans_scores,
+            reference_keypoints, reference_scores, processed
+        )
+        self.hand_logic.transfer_hands(
+            trans_kpts, trans_scores, source_keypoints, source_scores,
+            reference_keypoints, reference_scores, 
+            hand_scale_ratio=layout.global_scale if layout else 1.0, 
+            log=transfer_log
+        )
+
+        # =====================================================================
+        # Phase 2: Return Results (Offset will be applied in Pipeline after Face Scale)
+        # =====================================================================
+
+        # 결과 반환 (namespace object for attribute access)
+        class TransferOutput:
+            def __init__(self, kpts, scores, log):
+                self.keypoints = kpts
+                self.scores = scores
+                self.transfer_log = log
+        return TransferOutput(trans_kpts, trans_scores, transfer_log)

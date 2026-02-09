@@ -12,8 +12,11 @@ except ImportError:
     from .config import TransferConfig
     # FaceRenderingConfig가 삭제되었다면 패스
 
-# [Engine] 엔진 및 결과 데이터 (TransferResult는 engine.py에 있음)
-from .engine import PoseTransferEngine, TransferResult
+# [Engine] 엔진 클래스
+from .engine import PoseTransferEngine
+
+# [TransferResult] 결과 데이터 (utils/io.py에 있음)
+from ..utils.io import TransferResult
 
 # [Fallback] 폴백 전략 (기존 파일 유지)
 from .fallback import FallbackStrategy, FallbackResult, apply_fallback
