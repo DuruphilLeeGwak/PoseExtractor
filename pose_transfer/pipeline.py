@@ -389,37 +389,55 @@ class PoseTransferPipeline:
 
     def _sync_body_height(self, trans_kpts, trans_scores, src_kpts, src_scores):
         """
-        Src 사람 높이에 맞춰 Trans 스켈레톤 스케일링 (어깨 Pivot)
-        - 어깨 고정, 아래쪽으로 확장하여 발 위치를 Src에 맞춤
+        [변경] 머리 사이즈 기준으로 전체 스케일링 (Src 발 위치로 Pivot)
+        - Src 발 위치에 맞춰 스케일링하여 발 정렬 불필요하게 함
+        - 어깨라인 맞춤 X
         """
-        src_height = self._get_body_height(src_kpts, src_scores)
-        trans_height = self._get_body_height(trans_kpts, trans_scores)
+        # 1. 머리(얼굴) 크기 계산
+        src_face = self.bbox_mgr._kpt_to_face_public(src_kpts, src_scores)
+        trans_face = self.bbox_mgr._kpt_to_face_public(trans_kpts, trans_scores)
         
-        if src_height <= 0 or trans_height <= 0:
+        src_face_size = max(src_face.width, src_face.height)
+        trans_face_size = max(trans_face.width, trans_face.height)
+        
+        if src_face_size <= 1 or trans_face_size <= 1:
             return trans_kpts, 1.0
         
-        scale_factor = src_height / trans_height
-        scale_factor = float(np.clip(scale_factor, 0.5, 3.0))
+        # 2. 스케일 계산: Src 얼굴 / Trans 얼굴
+        scale_factor = src_face_size / trans_face_size
+        scale_factor = float(np.clip(scale_factor, 0.3, 3.0))
         
         if abs(scale_factor - 1.0) < 0.01:
             return trans_kpts, 1.0
         
         scaled = trans_kpts.copy()
         
-        # Pivot: 어깨 중심 (어깨 고정, 아래로 확장)
-        LS, RS = 5, 6
-        if trans_scores[LS] > 0.1 and trans_scores[RS] > 0.1:
-            shoulder_y = (trans_kpts[LS][1] + trans_kpts[RS][1]) / 2
-            pivot_x = (trans_kpts[LS][0] + trans_kpts[RS][0]) / 2
-        else:
+        # 3. Pivot: Src 발바닥 위치 (스케일링 후 발이 Src 위치에 맞춰짐)
+        src_foot_y = self._get_ground_y(src_kpts, src_scores)
+        trans_foot_y = self._get_ground_y(trans_kpts, trans_scores)
+        
+        if src_foot_y <= 0 or trans_foot_y <= 0:
             return trans_kpts, 1.0
         
-        pivot = np.array([pivot_x, shoulder_y])
+        # Trans 발 위치를 Src 발 위치로 이동시킨 후 스케일링
+        # 이동량 = Src 발 Y - Trans 발 Y
+        foot_offset_y = src_foot_y - trans_foot_y
         
-        # 전체 키포인트를 어깨 Pivot 기준으로 스케일링
+        # X축 중심 (Src bbox 중앙)
+        valid_xs = trans_kpts[trans_scores > 0][:, 0]
+        pivot_x = np.mean(valid_xs) if len(valid_xs) > 0 else 0
+        
+        # Pivot은 Src 발바닥 위치
+        pivot = np.array([pivot_x, src_foot_y])
+        
+        # 4. 먼저 발 위치를 Src에 맞추고, 그 위치에서 스케일링
         for idx in range(len(trans_scores)):
             if trans_scores[idx] > 0.1:
-                scaled[idx] = pivot + (scaled[idx] - pivot) * scale_factor
+                # 발 위치 이동
+                adjusted_pt = trans_kpts[idx].copy()
+                adjusted_pt[1] += foot_offset_y
+                # Src 발 기준 스케일링
+                scaled[idx] = pivot + (adjusted_pt - pivot) * scale_factor
         
         return scaled, scale_factor
 
